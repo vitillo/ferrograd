@@ -279,7 +279,7 @@ impl UOpGraph {
     /// This is the only way to create nodes — all builder methods below
     /// delegate here. The intern check is what makes hash-consing work.
     #[allow(clippy::cast_possible_truncation)]
-    fn add(&mut self, op: Op, dtype: DType, srcs: Vec<UOpId>, arg: Arg) -> UOpId {
+    pub fn add(&mut self, op: Op, dtype: DType, srcs: Vec<UOpId>, arg: Arg) -> UOpId {
         let key = (op, dtype, srcs.clone(), arg.clone());
         if let Some(&existing) = self.cache.get(&key) {
             return existing;
