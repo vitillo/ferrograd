@@ -1,4 +1,4 @@
-//! # rustgrad
+//! # ferrograd
 //!
 //! A from-scratch tensor compiler in Rust, inspired by tinygrad.
 //! Built for learning how tensor compilers work, one milestone at a time.

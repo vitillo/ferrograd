@@ -7,7 +7,7 @@
 
 #![allow(clippy::many_single_char_names)]
 
-use rustgrad::tensor::{Tensor, cpu};
+use ferrograd::tensor::{Tensor, cpu};
 
 fn main() {
     let dev = cpu();

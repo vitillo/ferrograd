@@ -1,4 +1,4 @@
-# rustgrad
+# ferrograd
 
 Educational tensor compiler in Rust, inspired by tinygrad. Plan: `dev/PLAN.md`
 
