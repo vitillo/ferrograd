@@ -129,14 +129,14 @@ impl CompiledKernel {
     /// 2. Run `clang -shared -O2 -o output.dylib input.c`
     /// 3. Load the shared library with dlopen
     pub fn new(source: &str, func_name: &str) -> Result<Self, CpuError> {
-        let src_file = tempfile::Builder::new()
-            .suffix(".c")
-            .tempfile()?;
+        let src_file = tempfile::Builder::new().suffix(".c").tempfile()?;
 
-        let lib_ext = if cfg!(target_os = "macos") { ".dylib" } else { ".so" };
-        let so_file = tempfile::Builder::new()
-            .suffix(lib_ext)
-            .tempfile()?;
+        let lib_ext = if cfg!(target_os = "macos") {
+            ".dylib"
+        } else {
+            ".so"
+        };
+        let so_file = tempfile::Builder::new().suffix(lib_ext).tempfile()?;
 
         // Keep so_temp_path alive -- we'll mem::forget it so the .dylib stays
         // on disk while the library is loaded (some OSes require this for dlopen).
@@ -155,11 +155,9 @@ impl CompiledKernel {
             file.flush()?;
         }
 
-        let src_path_str = src_path
-            .to_str()
-            .ok_or_else(|| CpuError::NonUtf8Path {
-                path: src_path.to_string_lossy().into_owned(),
-            })?;
+        let src_path_str = src_path.to_str().ok_or_else(|| CpuError::NonUtf8Path {
+            path: src_path.to_string_lossy().into_owned(),
+        })?;
 
         // -shared: produce a dynamically loadable library (not an executable)
         // -O2: optimize without slow compile times
@@ -197,12 +195,12 @@ impl CompiledKernel {
     /// Returns [`CpuError::SymbolNotFound`] if the symbol is not in the library.
     pub unsafe fn get_func<F>(&self) -> Result<libloading::Symbol<'_, F>, CpuError> {
         let func: libloading::Symbol<'_, F> =
-            self.lib.get(self.func_name.as_bytes()).map_err(|e| {
-                CpuError::SymbolNotFound {
+            self.lib
+                .get(self.func_name.as_bytes())
+                .map_err(|e| CpuError::SymbolNotFound {
                     symbol: self.func_name.clone(),
                     reason: e.to_string(),
-                }
-            })?;
+                })?;
         Ok(func)
     }
 }
@@ -231,7 +229,6 @@ impl Device for CpuDevice {
         Ok(Program::Cpu { kernel, num_bufs })
     }
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn execute(&self, program: &Program, bufs: &mut [&mut Buffer]) -> Result<(), DeviceError> {
         let Program::Cpu { kernel, num_bufs } = program;
 
@@ -242,29 +239,23 @@ impl Device for CpuDevice {
             bufs.len()
         );
 
-        let n = bufs[0].numel() as i32;
+        let ptrs: Vec<*mut u8> = bufs.iter_mut().map(|b| b.as_mut_ptr()).collect();
 
-        // SAFETY: We trust that the compiled C function's signature matches
-        // the pointers we're passing. This dispatch-by-arity is temporary --
-        // M4 codegen will produce kernels with a uniform signature.
+        // Use libffi to call the kernel with a dynamic number of pointer args.
+        // The kernel signature is `void kernel(float* data0, float* data1, ...)`.
+        let cif = libffi::middle::Cif::new(
+            vec![libffi::middle::Type::pointer(); ptrs.len()],
+            libffi::middle::Type::void(),
+        );
+        let args: Vec<libffi::middle::Arg> =
+            ptrs.iter().map(|p| libffi::middle::arg(p)).collect();
+
+        // SAFETY: We trust that the compiled kernel's signature matches
+        // the number and type of pointers we're passing.
         unsafe {
-            match *num_bufs {
-                2 => {
-                    let f: libloading::Symbol<
-                        '_, unsafe extern "C" fn(*mut u8, *mut u8, i32),
-                    > = kernel.get_func()?;
-                    f(bufs[0].as_mut_ptr(), bufs[1].as_mut_ptr(), n);
-                }
-                3 => {
-                    let f: libloading::Symbol<
-                        '_, unsafe extern "C" fn(*mut u8, *mut u8, *mut u8, i32),
-                    > = kernel.get_func()?;
-                    f(bufs[0].as_mut_ptr(), bufs[1].as_mut_ptr(), bufs[2].as_mut_ptr(), n);
-                }
-                other => unimplemented!(
-                    "CpuDevice::execute: {other} buffers not yet supported, will be replaced by M4 codegen"
-                ),
-            }
+            let func: libloading::Symbol<'_, fn()> = kernel.get_func()?;
+            let code_ptr = libffi::high::CodePtr(func.into_raw().as_raw_ptr().cast());
+            cif.call::<()>(code_ptr, &args);
         }
 
         Ok(())
@@ -403,8 +394,8 @@ mod tests {
         // Arrange
         let dev = CpuDevice;
         let source = r"
-            void add(float* a, float* b, float* out, int n) {
-                for (int i = 0; i < n; i++) out[i] = a[i] + b[i];
+            void add(float* out, float* a, float* b) {
+                for (int i = 0; i < 3; i++) out[i] = a[i] + b[i];
             }
         ";
         let program = dev.compile(source, "add", 3).expect("compile failed");
@@ -413,7 +404,7 @@ mod tests {
         let mut out = dev.allocate(DType::F32, 3);
 
         // Act
-        dev.execute(&program, &mut [&mut a, &mut b, &mut out])
+        dev.execute(&program, &mut [&mut out, &mut a, &mut b])
             .unwrap();
 
         // Assert
@@ -425,8 +416,8 @@ mod tests {
         // Arrange
         let dev = CpuDevice;
         let source = r"
-            void mul(float* a, float* b, float* out, int n) {
-                for (int i = 0; i < n; i++) out[i] = a[i] * b[i];
+            void mul(float* out, float* a, float* b) {
+                for (int i = 0; i < 3; i++) out[i] = a[i] * b[i];
             }
         ";
         let program = dev.compile(source, "mul", 3).expect("compile failed");
@@ -435,7 +426,7 @@ mod tests {
         let mut out = dev.allocate(DType::F32, 3);
 
         // Act
-        dev.execute(&program, &mut [&mut a, &mut b, &mut out])
+        dev.execute(&program, &mut [&mut out, &mut a, &mut b])
             .unwrap();
 
         // Assert
@@ -447,8 +438,8 @@ mod tests {
         // Arrange
         let dev = CpuDevice;
         let source = r"
-            void negate(float* input, float* output, int n) {
-                for (int i = 0; i < n; i++) output[i] = -input[i];
+            void negate(float* output, float* input) {
+                for (int i = 0; i < 3; i++) output[i] = -input[i];
             }
         ";
         let program = dev.compile(source, "negate", 2).expect("compile failed");
@@ -456,7 +447,7 @@ mod tests {
         let mut output = dev.allocate(DType::F32, 3);
 
         // Act
-        dev.execute(&program, &mut [&mut input, &mut output])
+        dev.execute(&program, &mut [&mut output, &mut input])
             .unwrap();
 
         // Assert
