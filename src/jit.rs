@@ -46,6 +46,42 @@
 use std::io::Write;
 use std::process::Command;
 
+/// Errors that can occur during JIT compilation and loading.
+#[derive(Debug, thiserror::Error)]
+pub enum JitError {
+    /// Failed to create a temporary file for C source or compiled output.
+    #[error("failed to create temp file: {0}")]
+    TempFile(#[from] std::io::Error),
+
+    /// Temp file path contained non-UTF8 characters (rare, but possible).
+    #[error("non-UTF8 path: {path}")]
+    NonUtf8Path {
+        /// The lossy representation of the path that failed.
+        path: String,
+    },
+
+    /// clang exited with a non-zero status. The stderr output is captured
+    /// so you can see the actual compiler errors.
+    #[error("clang compilation failed:\n{stderr}")]
+    ClangFailed {
+        /// The stderr output from clang.
+        stderr: String,
+    },
+
+    /// dlopen failed to load the compiled shared library.
+    #[error("failed to load shared library: {0}")]
+    LibLoad(String),
+
+    /// dlsym failed to find the requested function symbol.
+    #[error("symbol '{symbol}' not found: {reason}")]
+    SymbolNotFound {
+        /// The symbol name we tried to look up.
+        symbol: String,
+        /// The underlying error message.
+        reason: String,
+    },
+}
+
 /// A compiled C kernel loaded into memory, ready to be called.
 ///
 /// Holds the loaded shared library and its backing file. The library stays loaded
@@ -59,6 +95,14 @@ pub struct CompiledKernel {
     func_name: String,
 }
 
+impl std::fmt::Debug for CompiledKernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledKernel")
+            .field("func_name", &self.func_name)
+            .finish_non_exhaustive()
+    }
+}
+
 impl CompiledKernel {
     /// Compile C source code and load the resulting shared library.
     ///
@@ -68,23 +112,20 @@ impl CompiledKernel {
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - Temp file creation fails
-    /// - clang is not found or compilation fails
-    /// - The shared library cannot be loaded
+    /// Returns [`JitError`] if temp file creation, clang compilation, or
+    /// library loading fails.
     ///
     /// # The compilation pipeline
     ///
     /// 1. Write `source` to a temporary .c file
     /// 2. Run `clang -shared -O2 -o output.dylib input.c`
     /// 3. Load the shared library with dlopen
-    pub fn new(source: &str, func_name: &str) -> Result<Self, String> {
+    pub fn new(source: &str, func_name: &str) -> Result<Self, JitError> {
         // Create temp files for the C source and compiled output.
         // We use tempfile::Builder so we can control the suffix (.c and .dylib/.so).
         let src_file = tempfile::Builder::new()
             .suffix(".c")
-            .tempfile()
-            .map_err(|e| format!("Failed to create temp source file: {e}"))?;
+            .tempfile()?;
 
         // Determine the shared library extension based on the platform.
         let lib_ext = if cfg!(target_os = "macos") {
@@ -95,25 +136,24 @@ impl CompiledKernel {
 
         let so_file = tempfile::Builder::new()
             .suffix(lib_ext)
-            .tempfile()
-            .map_err(|e| format!("Failed to create temp output file: {e}"))?;
+            .tempfile()?;
 
         // Convert to TempPath so the file stays on disk but we get the path.
         // We'll forget this later to prevent deletion while the library is loaded.
         let so_temp_path = so_file.into_temp_path();
         let so_path_str = so_temp_path
             .to_str()
-            .ok_or("Non-UTF8 temp path")?
+            .ok_or_else(|| JitError::NonUtf8Path {
+                path: so_temp_path.to_string_lossy().into_owned(),
+            })?
             .to_string();
 
         // Step 1: Write the C source to the temp file
         let src_path = src_file.path().to_path_buf();
         {
             let mut file = src_file.as_file();
-            file.write_all(source.as_bytes())
-                .map_err(|e| format!("Failed to write C source: {e}"))?;
-            file.flush()
-                .map_err(|e| format!("Failed to flush C source: {e}"))?;
+            file.write_all(source.as_bytes())?;
+            file.flush()?;
         }
 
         // Step 2: Compile with clang
@@ -127,16 +167,18 @@ impl CompiledKernel {
         // On Linux, install with: apt install clang
         let src_path_str = src_path
             .to_str()
-            .ok_or("Non-UTF8 source path")?;
+            .ok_or_else(|| JitError::NonUtf8Path {
+                path: src_path.to_string_lossy().into_owned(),
+            })?;
 
         let output = Command::new("clang")
             .args(["-shared", "-O2", "-o", &so_path_str, src_path_str])
-            .output()
-            .map_err(|e| format!("Failed to run clang: {e}"))?;
+            .output()?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("clang compilation failed:\n{stderr}"));
+            return Err(JitError::ClangFailed {
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
         }
 
         // Step 3: Load the shared library
@@ -146,7 +188,7 @@ impl CompiledKernel {
         // function pointers.
         let lib = unsafe {
             libloading::Library::new(&*so_temp_path)
-                .map_err(|e| format!("Failed to load shared library: {e}"))?
+                .map_err(|e| JitError::LibLoad(e.to_string()))?
         };
 
         // Leak the TempPath so the .dylib stays on disk while the library is loaded.
@@ -174,12 +216,15 @@ impl CompiledKernel {
     ///
     /// # Errors
     ///
-    /// Returns an error if the symbol is not found in the loaded library.
-    pub unsafe fn get_func<F>(&self) -> Result<libloading::Symbol<'_, F>, String> {
-        let func: libloading::Symbol<'_, F> = self
-            .lib
-            .get(self.func_name.as_bytes())
-            .map_err(|e| format!("Failed to find symbol '{}': {e}", self.func_name))?;
+    /// Returns [`JitError::SymbolNotFound`] if the symbol is not in the library.
+    pub unsafe fn get_func<F>(&self) -> Result<libloading::Symbol<'_, F>, JitError> {
+        let func: libloading::Symbol<'_, F> =
+            self.lib.get(self.func_name.as_bytes()).map_err(|e| {
+                JitError::SymbolNotFound {
+                    symbol: self.func_name.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
         Ok(func)
     }
 }
@@ -188,72 +233,109 @@ impl CompiledKernel {
 mod tests {
     use super::*;
 
+    /// Helper type alias to reduce noise in tests.
+    type BinOpFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32, i32);
+
     #[test]
     fn test_add_kernel() {
+        // Arrange
         let source = r#"
             void add(float* a, float* b, float* out, int n) {
                 for (int i = 0; i < n; i++) out[i] = a[i] + b[i];
             }
         "#;
-
         let kernel = CompiledKernel::new(source, "add").expect("compile failed");
-
         let a = vec![1.0f32, 2.0, 3.0];
         let b = vec![4.0f32, 5.0, 6.0];
         let mut out = vec![0.0f32; 3];
 
+        // Act
         unsafe {
-            let f: libloading::Symbol<'_, unsafe extern "C" fn(*const f32, *const f32, *mut f32, i32)> =
-                kernel.get_func().unwrap();
+            let f: libloading::Symbol<'_, BinOpFn> = kernel.get_func().unwrap();
             f(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), 3);
         }
 
+        // Assert
         assert_eq!(out, vec![5.0, 7.0, 9.0]);
     }
 
     #[test]
     fn test_mul_kernel() {
+        // Arrange
         let source = r#"
             void mul(float* a, float* b, float* out, int n) {
                 for (int i = 0; i < n; i++) out[i] = a[i] * b[i];
             }
         "#;
-
         let kernel = CompiledKernel::new(source, "mul").expect("compile failed");
-
         let a = vec![2.0f32, 3.0, 4.0];
         let b = vec![5.0f32, 6.0, 7.0];
         let mut out = vec![0.0f32; 3];
 
+        // Act
         unsafe {
-            let f: libloading::Symbol<'_, unsafe extern "C" fn(*const f32, *const f32, *mut f32, i32)> =
-                kernel.get_func().unwrap();
+            let f: libloading::Symbol<'_, BinOpFn> = kernel.get_func().unwrap();
             f(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), 3);
         }
 
+        // Assert
         assert_eq!(out, vec![10.0, 18.0, 28.0]);
     }
 
     #[test]
     fn test_scalar_kernel() {
-        // Demonstrates passing a different signature (one array + one scalar).
+        // Arrange
         let source = r#"
             void scale(float* data, float* out, int n, float scalar) {
                 for (int i = 0; i < n; i++) out[i] = data[i] * scalar;
             }
         "#;
-
         let kernel = CompiledKernel::new(source, "scale").expect("compile failed");
-
         let data = vec![1.0f32, 2.0, 3.0, 4.0];
         let mut out = vec![0.0f32; 4];
 
+        // Act
         unsafe {
             let f: libloading::Symbol<'_, unsafe extern "C" fn(*const f32, *mut f32, i32, f32)> =
                 kernel.get_func().unwrap();
             f(data.as_ptr(), out.as_mut_ptr(), 4, 3.0);
         }
 
+        // Assert
         assert_eq!(out, vec![3.0, 6.0, 9.0, 12.0]);
+    }
+
+    #[test]
+    fn test_invalid_c_source_returns_clang_error() {
+        // Arrange
+        let bad_source = "this is not valid C!";
+
+        // Act
+        let result = CompiledKernel::new(bad_source, "nope");
+
+        // Assert
+        assert!(
+            matches!(result, Err(JitError::ClangFailed { .. })),
+            "expected ClangFailed, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_wrong_symbol_name_returns_symbol_error() {
+        // Arrange
+        let source = r#"
+            void real_name(float* a, int n) {}
+        "#;
+        let kernel = CompiledKernel::new(source, "wrong_name").unwrap();
+
+        // Act
+        let result: Result<libloading::Symbol<'_, unsafe extern "C" fn()>, _> =
+            unsafe { kernel.get_func() };
+
+        // Assert
+        assert!(
+            matches!(result, Err(JitError::SymbolNotFound { .. })),
+            "expected SymbolNotFound, got: {result:?}"
+        );
     }
 }
