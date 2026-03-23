@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }
+libffi = "5.1.0"
 libloading = "0.8"
 tempfile = "3"
 thiserror = "2"

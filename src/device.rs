@@ -33,7 +33,7 @@ pub enum DeviceError {
 /// The compiler and tensor layers never inspect this directly -- they pass
 /// it to the device which knows how to use it. This is what makes the same
 /// `Buffer` type work across CPU, CUDA, and future backends.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Storage {
     /// Host memory, owned as a flat byte array. Used by `CpuDevice`.
     Cpu(Vec<u8>),
@@ -45,9 +45,8 @@ pub enum Storage {
 /// Buffers are created by a [`Device`] and carry the device's opaque
 /// [`Storage`]. The `dtype` and `numel` give the raw bytes meaning.
 ///
-/// This matches tinygrad's `Buffer` in `device.py` -- it holds an opaque
-/// `_buf` allocated by a device-specific `Allocator`.
-#[derive(Debug)]
+/// A device-allocated memory region holding tensor data.
+#[derive(Debug, Clone)]
 pub struct Buffer {
     /// What type each element is.
     dtype: DType,
@@ -72,7 +71,11 @@ impl Buffer {
             dtype,
             numel
         );
-        Self { dtype, numel, storage }
+        Self {
+            dtype,
+            numel,
+            storage,
+        }
     }
 
     /// Total size in bytes.
