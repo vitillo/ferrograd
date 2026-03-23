@@ -174,6 +174,14 @@ impl fmt::Display for Arg {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UOpId(u32);
 
+impl UOpId {
+    /// Returns this ID as a `usize` index, for use in parallel arrays.
+    #[must_use]
+    pub fn idx(self) -> usize {
+        self.0 as usize
+    }
+}
+
 impl fmt::Debug for UOpId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "%{}", self.0)
