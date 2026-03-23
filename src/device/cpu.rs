@@ -1,9 +1,10 @@
-//! # JIT Compilation Module
+//! # CPU Backend
 //!
-//! This module handles the "compile C source → load shared library → get function pointer"
-//! pipeline. It's the runtime backbone that every later milestone builds on.
+//! The complete CPU backend: compiles C with clang, loads via dlopen, and
+//! executes kernels. This is tinygrad's `ops_cpu.py` equivalent -- it bundles
+//! the compiler, allocator, and kernel dispatch for the CPU target.
 //!
-//! ## How it works
+//! ## Compilation pipeline
 //!
 //! ```text
 //! C source string
@@ -46,9 +47,14 @@
 use std::io::Write;
 use std::process::Command;
 
-/// Errors that can occur during JIT compilation and loading.
+use crate::device::{Buffer, Device, DeviceError, Program, Storage};
+use crate::dtype::DType;
+
+// ── Errors ──────────────────────────────────────────────────────────────────
+
+/// Errors that can occur during CPU JIT compilation and loading.
 #[derive(Debug, thiserror::Error)]
-pub enum JitError {
+pub enum CpuError {
     /// Failed to create a temporary file for C source or compiled output.
     #[error("failed to create temp file: {0}")]
     TempFile(#[from] std::io::Error),
@@ -82,6 +88,8 @@ pub enum JitError {
     },
 }
 
+// ── CompiledKernel ──────────────────────────────────────────────────────────
+
 /// A compiled C kernel loaded into memory, ready to be called.
 ///
 /// Holds the loaded shared library and its backing file. The library stays loaded
@@ -112,7 +120,7 @@ impl CompiledKernel {
     ///
     /// # Errors
     ///
-    /// Returns [`JitError`] if temp file creation, clang compilation, or
+    /// Returns [`CpuError`] if temp file creation, clang compilation, or
     /// library loading fails.
     ///
     /// # The compilation pipeline
@@ -120,35 +128,26 @@ impl CompiledKernel {
     /// 1. Write `source` to a temporary .c file
     /// 2. Run `clang -shared -O2 -o output.dylib input.c`
     /// 3. Load the shared library with dlopen
-    pub fn new(source: &str, func_name: &str) -> Result<Self, JitError> {
-        // Create temp files for the C source and compiled output.
-        // We use tempfile::Builder so we can control the suffix (.c and .dylib/.so).
+    pub fn new(source: &str, func_name: &str) -> Result<Self, CpuError> {
         let src_file = tempfile::Builder::new()
             .suffix(".c")
             .tempfile()?;
 
-        // Determine the shared library extension based on the platform.
-        let lib_ext = if cfg!(target_os = "macos") {
-            ".dylib"
-        } else {
-            ".so"
-        };
-
+        let lib_ext = if cfg!(target_os = "macos") { ".dylib" } else { ".so" };
         let so_file = tempfile::Builder::new()
             .suffix(lib_ext)
             .tempfile()?;
 
-        // Convert to TempPath so the file stays on disk but we get the path.
-        // We'll forget this later to prevent deletion while the library is loaded.
+        // Keep so_temp_path alive -- we'll mem::forget it so the .dylib stays
+        // on disk while the library is loaded (some OSes require this for dlopen).
         let so_temp_path = so_file.into_temp_path();
         let so_path_str = so_temp_path
             .to_str()
-            .ok_or_else(|| JitError::NonUtf8Path {
+            .ok_or_else(|| CpuError::NonUtf8Path {
                 path: so_temp_path.to_string_lossy().into_owned(),
             })?
             .to_string();
 
-        // Step 1: Write the C source to the temp file
         let src_path = src_file.path().to_path_buf();
         {
             let mut file = src_file.as_file();
@@ -156,44 +155,29 @@ impl CompiledKernel {
             file.flush()?;
         }
 
-        // Step 2: Compile with clang
-        //
-        // Flags:
-        //   -shared    → produce a shared library (not an executable)
-        //   -O2        → optimize (makes the generated code fast without slow compile times)
-        //   -o <path>  → output path
-        //
-        // On macOS, clang is always available via Xcode Command Line Tools.
-        // On Linux, install with: apt install clang
         let src_path_str = src_path
             .to_str()
-            .ok_or_else(|| JitError::NonUtf8Path {
+            .ok_or_else(|| CpuError::NonUtf8Path {
                 path: src_path.to_string_lossy().into_owned(),
             })?;
 
+        // -shared: produce a dynamically loadable library (not an executable)
+        // -O2: optimize without slow compile times
         let output = Command::new("clang")
             .args(["-shared", "-O2", "-o", &so_path_str, src_path_str])
             .output()?;
 
         if !output.status.success() {
-            return Err(JitError::ClangFailed {
+            return Err(CpuError::ClangFailed {
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             });
         }
 
-        // Step 3: Load the shared library
-        //
-        // dlopen maps the compiled machine code into our process's address space.
-        // After this, we can look up symbols (function names) and get callable
-        // function pointers.
         let lib = unsafe {
             libloading::Library::new(&*so_temp_path)
-                .map_err(|e| JitError::LibLoad(e.to_string()))?
+                .map_err(|e| CpuError::LibLoad(e.to_string()))?
         };
 
-        // Leak the TempPath so the .dylib stays on disk while the library is loaded.
-        // Some OSes need the file to exist for dlopen'd code to work.
-        // In a production system we'd clean these up; for an educational JIT this is fine.
         std::mem::forget(so_temp_path);
 
         Ok(CompiledKernel {
@@ -208,19 +192,13 @@ impl CompiledKernel {
     /// C function's signature. There is no runtime check for this -- getting
     /// it wrong is undefined behavior (crashes, corruption, etc.).
     ///
-    /// For example, if the C function is:
-    ///   `void add_arrays(float* a, float* b, float* out, int n)`
-    ///
-    /// Then F must be:
-    ///   `unsafe extern "C" fn(*const f32, *const f32, *mut f32, i32)`
-    ///
     /// # Errors
     ///
-    /// Returns [`JitError::SymbolNotFound`] if the symbol is not in the library.
-    pub unsafe fn get_func<F>(&self) -> Result<libloading::Symbol<'_, F>, JitError> {
+    /// Returns [`CpuError::SymbolNotFound`] if the symbol is not in the library.
+    pub unsafe fn get_func<F>(&self) -> Result<libloading::Symbol<'_, F>, CpuError> {
         let func: libloading::Symbol<'_, F> =
             self.lib.get(self.func_name.as_bytes()).map_err(|e| {
-                JitError::SymbolNotFound {
+                CpuError::SymbolNotFound {
                     symbol: self.func_name.clone(),
                     reason: e.to_string(),
                 }
@@ -229,24 +207,90 @@ impl CompiledKernel {
     }
 }
 
+// ── CpuDevice ───────────────────────────────────────────────────────────────
+
+/// The CPU device -- compiles C with clang and runs it via dlopen.
+///
+/// Tinygrad's equivalent is `CPUDevice` in `tinygrad/runtime/ops_cpu.py`,
+/// which uses `ClangJITCompiler` + `CPUProgram` in the same way.
+pub struct CpuDevice;
+
+impl Device for CpuDevice {
+    fn allocate(&self, dtype: DType, numel: usize) -> Buffer {
+        let nbytes = dtype.size_bytes() * numel;
+        Buffer::new(dtype, numel, Storage::Cpu(vec![0u8; nbytes]))
+    }
+
+    fn compile(
+        &self,
+        source: &str,
+        func_name: &str,
+        num_bufs: usize,
+    ) -> Result<Program, DeviceError> {
+        let kernel = CompiledKernel::new(source, func_name)?;
+        Ok(Program::Cpu { kernel, num_bufs })
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn execute(&self, program: &Program, bufs: &mut [&mut Buffer]) -> Result<(), DeviceError> {
+        let Program::Cpu { kernel, num_bufs } = program;
+
+        assert_eq!(
+            bufs.len(),
+            *num_bufs,
+            "expected {num_bufs} buffers, got {}",
+            bufs.len()
+        );
+
+        let n = bufs[0].numel() as i32;
+
+        // SAFETY: We trust that the compiled C function's signature matches
+        // the pointers we're passing. This dispatch-by-arity is temporary --
+        // M4 codegen will produce kernels with a uniform signature.
+        unsafe {
+            match *num_bufs {
+                2 => {
+                    let f: libloading::Symbol<
+                        '_, unsafe extern "C" fn(*mut u8, *mut u8, i32),
+                    > = kernel.get_func()?;
+                    f(bufs[0].as_mut_ptr(), bufs[1].as_mut_ptr(), n);
+                }
+                3 => {
+                    let f: libloading::Symbol<
+                        '_, unsafe extern "C" fn(*mut u8, *mut u8, *mut u8, i32),
+                    > = kernel.get_func()?;
+                    f(bufs[0].as_mut_ptr(), bufs[1].as_mut_ptr(), bufs[2].as_mut_ptr(), n);
+                }
+                other => unimplemented!(
+                    "CpuDevice::execute: {other} buffers not yet supported, will be replaced by M4 codegen"
+                ),
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── CompiledKernel tests ────────────────────────────────────────────
 
     /// Helper type alias to reduce noise in tests.
     type BinOpFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32, i32);
 
     #[test]
-    fn test_add_kernel() {
+    fn test_compile_and_call_add() {
         // Arrange
-        let source = r#"
+        let source = r"
             void add(float* a, float* b, float* out, int n) {
                 for (int i = 0; i < n; i++) out[i] = a[i] + b[i];
             }
-        "#;
+        ";
         let kernel = CompiledKernel::new(source, "add").expect("compile failed");
-        let a = vec![1.0f32, 2.0, 3.0];
-        let b = vec![4.0f32, 5.0, 6.0];
+        let a = [1.0f32, 2.0, 3.0];
+        let b = [4.0f32, 5.0, 6.0];
         let mut out = vec![0.0f32; 3];
 
         // Act
@@ -260,16 +304,16 @@ mod tests {
     }
 
     #[test]
-    fn test_mul_kernel() {
+    fn test_compile_and_call_mul() {
         // Arrange
-        let source = r#"
+        let source = r"
             void mul(float* a, float* b, float* out, int n) {
                 for (int i = 0; i < n; i++) out[i] = a[i] * b[i];
             }
-        "#;
+        ";
         let kernel = CompiledKernel::new(source, "mul").expect("compile failed");
-        let a = vec![2.0f32, 3.0, 4.0];
-        let b = vec![5.0f32, 6.0, 7.0];
+        let a = [2.0f32, 3.0, 4.0];
+        let b = [5.0f32, 6.0, 7.0];
         let mut out = vec![0.0f32; 3];
 
         // Act
@@ -283,15 +327,15 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_kernel() {
+    fn test_compile_and_call_scalar() {
         // Arrange
-        let source = r#"
+        let source = r"
             void scale(float* data, float* out, int n, float scalar) {
                 for (int i = 0; i < n; i++) out[i] = data[i] * scalar;
             }
-        "#;
+        ";
         let kernel = CompiledKernel::new(source, "scale").expect("compile failed");
-        let data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let data = [1.0f32, 2.0, 3.0, 4.0];
         let mut out = vec![0.0f32; 4];
 
         // Act
@@ -306,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_c_source_returns_clang_error() {
+    fn test_invalid_c_source_returns_error() {
         // Arrange
         let bad_source = "this is not valid C!";
 
@@ -315,17 +359,17 @@ mod tests {
 
         // Assert
         assert!(
-            matches!(result, Err(JitError::ClangFailed { .. })),
+            matches!(result, Err(CpuError::ClangFailed { .. })),
             "expected ClangFailed, got: {result:?}"
         );
     }
 
     #[test]
-    fn test_wrong_symbol_name_returns_symbol_error() {
+    fn test_wrong_symbol_returns_error() {
         // Arrange
-        let source = r#"
+        let source = r"
             void real_name(float* a, int n) {}
-        "#;
+        ";
         let kernel = CompiledKernel::new(source, "wrong_name").unwrap();
 
         // Act
@@ -334,8 +378,100 @@ mod tests {
 
         // Assert
         assert!(
-            matches!(result, Err(JitError::SymbolNotFound { .. })),
+            matches!(result, Err(CpuError::SymbolNotFound { .. })),
             "expected SymbolNotFound, got: {result:?}"
         );
+    }
+
+    // ── CpuDevice tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_allocate_through_device() {
+        // Arrange
+        let dev = CpuDevice;
+
+        // Act
+        let buf = dev.allocate(DType::F32, 4);
+
+        // Assert
+        assert_eq!(buf.numel(), 4);
+        assert_eq!(buf.nbytes(), 16);
+    }
+
+    #[test]
+    fn test_device_add() {
+        // Arrange
+        let dev = CpuDevice;
+        let source = r"
+            void add(float* a, float* b, float* out, int n) {
+                for (int i = 0; i < n; i++) out[i] = a[i] + b[i];
+            }
+        ";
+        let program = dev.compile(source, "add", 3).expect("compile failed");
+        let mut a = Buffer::from_f32(&[1.0, 2.0, 3.0]);
+        let mut b = Buffer::from_f32(&[4.0, 5.0, 6.0]);
+        let mut out = dev.allocate(DType::F32, 3);
+
+        // Act
+        dev.execute(&program, &mut [&mut a, &mut b, &mut out])
+            .unwrap();
+
+        // Assert
+        assert_eq!(out.to_f32(), vec![5.0, 7.0, 9.0]);
+    }
+
+    #[test]
+    fn test_device_mul() {
+        // Arrange
+        let dev = CpuDevice;
+        let source = r"
+            void mul(float* a, float* b, float* out, int n) {
+                for (int i = 0; i < n; i++) out[i] = a[i] * b[i];
+            }
+        ";
+        let program = dev.compile(source, "mul", 3).expect("compile failed");
+        let mut a = Buffer::from_f32(&[2.0, 3.0, 4.0]);
+        let mut b = Buffer::from_f32(&[5.0, 6.0, 7.0]);
+        let mut out = dev.allocate(DType::F32, 3);
+
+        // Act
+        dev.execute(&program, &mut [&mut a, &mut b, &mut out])
+            .unwrap();
+
+        // Assert
+        assert_eq!(out.to_f32(), vec![10.0, 18.0, 28.0]);
+    }
+
+    #[test]
+    fn test_device_unary() {
+        // Arrange
+        let dev = CpuDevice;
+        let source = r"
+            void negate(float* input, float* output, int n) {
+                for (int i = 0; i < n; i++) output[i] = -input[i];
+            }
+        ";
+        let program = dev.compile(source, "negate", 2).expect("compile failed");
+        let mut input = Buffer::from_f32(&[1.0, -2.0, 3.0]);
+        let mut output = dev.allocate(DType::F32, 3);
+
+        // Act
+        dev.execute(&program, &mut [&mut input, &mut output])
+            .unwrap();
+
+        // Assert
+        assert_eq!(output.to_f32(), vec![-1.0, 2.0, -3.0]);
+    }
+
+    #[test]
+    fn test_device_compile_bad_source() {
+        // Arrange
+        let dev = CpuDevice;
+
+        // Act
+        let result = dev.compile("not valid C!", "nope", 1);
+
+        // Assert
+        assert!(result.is_err());
     }
 }

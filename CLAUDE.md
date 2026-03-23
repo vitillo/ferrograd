@@ -3,6 +3,7 @@
 Educational tensor compiler in Rust, inspired by tinygrad. Plan: `dev/PLAN.md`
 
 ## Code style
+- Follow modern Rust conventions (e.g. `module.rs` + `module/` over `module/mod.rs`)
 - Use `thiserror` for typed errors, not `String`
 - Clippy pedantic is on -- keep it warning-free
 
