@@ -90,7 +90,27 @@ This plan is based on a deep exploration of the tinygrad codebase. Tinygrad's pi
 
 ---
 
-## Milestone 5: Tensor API + Lazy Evaluation
+## Milestone 5: Graph Rewriting
+
+**Compiler concept:** Term rewriting -- pattern-match-and-replace as the universal compiler optimization strategy.
+
+**Build:**
+- `UPat` struct: a pattern that matches UOp nodes by op, dtype, and source patterns. Named captures let the replacement function access matched subtrees.
+- `PatternMatcher`: holds a list of `(UPat, replacement_fn)` rules. Given a UOp, tries each rule and returns the first match. Dispatches by op for O(1) lookup.
+- `graph_rewrite(root, pm)`: walks the graph bottom-up (children first, then parent), applying the PatternMatcher at each node until no more rules fire (fixed-point iteration).
+- Starter rules to validate the machinery:
+  - Constant folding: `add(const(a), const(b))` → `const(a + b)` (and mul, neg, etc.)
+  - Algebraic identities: `x + 0` → `x`, `x * 1` → `x`, `x * 0` → `0`
+
+**Key insight:** Tinygrad does nearly all optimization through graph rewrites -- constant folding, algebraic simplification, scheduling, movement op lowering, GPU-specific transforms. It's all `PatternMatcher` rules applied by `graph_rewrite`. Building this machinery once means M6-M10 just add rules instead of writing ad-hoc passes.
+
+**Tinygrad reference:** `tinygrad/uop/ops.py` (PatternMatcher, UPat, graph_rewrite), `tinygrad/uop/symbolic.py` (algebraic rules)
+
+**Test:** Build a graph with `x + 0`, rewrite it, verify the add is eliminated. Build `const(2) + const(3)`, verify it folds to `const(5)`. Verify fixed-point: `(x + 0) * 1` should simplify to just `x` in one pass.
+
+---
+
+## Milestone 6: Tensor API + Lazy Evaluation
 
 **Compiler concept:** Lazy evaluation and kernel fusion -- why ML frameworks don't execute eagerly.
 
@@ -109,7 +129,7 @@ This plan is based on a deep exploration of the tinygrad codebase. Tinygrad's pi
 
 ---
 
-## Milestone 6: Reductions + Matmul
+## Milestone 7: Reductions + Matmul
 
 **Compiler concept:** Loop nest generation for reductions, multi-dimensional index arithmetic.
 
@@ -131,7 +151,7 @@ This plan is based on a deep exploration of the tinygrad codebase. Tinygrad's pi
 
 ---
 
-## Milestone 7: Autograd
+## Milestone 8: Autograd
 
 **Compiler concept:** Automatic differentiation as graph transformation (the chain rule on a DAG).
 
@@ -157,7 +177,7 @@ This plan is based on a deep exploration of the tinygrad codebase. Tinygrad's pi
 
 ---
 
-## Milestone 8: CUDA Backend
+## Milestone 9: CUDA Backend
 
 **Compiler concept:** GPU programming model -- thread grids replace loops.
 
@@ -175,11 +195,11 @@ This plan is based on a deep exploration of the tinygrad codebase. Tinygrad's pi
 
 **Tinygrad reference:** `tinygrad/renderer/cstyle.py` (CUDARenderer), `tinygrad/runtime/ops_cuda.py`
 
-**Test:** Run the same operations from M5/M6 on CUDA, verify results match CPU.
+**Test:** Run the same operations from M6/M7 on CUDA, verify results match CPU.
 
 ---
 
-## Milestone 9: Train an MLP on MNIST
+## Milestone 10: Train an MLP on MNIST
 
 **Compiler concept:** End-to-end integration -- every layer of the stack exercised.
 
@@ -199,8 +219,8 @@ This plan is based on a deep exploration of the tinygrad codebase. Tinygrad's pi
 ## Milestone Dependency Graph
 
 ```
-M1 (JIT) → M2 (Device) → M3 (IR) → M4 (Codegen) → M5 (Tensor) → M6 (Reduce/Matmul) → M7 (Autograd) → M9 (MNIST)
-                                                                                          ↘ M8 (CUDA) ↗
+M1 (JIT) → M2 (Device) → M3 (IR) → M4 (Codegen) → M5 (Rewrite) → M6 (Tensor) → M7 (Reduce/Matmul) → M8 (Autograd) → M10 (MNIST)
+                                                                                                          ↘ M9 (CUDA) ↗
 ```
 
 ## Compiler Concepts Summary
@@ -211,8 +231,9 @@ M1 (JIT) → M2 (Device) → M3 (IR) → M4 (Codegen) → M5 (Tensor) → M6 (Re
 | 2 | DType + Buffer + Device | Type systems, hardware abstraction |
 | 3 | UOp IR | DAG-based intermediate representation, interning |
 | 4 | IR to C | Code emission / lowering |
-| 5 | Tensor + Lazy Eval | Lazy evaluation, kernel fusion, scheduling |
-| 6 | Reduce + Matmul | Loop nest generation, index arithmetic |
-| 7 | Autograd | Reverse-mode AD as graph transformation |
-| 8 | CUDA | GPU codegen (thread grids replace loops) |
-| 9 | MNIST | Full integration |
+| 5 | Graph Rewriting | Term rewriting, pattern matching, algebraic simplification |
+| 6 | Tensor + Lazy Eval | Lazy evaluation, kernel fusion, scheduling |
+| 7 | Reduce + Matmul | Loop nest generation, index arithmetic |
+| 8 | Autograd | Reverse-mode AD as graph transformation |
+| 9 | CUDA | GPU codegen (thread grids replace loops) |
+| 10 | MNIST | Full integration |
