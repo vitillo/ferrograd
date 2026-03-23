@@ -11,6 +11,10 @@ Educational tensor compiler in Rust, inspired by tinygrad. Plan: `dev/PLAN.md`
 - Arrange / Act / Assert structure with section comments
 - Test both happy paths and error cases
 
+## Tinygrad alignment
+- Every IR op, type, and abstraction must have a tinygrad equivalent -- don't invent concepts that don't exist upstream
+- Reference tinygrad source: `~/projects/tinygrad`
+
 ## Documentation
 - `missing_docs` lint is enabled -- all public items need docs
 - Explain *why*, not just *what* -- this is an educational project

@@ -13,9 +13,11 @@
 //!
 //! - [`dtype`] -- Data types that bridge Rust, IR, and C worlds (M2)
 //! - [`device`] -- Device trait, Buffer, Storage, plus backend implementations (M2)
+//! - [`uop`] -- DAG-based intermediate representation with hash-consing (M3)
 
 pub mod device;
 pub mod dtype;
+pub mod uop;
 
 use device::{Buffer, CpuDevice, Device};
 use dtype::DType;

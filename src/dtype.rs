@@ -27,6 +27,8 @@ pub enum DType {
     I32,
     /// Boolean. Used for masks and comparison results.
     Bool,
+    /// No value. Used for side-effecting IR nodes (Store, Sink, End).
+    Void,
 }
 
 impl DType {
@@ -39,6 +41,7 @@ impl DType {
         match self {
             Self::F32 | Self::I32 => 4,
             Self::Bool => 1,
+            Self::Void => 0,
         }
     }
 
@@ -52,6 +55,7 @@ impl DType {
             Self::F32 => "float",
             Self::I32 => "int",
             Self::Bool => "_Bool",
+            Self::Void => "void",
         }
     }
 }
@@ -62,6 +66,7 @@ impl std::fmt::Display for DType {
             Self::F32 => write!(f, "f32"),
             Self::I32 => write!(f, "i32"),
             Self::Bool => write!(f, "bool"),
+            Self::Void => write!(f, "void"),
         }
     }
 }
