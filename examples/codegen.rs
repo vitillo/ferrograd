@@ -1,33 +1,12 @@
-//! # rustgrad
-//!
-//! A from-scratch tensor compiler in Rust, inspired by tinygrad.
-//! Built for learning how tensor compilers work, one milestone at a time.
-//!
-//! ## Architecture (same as tinygrad, simplified)
-//!
-//! ```text
-//! Tensor API → Lazy UOp Graph → Scheduling → Codegen → Compilation → Execution
-//! ```
-//!
-//! ## Module overview
-//!
-//! - [`dtype`] -- Data types that bridge Rust, IR, and C worlds (M2)
-//! - [`device`] -- Device trait, Buffer, Storage, plus backend implementations (M2)
-//! - [`uop`] -- DAG-based intermediate representation with hash-consing (M3)
-//! - [`codegen`] -- Code generation: `UOp` IR to C source (M4)
+//! Builds a `UOp` graph, renders it to C, compiles, and runs it.
 
-pub mod codegen;
-pub mod device;
-pub mod dtype;
-pub mod uop;
-
-use codegen::{ClangRenderer, Renderer};
-use device::{Buffer, CpuDevice, Device};
-use dtype::DType;
-use uop::UOpGraph;
+use rustgrad::codegen::{ClangRenderer, Renderer};
+use rustgrad::device::{Buffer, CpuDevice, Device};
+use rustgrad::dtype::DType;
+use rustgrad::uop::UOpGraph;
 
 fn main() {
-    println!("=== Milestone 4: Code Generation (IR → C) ===\n");
+    println!("=== Code Generation: IR → C → compile → run ===\n");
 
     // Build a UOp graph: out[i] = (a[i] + b[i]) * 2.0
     let mut g = UOpGraph::new();
