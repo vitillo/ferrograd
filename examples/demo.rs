@@ -7,34 +7,23 @@
 
 #![allow(clippy::many_single_char_names)]
 
-use ferrograd::tensor::{Tensor, cpu};
+use ferrograd::tensor::{cpu, Tensor};
 
 fn main() {
     let dev = cpu();
 
-    println!("=== Tensor API: lazy evaluation + kernel fusion ===\n");
+    /*let m = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &dev);
+    let n = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2], &dev);
+    let p = m.matmul(&n).to_vec();
+    println!("\n  m       = [[1,2,3],[4,5,6]]");
+    println!("  n       = [[1,2],[3,4],[5,6]]");
+    println!("  m @ n   = {p:?}");
+    assert_eq!(p, vec![22.0, 28.0, 49.0, 64.0]);*/
 
-    let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &dev);
-    let b = Tensor::from_slice(&[10.0, 20.0, 30.0], &dev);
-    let two = Tensor::from_slice(&[2.0, 2.0, 2.0], &dev);
-
-    // Nothing has executed yet — just building a lazy graph.
-    let c = a.add(&b).mul(&two);
-    println!("  c is lazy: realized = {}\n", c.is_realized());
-
-    // realize() lowers the graph to a single fused kernel, compiles, and runs.
-    let result = c.to_vec();
-    println!("  a       = [1.0, 2.0, 3.0]");
-    println!("  b       = [10.0, 20.0, 30.0]");
-    println!("  (a+b)*2 = {result:?}");
-    assert_eq!(result, vec![22.0, 44.0, 66.0]);
-
-    // Relu
-    let x = Tensor::from_slice(&[1.0, -2.0, 3.0, -4.0], &dev);
-    let r = x.relu().to_vec();
-    println!("\n  x       = [1.0, -2.0, 3.0, -4.0]");
-    println!("  relu(x) = {r:?}");
-    assert_eq!(r, vec![1.0, 0.0, 3.0, 0.0]);
-
-    println!("\n  ✓ Lazy eval + kernel fusion works!\n");
+    // Sum reduction
+    let s = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &dev);
+    let row_sums = s.sum(&[1]).to_vec();
+    println!("\n  s           = [[1,2,3],[4,5,6]]");
+    println!("  s.sum(axis=1) = {row_sums:?}");
+    assert_eq!(row_sums, vec![6.0, 15.0]);
 }

@@ -9,8 +9,16 @@
 //! `tinygrad/uop/ops.py` — `UPat`, `PatternMatcher`, `graph_rewrite`.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use crate::uop::{Arg, Op, UOp};
+
+static DEBUG: LazyLock<u8> = LazyLock::new(|| {
+    std::env::var("DEBUG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+});
 
 // ── Captures ────────────────────────────────────────────────────────────────
 
@@ -264,8 +272,17 @@ impl PatternMatcher {
 // ── graph_rewrite ───────────────────────────────────────────────────────────
 
 /// Rewrite a graph bottom-up until no more rules fire (fixed-point).
+///
+/// The `name` parameter identifies the pass in debug output (like tinygrad's
+/// `name=` on `graph_rewrite`). When `DEBUG >= 3`, prints the graph before
+/// and after the rewrite.
 #[must_use]
-pub fn graph_rewrite(root: &UOp, pm: &PatternMatcher) -> UOp {
+pub fn graph_rewrite(root: &UOp, pm: &PatternMatcher, name: &str) -> UOp {
+    let debug = *DEBUG;
+    if debug >= 3 {
+        eprintln!("━━━ {name} [before] ━━━\n{}", root.dump());
+    }
+
     let mut current = root.clone();
 
     loop {
@@ -283,7 +300,6 @@ pub fn graph_rewrite(root: &UOp, pm: &PatternMatcher) -> UOp {
 
             let srcs_changed = node.srcs().iter().zip(&new_srcs).any(|(old, new)| old != new);
             let rebuilt = if srcs_changed {
-                changed = true;
                 UOp::new(node.op(), node.dtype(), new_srcs, node.arg().clone())
             } else {
                 node.clone()
@@ -300,6 +316,9 @@ pub fn graph_rewrite(root: &UOp, pm: &PatternMatcher) -> UOp {
         current = replace.get(&current).cloned().unwrap_or(current);
 
         if !changed {
+            if debug >= 3 {
+                eprintln!("━━━ {name} [after] ━━━\n{}", current.dump());
+            }
             return current;
         }
     }
@@ -436,7 +455,7 @@ mod tests {
         let zero = UOp::const_float(0.0, DType::F32);
         let sum = UOp::new(Op::Add, DType::F32, vec![x, zero], Arg::None);
 
-        let result = graph_rewrite(&sum, &symbolic_simple());
+        let result = graph_rewrite(&sum, &symbolic_simple(), "test");
         assert_eq!(result.op(), Op::Const);
         assert_eq!(*result.arg(), Arg::Float(5.0));
     }
@@ -447,7 +466,7 @@ mod tests {
         let three = UOp::const_float(3.0, DType::F32);
         let sum = UOp::new(Op::Add, DType::F32, vec![two, three], Arg::None);
 
-        let result = graph_rewrite(&sum, &symbolic_simple());
+        let result = graph_rewrite(&sum, &symbolic_simple(), "test");
         assert_eq!(result.op(), Op::Const);
         assert_eq!(*result.arg(), Arg::Float(5.0));
     }
@@ -460,7 +479,7 @@ mod tests {
         let sum = UOp::new(Op::Add, DType::F32, vec![x, zero], Arg::None);
         let prod = UOp::new(Op::Mul, DType::F32, vec![sum, one], Arg::None);
 
-        let result = graph_rewrite(&prod, &symbolic_simple());
+        let result = graph_rewrite(&prod, &symbolic_simple(), "test");
         assert_eq!(result.op(), Op::Const);
         assert_eq!(*result.arg(), Arg::Float(7.0));
     }
@@ -472,7 +491,7 @@ mod tests {
         let sum = UOp::new(Op::Add, DType::F32, vec![x, y], Arg::None);
 
         let pm = PatternMatcher::new(vec![]);
-        let result = graph_rewrite(&sum, &pm);
+        let result = graph_rewrite(&sum, &pm, "test");
         assert_eq!(result, sum);
     }
 
@@ -482,7 +501,7 @@ mod tests {
         let zero = UOp::const_float(0.0, DType::F32);
         let prod = UOp::new(Op::Mul, DType::F32, vec![x, zero], Arg::None);
 
-        let result = graph_rewrite(&prod, &symbolic_simple());
+        let result = graph_rewrite(&prod, &symbolic_simple(), "test");
         assert_eq!(result.op(), Op::Const);
         assert_eq!(*result.arg(), Arg::Float(0.0));
     }

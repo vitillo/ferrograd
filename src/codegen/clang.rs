@@ -23,7 +23,7 @@ impl Renderer for ClangRenderer {
         let mut params: Vec<(usize, DType)> = Vec::new();
         for node in &order {
             if node.op() == Op::Param {
-                if let Arg::Index(slot) = node.arg() {
+                if let Arg::Param(slot, _) = node.arg() {
                     params.push((*slot, node.dtype()));
                 }
             }
@@ -66,6 +66,12 @@ impl Renderer for ClangRenderer {
                     let _ = writeln!(out, "{ind}*{idx_expr} = {value};", ind = indent(depth));
                     continue;
                 }
+                Op::After => {
+                    // Passthrough: use src[0]'s value, src[1] is ordering only.
+                    let val = name_of(&node.srcs()[0], &names);
+                    names.insert(node, val);
+                    continue;
+                }
                 Op::Buffer => unreachable!("Buffer is a tensor-level op"),
                 _ => {}
             }
@@ -78,7 +84,7 @@ impl Renderer for ClangRenderer {
 
             match node.op() {
                 Op::Param => {
-                    if let Arg::Index(slot) = node.arg() {
+                    if let Arg::Param(slot, _) = node.arg() {
                         names.insert(node, format!("data{slot}"));
                     }
                 }
@@ -216,8 +222,25 @@ impl Renderer for ClangRenderer {
                     let _ = writeln!(out, "{ind}{ctype} {var} = ({cond}?{true_val}:{false_val});", ind = indent(depth), ctype = node.dtype().c_type());
                     names.insert(node, var);
                 }
-                // Sink, End, Store, Buffer handled above.
-                Op::Sink | Op::End | Op::Store | Op::Buffer => unreachable!(),
+                Op::DefineAcc => {
+                    let init = srcs[0].clone();
+                    let var = format!("acc{alu_count}");
+                    alu_count += 1;
+                    let _ = writeln!(out, "{ind}{ctype} {var} = {init};", ind = indent(depth), ctype = node.dtype().c_type());
+                    names.insert(node, var);
+                }
+                Op::Assign => {
+                    let acc_var = name_of(&node.srcs()[0], &names);
+                    let new_val = name_of(&node.srcs()[1], &names);
+                    let _ = writeln!(out, "{ind}{acc_var} = {new_val};", ind = indent(depth));
+                    names.insert(node, acc_var);
+                }
+                // Sink, End, Store, After, Buffer handled above.
+                Op::Sink | Op::End | Op::Store | Op::After | Op::Buffer => unreachable!(),
+                // Tensor-level and unexpanded ops should be lowered before codegen.
+                Op::Reshape | Op::Permute | Op::Expand | Op::ReduceAxis | Op::Reduce => {
+                    unreachable!("{op:?} should be lowered before codegen", op = node.op())
+                }
             }
         }
 
@@ -232,9 +255,9 @@ mod tests {
     use crate::device::{CpuDevice, Device};
 
     fn build_add_graph(n: i64) -> UOp {
-        let out_ptr = UOp::param(0, DType::F32);
-        let a_ptr = UOp::param(1, DType::F32);
-        let b_ptr = UOp::param(2, DType::F32);
+        let out_ptr = UOp::param(0, DType::F32, 3);
+        let a_ptr = UOp::param(1, DType::F32, 3);
+        let b_ptr = UOp::param(2, DType::F32, 3);
         let bound = UOp::const_int(n, DType::I32);
         let idx = UOp::range(0, bound);
         let a_val = UOp::load(UOp::index(a_ptr, idx.clone()), DType::F32);
@@ -285,8 +308,8 @@ mod tests {
     #[test]
     fn test_render_negate_kernel() {
         // Arrange
-        let out_ptr = UOp::param(0, DType::F32);
-        let a_ptr = UOp::param(1, DType::F32);
+        let out_ptr = UOp::param(0, DType::F32, 3);
+        let a_ptr = UOp::param(1, DType::F32, 3);
         let n = UOp::const_int(3, DType::I32);
         let idx = UOp::range(0, n);
         let a_val = UOp::load(UOp::index(a_ptr, idx.clone()), DType::F32);
@@ -311,8 +334,8 @@ mod tests {
     #[test]
     fn test_render_relu_kernel() {
         // Arrange
-        let out_ptr = UOp::param(0, DType::F32);
-        let a_ptr = UOp::param(1, DType::F32);
+        let out_ptr = UOp::param(0, DType::F32, 4);
+        let a_ptr = UOp::param(1, DType::F32, 4);
         let n = UOp::const_int(4, DType::I32);
         let zero = UOp::const_float(0.0, DType::F32);
         let idx = UOp::range(0, n);

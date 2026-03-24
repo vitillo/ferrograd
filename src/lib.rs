@@ -17,12 +17,12 @@
 //! - [`codegen`] -- Code generation: `UOp` IR to C source (M4)
 //! - [`rewrite`] -- Graph rewriting: pattern matching and algebraic simplification (M5)
 //! - [`tensor`] -- Lazy tensor API with kernel fusion (M6)
-//! - [`lower`] -- Lowering: lazy tensor ops to kernel-level `UOp`s (M6)
+//! - [`schedule`] -- Converts tensor-level `UOps` to kernel-level `UOps` (M6)
 
 pub mod codegen;
 pub mod device;
 pub mod dtype;
-pub mod lower;
 pub mod rewrite;
+pub mod schedule;
 pub mod tensor;
 pub mod uop;
