@@ -4,52 +4,62 @@
 //! kernel-level IR that the codegen can render to C. The pipeline mirrors
 //! tinygrad's `schedule/` package.
 //!
+//! ## Why scheduling exists
+//!
+//! The tensor API builds a lazy graph of high-level operations (Add, Reshape,
+//! `ReduceAxis`, etc.). These ops describe *what* to compute, but not *how* to
+//! iterate over memory. Scheduling bridges that gap:
+//!
+//! 1. **`schedule()`** (this file) — replaces device-level `Buffer` nodes with
+//!    abstract `Param` slots and wraps everything in `Store`/`Sink`. This
+//!    separates "what data lives where" from "what computation to do", which
+//!    is essential because the same buffer might be shared across expressions.
+//!
+//! 2. **`rangeify`** — creates loop nests (`Range`/`End`) and pushes `Index`
+//!    nodes down through the graph. Movement ops (Reshape, Permute, Expand)
+//!    transform the index expressions as they pass through, then disappear.
+//!    When Index reaches a Param leaf, it becomes a `Load` with a flat offset.
+//!    Reductions get their own inner loops with accumulator patterns.
+//!
+//! 3. **`symbolic_simple`** (in [`crate::rewrite`]) — cleans up redundant
+//!    arithmetic (`x+0`, `x*1`, constant folding) left over from index
+//!    generation.
+//!
+//! After these steps, the graph contains only kernel-level ops that map
+//! directly to C code: Range/End (loops), Load/Store (memory), and ALU ops.
+//!
 //! ## Pipeline
 //!
 //! ```text
 //! Tensor ops (lazy UOp graph)
-//!   │
+//!   │  Buffers, Reshape, Permute, Expand, ReduceAxis, ALU ops
 //!   ▼
-//! schedule           Create Sink(Store(Param, expr)) — the proto-kernel
-//!   │
+//! schedule()         Buffer → Param, wrap in Store/Sink
+//!   │  Params, Reshape, Permute, Expand, ReduceAxis, ALU ops
 //!   ▼
-//! rangeify           Add Range loops, push Index through the graph,
-//!   │                convert ReduceAxis → Reduce → DefineAcc/Assign/End
+//! rangeify()         Add Range loops, push Index down, expand Reduce
+//!   │  Range, End, Load, Store, DefineAcc, Assign, After, ALU ops
 //!   ▼
-//! symbolic_simple    Simplify index arithmetic (x+0→x, x*1→x, const fold)
-//!   │
+//! symbolic_simple()  x+0→x, x*1→x, const fold
+//!   │  (same ops, simplified index arithmetic)
 //!   ▼
-//! codegen            Render kernel-level UOps to C source
+//! codegen            Render to C source
 //! ```
-//!
-//! ## How rangeify works
-//!
-//! 1. Matches `Store(Param, expr)` and creates `Range` loops for each
-//!    dimension of the expression's shape.
-//! 2. Wraps the expression in `Index(expr, ranges...)` and pushes `Index`
-//!    down through the graph until it reaches the leaf `Buffer` nodes.
-//!    As it passes through each op, the index expressions are adjusted:
-//!    movement ops (Reshape, Permute, Expand) transform the indices to
-//!    account for how they rearrange data, while math ops (Add, Mul, etc.)
-//!    are left unchanged. When Index reaches a Buffer, it becomes a `Load`
-//!    with a flat memory offset computed from the index expressions.
-//! 3. `Reduce` nodes are expanded into accumulator loops (`DefineAcc` +
-//!    `Assign` + `End`), with `After` nodes to ensure correct ordering.
 //!
 //! ## Example: `a[2,3] + b[2,3]`
 //!
-//! **Input** (scheduled proto-kernel):
+//! **After `schedule()`** — Buffers replaced with Params, wrapped in Store/Sink:
 //! ```text
-//! Sink(Store(Param(0), Add(Reshape([2,3], Buffer(6)), Reshape([2,3], Buffer(6)))))
+//! Sink(Store(Param(0), Add(Reshape([2,3], Param(1)), Reshape([2,3], Param(2)))))
 //! ```
 //!
-//! **After rangeify** — Store matched, ranges created, Index pushed to buffers:
+//! **After `rangeify()`** — loops created, Index pushed down to Loads:
 //! ```text
 //! for i in 0..2:
 //!   for j in 0..3:
-//!     val0 = Load(a, i*3+j)
-//!     val1 = Load(b, i*3+j)
-//!     Store(out, i*3+j, val0 + val1)
+//!     val0 = Load(Param(1), i*3+j)
+//!     val1 = Load(Param(2), i*3+j)
+//!     Store(Param(0), i*3+j, val0 + val1)
 //! ```
 //!
 //! ## What's not here yet
@@ -61,15 +71,11 @@
 //!   need different ranges.
 //! - **Buffer cost analysis**: deciding which intermediates to materialize
 //!   vs. recompute.
-//! - **Buffer → Param in scheduler**: currently rangeify converts Buffers to
-//!   Params during Index pushing. Ideally the scheduler would do this
-//!   (matching tinygrad), but it requires solving how shape info flows
-//!   when flat Buffers wrapped in Reshape become Params.
 //!
 //! ## Submodules
 //!
-//! - [`indexing`] — core index transformation rules and helpers
-//! - [`rangeify`] — rewrite rules that add ranges and lower to kernel IR
+//! - [`indexing`] — core index transformation rules (see module docs for details)
+//! - [`rangeify`] — orchestrates all rewrite rules into a single pass
 
 pub mod indexing;
 pub mod rangeify;
@@ -83,11 +89,17 @@ use crate::uop::{Arg, Op, UOp};
 
 /// Schedule a tensor expression for execution as a single kernel.
 ///
-/// Converts all `Buffer` nodes to `Param` nodes (slot 0 = output, 1+ = inputs),
-/// collects the input buffers, and wraps in `Store`/`Sink`.
-/// This matches tinygrad where the scheduled AST has PARAM nodes for all buffers.
+/// This is the first step of lowering: it separates the computation graph
+/// from the concrete device buffers. Every `Buffer` node (which holds an
+/// `Rc<Buffer>` pointing to actual device memory) is replaced with a `Param`
+/// node (which just has a slot number). This way, rangeify and codegen work
+/// with abstract parameters, and the runtime binds actual buffers at launch.
 ///
-/// Returns `(scheduled_sink, input_buffers)`.
+/// The same `Buffer` identity (by `Rc` pointer) always maps to the same
+/// `Param` slot, so `a + a` correctly shares a single input parameter.
+///
+/// Returns `(scheduled_sink, input_buffers)` where slot 0 is the output
+/// and slots 1+ correspond to the collected input buffers.
 ///
 /// # Panics
 ///
@@ -102,15 +114,8 @@ pub fn schedule(expr: &UOp) -> (UOp, Vec<Buffer>) {
     let bufs = input_bufs.clone();
     let params = buf_params.clone();
 
-    // Replace Buffer → Param via graph_rewrite.
     let pm = PatternMatcher::new(vec![(
-        UPat {
-            op: Some(vec![Op::Buffer]),
-            name: Some("buf".into()),
-            arg: None,
-            src: None,
-            commutative: false,
-        },
+        UPat::named(Op::Buffer, "buf"),
         Box::new(move |caps: &Captures| {
             let buf_uop = caps.get("buf");
             let Arg::Buffer(ref rc) = buf_uop.arg() else { return None };

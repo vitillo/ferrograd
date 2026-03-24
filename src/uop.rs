@@ -116,6 +116,18 @@ pub enum Op {
     Assign,
 }
 
+impl Op {
+    /// Whether this op is an element-wise ALU operation (math on scalars).
+    #[must_use]
+    pub fn is_alu(self) -> bool {
+        matches!(
+            self,
+            Self::Add | Self::Mul | Self::Max | Self::CmpLt | Self::Where
+                | Self::Neg | Self::Exp2 | Self::Log2 | Self::Sqrt | Self::Reciprocal
+        )
+    }
+}
+
 impl fmt::Display for Op {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self, f)
@@ -308,17 +320,7 @@ impl UOp {
                 }
                 None
             }
-            // ALU ops: shape of first source with shape.
-            Op::Add
-            | Op::Mul
-            | Op::Max
-            | Op::CmpLt
-            | Op::Where
-            | Op::Neg
-            | Op::Exp2
-            | Op::Log2
-            | Op::Sqrt
-            | Op::Reciprocal => self.srcs()[0].shape(),
+            op if op.is_alu() => self.srcs()[0].shape(),
             // Kernel-level / scalar nodes: no shape.
             _ => None,
         }

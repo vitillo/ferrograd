@@ -1,8 +1,20 @@
 //! # Graph Rewriting — pattern-match-and-replace on `UOp` graphs
 //!
-//! Define patterns that match subgraphs and replacement functions that
-//! produce simplified equivalents. A fixed-point loop applies all rules
-//! bottom-up until no more fire.
+//! This is the compiler's workhorse: a general-purpose engine for
+//! transforming IR graphs. You define declarative rules ("when you see
+//! this pattern, replace it with that"), and `graph_rewrite` applies them
+//! in a fixed-point loop until no more rules fire.
+//!
+//! Almost every transformation in the compiler is expressed as rewrite rules:
+//! - **Scheduling**: `Buffer → Param` (in [`crate::schedule`])
+//! - **Rangeify**: Store → loops, Index pushing, Reduce expansion
+//!   (in [`crate::schedule::rangeify`])
+//! - **Simplification**: `x+0 → x`, constant folding (in [`symbolic_simple`])
+//!
+//! This matches tinygrad's architecture where `graph_rewrite` + `PatternMatcher`
+//! drive all lowering passes. The advantage over procedural transformations:
+//! rules are composable, order-independent, and the fixed-point loop
+//! handles cascading simplifications automatically.
 //!
 //! ## Tinygrad reference
 //!
@@ -142,6 +154,12 @@ impl UPat {
     #[must_use]
     pub fn op(op: Op, src: Vec<Self>) -> Self {
         Self { op: Some(vec![op]), name: None, arg: None, src: Some(src), commutative: false }
+    }
+
+    /// Match a specific op and capture it by name (any args/sources).
+    #[must_use]
+    pub fn named(op: Op, name: &str) -> Self {
+        Self { op: Some(vec![op]), name: Some(name.to_string()), arg: None, src: None, commutative: false }
     }
 
     /// Match a commutative binary op — tries all source permutations.
@@ -324,7 +342,14 @@ pub fn graph_rewrite(root: &UOp, pm: &PatternMatcher, name: &str) -> UOp {
     }
 }
 
-// ── Starter rules ───────────────────────────────────────────────────────────
+// ── Symbolic simplification ─────────────────────────────────────────────────
+//
+// These rules clean up the index arithmetic that rangeify generates.
+// For example, when a Reshape inserts a size-1 dim, flat_index produces
+// `idx * 1 + 0` — these rules simplify that to just `idx`.
+//
+// Tinygrad has a much larger set of symbolic rules (see `tinygrad/uop/symbolic.py`).
+// We start with the essentials: constant folding and identity elimination.
 
 fn fold_binary(op: Op, a: &Arg, b: &Arg) -> Option<Arg> {
     match (op, a, b) {
@@ -336,7 +361,18 @@ fn fold_binary(op: Op, a: &Arg, b: &Arg) -> Option<Arg> {
     }
 }
 
-/// Starter rules: constant folding and algebraic identities.
+/// Algebraic simplification rules for index arithmetic.
+///
+/// These run as a separate pass after rangeify to clean up redundant
+/// operations in the generated index expressions. The rules are:
+///
+/// - **Constant folding**: `3 + 4` → `7`, `2 * 3` → `6`
+/// - **Additive identity**: `x + 0` → `x` (common from broadcast dims with stride 0)
+/// - **Multiplicative identity**: `x * 1` → `x` (common from innermost-dim stride)
+/// - **Multiplicative zero**: `x * 0` → `0` (dead index arithmetic)
+///
+/// All binary rules use `UPat::comm` so they match regardless of operand order
+/// (e.g. both `x + 0` and `0 + x`).
 #[must_use]
 pub fn symbolic_simple() -> PatternMatcher {
     PatternMatcher::new(vec![
