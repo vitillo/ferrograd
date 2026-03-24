@@ -34,6 +34,56 @@ pub struct Tensor {
     requires_grad: bool,
 }
 
+/// A reusable symbolic index variable for view-based slicing.
+///
+/// Tinygrad models these as `DEFINE_VAR` + `BIND`. We expose a tiny wrapper so
+/// callers can reuse the same variable identity across many executions without
+/// touching raw `UOp`s.
+#[derive(Clone)]
+pub struct IndexVar {
+    name: String,
+    min: usize,
+    max: usize,
+}
+
+impl IndexVar {
+    /// Create a symbolic index variable with inclusive `[min, max]` bounds.
+    #[must_use]
+    pub fn new(name: &str, min: usize, max: usize) -> Self {
+        Self {
+            name: name.to_string(),
+            min,
+            max,
+        }
+    }
+
+    /// Bind a concrete value to this variable for one execution.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` falls outside the variable's declared range.
+    #[must_use]
+    pub fn bind(&self, value: usize) -> BoundIndex {
+        assert!(
+            self.min <= value && value <= self.max,
+            "bind value {value} out of range [{}, {}]",
+            self.min,
+            self.max
+        );
+        BoundIndex {
+            var: self.clone(),
+            value,
+        }
+    }
+}
+
+/// A concrete binding of an [`IndexVar`].
+#[derive(Clone)]
+pub struct BoundIndex {
+    var: IndexVar,
+    value: usize,
+}
+
 impl Tensor {
     /// Create a tensor from a float slice on the default CPU device.
     ///
@@ -283,34 +333,69 @@ impl Tensor {
     /// valid half-open interval for that dimension.
     #[must_use]
     pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Self {
+        let start = bound_const(start, self.device());
+        self.narrow_with_start(dim, &start, len)
+    }
+
+    /// Slice a single dimension using a symbolic start variable.
+    ///
+    /// Reusing the same [`IndexVar`] across executions lets the scheduler keep
+    /// one kernel shape while only the bound value changes at runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dim` is out of range or if `start..start + len` cannot fit
+    /// within that dimension.
+        #[must_use]
+        pub fn narrow_var(&self, dim: usize, start: &BoundIndex, len: usize) -> Self {
+            let var = UOp::variable(
+                &start.var.name,
+                i64::try_from(start.var.min).expect("index var min must fit in i64"),
+                i64::try_from(start.var.max).expect("index var max must fit in i64"),
+                self.device(),
+            );
+            let bound = UOp::bind(
+                var,
+                i64::try_from(start.value).expect("bound index value must fit in i64"),
+            );
+            self.narrow_with_start(dim, &bound, len)
+        }
+
+    fn narrow_with_start(&self, dim: usize, start: &UOp, len: usize) -> Self {
         let shape = self.shape();
         assert!(dim < shape.ndim(), "narrow: dim {dim} out of range");
-        let end = start
+        let start_value = bound_value(start);
+        let end = start_value
             .checked_add(len)
             .expect("narrow: start + len overflowed usize");
         assert!(
             end <= shape[dim],
-            "narrow: range [{start}, {end}) out of bounds for axis {dim} with size {}",
+            "narrow: range [{start_value}, {end}) out of bounds for axis {dim} with size {}",
             shape[dim]
         );
-        if start == 0 && len == shape[dim] {
+        if start_value == 0 && len == shape[dim] {
             return self.clone();
         }
 
-        let bounds: Vec<(usize, usize)> = shape
+        let starts: Vec<UOp> = shape
             .iter()
             .enumerate()
-            .map(|(axis, &size)| {
+            .map(|(axis, &_size)| {
                 if axis == dim {
-                    (start, end)
+                    start.clone()
                 } else {
-                    (0, size)
+                    UOp::const_int(0, DType::I32, self.device())
                 }
             })
             .collect();
+        let lengths: Vec<usize> = shape
+            .iter()
+            .enumerate()
+            .map(|(axis, &size)| if axis == dim { len } else { size })
+            .collect();
 
         Self {
-            uop: UOp::shrink(self.uop.clone(), &bounds),
+            uop: UOp::shrink(self.uop.clone(), &starts, &lengths),
             requires_grad: self.requires_grad,
         }
     }
@@ -478,7 +563,7 @@ impl Tensor {
         );
         assert_codegen_ready(&lowered);
 
-        let num_bufs = item.input_ids.len() + 1;
+        let num_bufs = item.inputs.len() + 1;
         let program = if let Some(program) = state.cached_program(&lowered) {
             if debug >= 1 {
                 let kid = KERNEL_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -516,9 +601,14 @@ impl Tensor {
 
         let mut out = state.device().allocate(item.out_dtype, item.out_shape.numel());
         let mut input_copies: Vec<Buffer> = item
-            .input_ids
+            .inputs
             .iter()
-            .map(|&id| state.load_buffer(id).expect("scheduled input buffer missing"))
+            .map(|input| match input {
+                schedule::KernelInput::Buffer(id) => {
+                    state.load_buffer(*id).expect("scheduled input buffer missing")
+                }
+                schedule::KernelInput::Scalar(buffer) => buffer.clone(),
+            })
             .collect();
         let mut buf_refs: Vec<&mut Buffer> = Vec::with_capacity(num_bufs);
         buf_refs.push(&mut out);
@@ -613,6 +703,29 @@ fn full(shape: Shape, dtype: DType, device: DeviceId, value: f64) -> UOp {
     UOp::expand(base, shape)
 }
 
+fn bound_const(value: usize, device: DeviceId) -> UOp {
+    #[allow(clippy::cast_possible_wrap)]
+    UOp::const_int(value as i64, DType::I32, device)
+}
+
+fn bound_value(start: &UOp) -> usize {
+    match start.op() {
+        Op::Const => {
+            let Arg::Int(value) = start.arg() else {
+                panic!("narrow start constant must be Arg::Int");
+            };
+            usize::try_from(*value).expect("narrow start must be non-negative")
+        }
+        Op::Bind => {
+            let Arg::Int(value) = start.srcs()[1].arg() else {
+                panic!("bound narrow start must carry an integer value");
+            };
+            usize::try_from(*value).expect("bound narrow start must be non-negative")
+        }
+        _ => panic!("narrow start must be a bound integer"),
+    }
+}
+
 fn broadcast_shapes(left: &Tensor, right: &Tensor) -> (Tensor, Tensor) {
     assert!(
         left.device() == right.device(),
@@ -638,7 +751,9 @@ fn assert_codegen_ready(root: &UOp) {
         assert!(
             !matches!(
                 node.op(),
-                Op::Buffer
+                Op::DefineVar
+                    | Op::Bind
+                    | Op::Buffer
                     | Op::Shrink
                     | Op::Reshape
                     | Op::Permute
@@ -752,6 +867,26 @@ mod tests {
         // Assert.
         assert_eq!(narrowed.shape(), [1, 3]);
         assert_eq!(narrowed.to_vec(), vec![4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_narrow_var_reuses_kernel_cache_across_bindings() {
+        // Arrange.
+        runtime::clear_for_tests(dev());
+        let x = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]);
+        let start = IndexVar::new("batch_start", 0, 1);
+
+        // Act.
+        let first = x.narrow_var(0, &start.bind(0), 2);
+        assert_eq!(first.to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
+        let after_first = runtime::kernel_cache_len(dev());
+
+        let second = x.narrow_var(0, &start.bind(1), 2);
+        assert_eq!(second.to_vec(), vec![3.0, 4.0, 5.0, 6.0]);
+
+        // Assert.
+        assert_eq!(after_first, 1);
+        assert_eq!(runtime::kernel_cache_len(dev()), after_first);
     }
 
     #[test]

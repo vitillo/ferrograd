@@ -9,17 +9,26 @@ pub mod rangeify;
 use std::collections::{HashMap, HashSet};
 
 use crate::dtype::DType;
+use crate::device::Buffer;
 use crate::runtime::{self, BufferId};
 use crate::rewrite::graph_rewrite;
 use crate::shape::Shape;
 use crate::uop::{Arg, Op, UOp};
 
+/// A runtime input to a compiled kernel.
+pub enum KernelInput {
+    /// A realized tensor buffer identified in device state.
+    Buffer(BufferId),
+    /// A one-element scalar buffer materialized for this execution.
+    Scalar(Buffer),
+}
+
 /// A single kernel to compile and execute.
 pub struct ScheduleItem {
     /// Kernel-ready `Sink(Store(Param(0), expr))`.
     pub sink: UOp,
-    /// Input buffer ids in parameter-slot order, excluding output slot 0.
-    pub input_ids: Vec<BufferId>,
+    /// Runtime inputs in parameter-slot order, excluding output slot 0.
+    pub inputs: Vec<KernelInput>,
     /// Output buffer id reserved for slot 0.
     pub output_id: BufferId,
     /// Output shape.
@@ -59,32 +68,52 @@ fn parameterize(expr: &UOp) -> ScheduleItem {
     use std::cell::RefCell;
 
     let state = runtime::state(expr.device());
-    let input_ids: RefCell<Vec<BufferId>> = RefCell::new(Vec::new());
+    let inputs: RefCell<Vec<KernelInput>> = RefCell::new(Vec::new());
     let params: RefCell<HashMap<BufferId, UOp>> = RefCell::new(HashMap::new());
+    let scalar_params: RefCell<HashMap<UOp, UOp>> = RefCell::new(HashMap::new());
 
-    let rewrite_buffer = |node: &UOp| -> Option<UOp> {
-        if node.op() != Op::Buffer {
-            return None;
+    let rewrite_inputs = |node: &UOp| -> Option<UOp> {
+        match node.op() {
+            Op::Buffer => {
+                let Arg::Buffer(id, numel) = node.arg() else {
+                    return None;
+                };
+                let dtype = node.dtype();
+                let mut params = params.borrow_mut();
+                Some(
+                    params
+                        .entry(*id)
+                        .or_insert_with(|| {
+                            let mut inputs = inputs.borrow_mut();
+                            let slot = inputs.len() + 1;
+                            inputs.push(KernelInput::Buffer(*id));
+                            UOp::param(slot, dtype, *numel, expr.device())
+                        })
+                        .clone(),
+                )
+            }
+            Op::Bind => {
+                let variable = node.srcs()[0].clone();
+                let literal = node.srcs()[1].arg().clone();
+                let mut scalar_params = scalar_params.borrow_mut();
+                let param = scalar_params
+                    .entry(variable)
+                    .or_insert_with(|| {
+                        let mut inputs = inputs.borrow_mut();
+                        let slot = inputs.len() + 1;
+                        inputs.push(KernelInput::Scalar(literal_buffer(node.dtype(), &literal)));
+                        UOp::param(slot, node.dtype(), 1, expr.device())
+                    })
+                    .clone();
+                let zero = UOp::const_int(0, DType::I32, expr.device());
+                let index = UOp::new(Op::Index, node.dtype(), vec![param, zero], Arg::Index(0));
+                Some(UOp::new(Op::Load, node.dtype(), vec![index], Arg::None))
+            }
+            _ => None,
         }
-        let Arg::Buffer(id, numel) = node.arg() else {
-            return None;
-        };
-        let dtype = node.dtype();
-        let mut params = params.borrow_mut();
-        Some(
-            params
-                .entry(*id)
-                .or_insert_with(|| {
-                    let mut ids = input_ids.borrow_mut();
-                    let slot = ids.len() + 1;
-                    ids.push(*id);
-                    UOp::param(slot, dtype, *numel, expr.device())
-                })
-                .clone(),
-        )
     };
 
-    let parameterized = graph_rewrite(expr, &rewrite_buffer, "schedule");
+    let parameterized = graph_rewrite(expr, &rewrite_inputs, "schedule");
     let out_shape = parameterized.shape().unwrap_or_else(|| Shape::flat(1));
     let output_id = state.reserve_buffer(expr.dtype(), out_shape.numel());
     let out_param = UOp::param(0, expr.dtype(), out_shape.numel(), expr.device());
@@ -98,10 +127,26 @@ fn parameterize(expr: &UOp) -> ScheduleItem {
 
     ScheduleItem {
         sink,
-        input_ids: input_ids.into_inner(),
+        inputs: inputs.into_inner(),
         output_id,
         out_shape,
         out_dtype: expr.dtype(),
+    }
+}
+
+fn literal_buffer(dtype: DType, literal: &Arg) -> Buffer {
+    match literal {
+        #[allow(clippy::cast_possible_truncation)]
+        Arg::Float(value) => Buffer::from_f32(&[*value as f32]),
+        Arg::Int(value) => {
+            let value = i32::try_from(*value).expect("kernel scalar int must fit in i32");
+            let bytes = value.to_ne_bytes().to_vec();
+            Buffer::new(dtype, 1, crate::device::Storage::Cpu(bytes))
+        }
+        Arg::Bool(value) => {
+            Buffer::new(dtype, 1, crate::device::Storage::Cpu(vec![u8::from(*value)]))
+        }
+        _ => panic!("kernel scalar input must be a literal"),
     }
 }
 
@@ -136,7 +181,7 @@ fn should_materialize(
     if node == root || node.shape().is_none() {
         return false;
     }
-    if matches!(node.op(), Op::Buffer | Op::Const) {
+    if matches!(node.op(), Op::Buffer | Op::Const | Op::DefineVar | Op::Bind) {
         return false;
     }
     if consumer_map.get(node).is_some_and(|consumers| consumers.len() > 1) {
@@ -217,7 +262,7 @@ mod tests {
 
         let items = schedule(&outer);
         assert_eq!(items.len(), 2);
-        assert_eq!(items[1].input_ids, vec![items[0].output_id]);
+        assert!(matches!(items[1].inputs[0], KernelInput::Buffer(id) if id == items[0].output_id));
     }
 
     #[test]
@@ -232,8 +277,9 @@ mod tests {
 
         let items = schedule(&root);
         assert_eq!(items.len(), 4);
-        assert_eq!(items[1].input_ids, vec![items[0].output_id]);
-        assert_eq!(items[2].input_ids, vec![items[0].output_id]);
-        assert_eq!(items[3].input_ids, vec![items[1].output_id, items[2].output_id]);
+        assert!(matches!(items[1].inputs[0], KernelInput::Buffer(id) if id == items[0].output_id));
+        assert!(matches!(items[2].inputs[0], KernelInput::Buffer(id) if id == items[0].output_id));
+        assert!(matches!(items[3].inputs[0], KernelInput::Buffer(id) if id == items[1].output_id));
+        assert!(matches!(items[3].inputs[1], KernelInput::Buffer(id) if id == items[2].output_id));
     }
 }
