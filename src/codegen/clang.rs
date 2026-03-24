@@ -55,7 +55,7 @@ impl Renderer for ClangRenderer {
             // Side-effect-only nodes — no C expression to name.
             match node.op() {
                 Op::Sink => continue,
-                Op::Device => {
+                Op::Device | Op::DefineVar => {
                     names.insert(node, String::new());
                     continue;
                 }
@@ -243,11 +243,17 @@ impl Renderer for ClangRenderer {
                     names.insert(node, acc_var);
                 }
                 // Sink, End, Store, After, Buffer handled above.
-                Op::Sink | Op::End | Op::Store | Op::After | Op::Buffer | Op::Device => {
+                Op::Sink | Op::End | Op::Store | Op::After | Op::Buffer | Op::Device | Op::DefineVar => {
                     unreachable!()
                 }
                 // Tensor-level and unexpanded ops should be lowered before codegen.
-                Op::Shrink | Op::Reshape | Op::Permute | Op::Expand | Op::ReduceAxis | Op::Reduce => {
+                Op::Bind
+                | Op::Shrink
+                | Op::Reshape
+                | Op::Permute
+                | Op::Expand
+                | Op::ReduceAxis
+                | Op::Reduce => {
                     unreachable!("{op:?} should be lowered before codegen", op = node.op())
                 }
             }

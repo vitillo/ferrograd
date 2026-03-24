@@ -91,18 +91,16 @@ pub fn rewrite_index_movement(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
 
     let new_idxs = match inner.op() {
         Op::Shrink => {
-            let Arg::Bounds(bounds) = inner.arg() else {
+            let Arg::Bounds(lengths) = inner.arg() else {
                 panic!("Shrink must have Arg::Bounds");
             };
             idxs.iter()
-                .zip(bounds.iter())
-                .map(|(idx, &(start, _))| {
-                    if start == 0 {
+                .zip(inner.srcs()[1..].iter().zip(lengths.iter()))
+                .map(|(idx, (start, _))| {
+                    if start.is_zero() {
                         return idx.clone();
                     }
-                    #[allow(clippy::cast_possible_wrap)]
-                    let offset = UOp::const_int(start as i64, DType::I32, idx.device());
-                    UOp::add(idx.clone(), offset)
+                    UOp::add(idx.clone(), start.clone())
                 })
                 .collect()
         }

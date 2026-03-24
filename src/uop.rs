@@ -21,6 +21,10 @@ use crate::shape::Shape;
 pub enum Op {
     /// A device identity leaf.
     Device,
+    /// A symbolic integer variable with a known min/max range.
+    DefineVar,
+    /// Bind a concrete value to a symbolic variable for one execution.
+    Bind,
     /// A realized data buffer.
     Buffer,
     /// Narrow each dimension to a half-open range without copying.
@@ -112,6 +116,8 @@ pub enum Arg {
     None,
     /// Device identity for `Device`.
     Device(DeviceId),
+    /// Symbolic variable metadata: name, min, max.
+    Variable(String, i64, i64),
     /// Axis id for `Range`, or sentinel tag for kernel-level `Index`.
     Index(usize),
     /// Kernel parameter slot and flattened element count.
@@ -124,8 +130,8 @@ pub enum Arg {
     Bool(bool),
     /// Device buffer id and flat element count.
     Buffer(BufferId, usize),
-    /// Per-dimension half-open bounds for `Shrink`.
-    Bounds(Box<[(usize, usize)]>),
+    /// Per-dimension concrete lengths for `Shrink`.
+    Bounds(Box<[usize]>),
     /// Shape payload for `Reshape` and `Expand`.
     Shape(Shape),
     /// Axis payload for `Permute`.
@@ -135,10 +141,14 @@ pub enum Arg {
 }
 
 impl PartialEq for Arg {
+    #[allow(clippy::match_same_arms)]
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::None, Self::None) => true,
             (Self::Device(a), Self::Device(b)) => a == b,
+            (Self::Variable(name_a, min_a, max_a), Self::Variable(name_b, min_b, max_b)) => {
+                name_a == name_b && min_a == min_b && max_a == max_b
+            }
             (Self::Index(a), Self::Index(b)) => a == b,
             (Self::Param(sa, na), Self::Param(sb, nb)) => sa == sb && na == nb,
             (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
@@ -164,6 +174,11 @@ impl std::hash::Hash for Arg {
         match self {
             Self::None => {}
             Self::Device(device) => device.hash(state),
+            Self::Variable(name, min, max) => {
+                name.hash(state);
+                min.hash(state);
+                max.hash(state);
+            }
             Self::Index(i) => i.hash(state),
             Self::Param(slot, numel) => {
                 slot.hash(state);
@@ -176,7 +191,7 @@ impl std::hash::Hash for Arg {
                 id.hash(state);
                 numel.hash(state);
             }
-            Self::Bounds(bounds) => bounds.hash(state),
+            Self::Bounds(lengths) => lengths.hash(state),
             Self::Shape(shape) => shape.hash(state),
             Self::Axes(axes) => axes.hash(state),
             Self::Reduce(op, axes) => {
@@ -192,13 +207,14 @@ impl fmt::Display for Arg {
         match self {
             Self::None => write!(f, ""),
             Self::Device(device) => write!(f, "{device:?}"),
+            Self::Variable(name, min, max) => write!(f, "{name}[{min}, {max}]"),
             Self::Index(i) => write!(f, "{i}"),
             Self::Param(slot, numel) => write!(f, "slot={slot},n={numel}"),
             Self::Float(v) => write!(f, "{v}"),
             Self::Int(v) => write!(f, "{v}"),
             Self::Bool(v) => write!(f, "{v}"),
             Self::Buffer(id, numel) => write!(f, "buf#{id}[{numel}]"),
-            Self::Bounds(bounds) => write!(f, "{bounds:?}"),
+            Self::Bounds(lengths) => write!(f, "{lengths:?}"),
             Self::Shape(shape) => write!(f, "{shape:?}"),
             Self::Axes(axes) => write!(f, "{axes:?}"),
             Self::Reduce(op, axes) => write!(f, "{op:?}({axes:?})"),
@@ -263,6 +279,18 @@ impl UOp {
         Self::build(device, Op::Device, DType::Void, vec![], Arg::Device(device))
     }
 
+    /// Create a symbolic integer variable leaf.
+    #[must_use]
+    pub(crate) fn variable(name: &str, min: i64, max: i64, device: DeviceId) -> Self {
+        Self::build(
+            device,
+            Op::DefineVar,
+            DType::I32,
+            vec![Self::device_uop(device)],
+            Arg::Variable(name.to_string(), min, max),
+        )
+    }
+
     /// Create a kernel parameter leaf on `device`.
     #[must_use]
     #[cfg_attr(not(test), allow(dead_code))]
@@ -325,6 +353,25 @@ impl UOp {
             vec![Self::device_uop(device)],
             Arg::Bool(value),
         )
+    }
+
+    /// Bind a concrete value to a symbolic variable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `var` is not a `DefineVar` or if `value` is out of range.
+    #[must_use]
+    pub(crate) fn bind(var: Self, value: i64) -> Self {
+        let Arg::Variable(_, min, max) = var.arg() else {
+            panic!("Bind requires a DefineVar source");
+        };
+        assert!(
+            *min <= value && value <= *max,
+            "bind value {value} out of range [{min}, {max}]"
+        );
+        let device = var.device();
+        let value_uop = Self::const_int(value, DType::I32, device);
+        Self::new(Op::Bind, DType::I32, vec![var, value_uop], Arg::None)
     }
 
     /// Return the device this node belongs to.
@@ -393,15 +440,10 @@ impl UOp {
                 Some(Shape::flat(*numel))
             }
             Op::Shrink => {
-                let Arg::Bounds(bounds) = self.arg() else {
+                let Arg::Bounds(lengths) = self.arg() else {
                     return None;
                 };
-                Some(Shape::new(
-                    bounds
-                        .iter()
-                        .map(|&(start, end)| end.saturating_sub(start))
-                        .collect(),
-                ))
+                Some(Shape::new(lengths.to_vec()))
             }
             Op::Reshape | Op::Expand => {
                 let Arg::Shape(shape) = self.arg() else {
@@ -432,7 +474,7 @@ impl UOp {
                 ))
             }
             Op::Const => Some(Shape::flat(1)),
-            Op::Device => None,
+            Op::Device | Op::DefineVar | Op::Bind => None,
             op if op.is_alu() => self.srcs()[0].shape(),
             _ => None,
         }
@@ -475,13 +517,15 @@ impl UOp {
     }
 
     #[must_use]
-    pub(crate) fn shrink(src: Self, bounds: &[(usize, usize)]) -> Self {
+    pub(crate) fn shrink(src: Self, starts: &[Self], lengths: &[usize]) -> Self {
         let dtype = src.dtype();
+        let mut srcs = vec![src];
+        srcs.extend_from_slice(starts);
         Self::new(
             Op::Shrink,
             dtype,
-            vec![src],
-            Arg::Bounds(bounds.to_vec().into_boxed_slice()),
+            srcs,
+            Arg::Bounds(lengths.to_vec().into_boxed_slice()),
         )
     }
 
