@@ -346,6 +346,24 @@ impl UOp {
         Self::new(Op::Const, dtype, vec![], Arg::Int(value))
     }
 
+    /// Whether this is a `Const` node.
+    #[must_use]
+    pub fn is_const(&self) -> bool {
+        self.op() == Op::Const
+    }
+
+    /// Whether this is a `Const` node with a specific float value.
+    #[must_use]
+    pub fn is_const_float(&self, val: f64) -> bool {
+        self.op() == Op::Const && *self.arg() == Arg::Float(val)
+    }
+
+    /// Whether this is a `Const` node with a specific int value.
+    #[must_use]
+    pub fn is_const_int(&self, val: i64) -> bool {
+        self.op() == Op::Const && *self.arg() == Arg::Int(val)
+    }
+
     /// Loop range with `axis` id and upper `bound`.
     #[must_use]
     pub fn range(axis: usize, bound: Self) -> Self {
