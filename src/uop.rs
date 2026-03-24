@@ -20,59 +20,100 @@ use crate::dtype::DType;
 // ── Op ──────────────────────────────────────────────────────────────────────
 
 /// The operations our IR supports.
+///
+/// The same `Op` enum is used at both the tensor level (lazy graph built by
+/// the user) and the kernel level (executable loops + loads + stores produced
+/// by rangeify). Tensor-level ops are lowered away before codegen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Op {
-    // Tensor-level
-    /// A realized tensor buffer. Arg is `Arg::Buffer(buf)`.
+    // ── Tensor-level ──────────────────────────────────────────────────
+    /// A realized data buffer.
+    /// srcs: none. arg: `Arg::Buffer(data)`.
     Buffer,
+    /// Change shape without moving data.
+    /// srcs: `[source]`. arg: `Arg::Dims(new_shape)`.
+    Reshape,
+    /// Reorder dimensions.
+    /// srcs: `[source]`. arg: `Arg::Dims(axis_order)`.
+    Permute,
+    /// Broadcast dimensions of size 1 to a larger size.
+    /// srcs: `[source]`. arg: `Arg::Dims(new_shape)`.
+    Expand,
+    /// Reduce over axes (e.g. sum, max). Tensor-level, lowered to `Reduce`.
+    /// srcs: `[source]`. arg: `Arg::Reduce(op, axes)`.
+    ReduceAxis,
 
-    // Kernel structure
-    /// A kernel buffer parameter. Arg is `Arg::Index(slot)`.
+    // ── Kernel structure ──────────────────────────────────────────────
+    /// A kernel buffer parameter (pointer to device memory).
+    /// srcs: none. arg: `Arg::Param(slot, numel)` where slot 0 is the output.
     Param,
-    /// Loop counter. Arg is `Arg::Index(axis)`.
+    /// Loop from 0 to bound. Opens a `for` loop in codegen.
+    /// srcs: `[bound]` + optional ordering deps. arg: `Arg::Index(axis_id)`.
     Range,
-    /// Closes a Range loop.
+    /// Closes a `Range` loop.
+    /// srcs: `[range]` + ordering deps (e.g. the Store or Assign inside).
     End,
-    /// Root of a kernel graph.
+    /// Root of a completed kernel graph.
+    /// srcs: all top-level nodes (End, Store).
     Sink,
 
-    // Memory
-    /// Pointer arithmetic: Param + Range.
+    // ── Memory / Indexing ─────────────────────────────────────────────
+    /// At the tensor level: `srcs: [expr, range0, range1, ...]` — index an
+    /// expression at loop positions. At the kernel level: `srcs: [param,
+    /// flat_offset]` — pointer arithmetic for memory access.
     Index,
-    /// Read from an address.
+    /// Read a value from memory.
+    /// srcs: `[index]` (an Index node).
     Load,
-    /// Write to an address.
+    /// Write a value to memory.
+    /// srcs: `[index, value]`.
     Store,
 
-    // Constants
-    /// A compile-time constant. Arg is the value.
+    // ── Constants ─────────────────────────────────────────────────────
+    /// A compile-time constant.
+    /// srcs: none. arg: `Arg::Float`, `Arg::Int`, or `Arg::Bool`.
     Const,
 
-    // Math: unary
-    /// Negate: `-x`.
+    // ── Math: unary ───────────────────────────────────────────────────
+    /// `-x`. srcs: `[x]`.
     Neg,
-    /// Base-2 exponential: `2^x`.
+    /// `2^x`. srcs: `[x]`.
     Exp2,
-    /// Base-2 logarithm: `log2(x)`.
+    /// `log2(x)`. srcs: `[x]`.
     Log2,
-    /// Square root.
+    /// `sqrt(x)`. srcs: `[x]`.
     Sqrt,
-    /// Reciprocal: `1/x`.
+    /// `1/x`. srcs: `[x]`.
     Reciprocal,
 
-    // Math: binary
-    /// Addition.
+    // ── Math: binary ──────────────────────────────────────────────────
+    /// `x + y`. srcs: `[x, y]`.
     Add,
-    /// Multiplication.
+    /// `x * y`. srcs: `[x, y]`.
     Mul,
-    /// Maximum.
+    /// `max(x, y)`. srcs: `[x, y]`.
     Max,
-    /// Less-than comparison, returns bool.
+    /// `x < y`, returns bool. srcs: `[x, y]`.
     CmpLt,
 
-    // Math: ternary
-    /// Conditional select: `where(cond, true_val, false_val)`.
+    // ── Math: ternary ─────────────────────────────────────────────────
+    /// `if cond then true_val else false_val`. srcs: `[cond, true_val, false_val]`.
     Where,
+
+    // ── Kernel-level reduction ────────────────────────────────────────
+    /// Reduce a value over loop ranges (e.g. sum over a loop).
+    /// srcs: `[value, range0, range1, ...]`. arg: `Arg::Reduce(op, _)`.
+    /// Expanded to DefineAcc/Assign/End/After before codegen.
+    Reduce,
+    /// Ordering barrier: makes `value` depend on `barrier` in the toposort.
+    /// srcs: `[value, barrier]`. Codegen passes through `value`.
+    After,
+    /// Declares a mutable accumulator variable.
+    /// srcs: `[initial_value]` + optional ordering deps.
+    DefineAcc,
+    /// Updates an accumulator: `acc = new_value`.
+    /// srcs: `[acc, new_value]`.
+    Assign,
 }
 
 impl fmt::Display for Op {
@@ -88,8 +129,10 @@ impl fmt::Display for Op {
 pub enum Arg {
     /// No argument.
     None,
-    /// An integer index — buffer slot for Param, axis id for Range.
+    /// An integer index — axis id for Range.
     Index(usize),
+    /// Kernel buffer parameter: (slot, numel). Slot 0 is the output.
+    Param(usize, usize),
     /// A constant float value.
     Float(f64),
     /// A constant integer value.
@@ -99,6 +142,10 @@ pub enum Arg {
     /// A realized tensor buffer. Rc-wrapped for cheap cloning during rewrites.
     /// Identity is by Rc pointer, not by content.
     Buffer(Rc<Buffer>),
+    /// Dimension list — shape for Reshape/Expand, axis order for Permute.
+    Dims(Vec<usize>),
+    /// Reduction: (`reduce_op`, axes).
+    Reduce(Op, Vec<usize>),
 }
 
 impl PartialEq for Arg {
@@ -106,10 +153,13 @@ impl PartialEq for Arg {
         match (self, other) {
             (Self::None, Self::None) => true,
             (Self::Index(a), Self::Index(b)) => a == b,
+            (Self::Param(sa, na), Self::Param(sb, nb)) => sa == sb && na == nb,
             (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
             (Self::Int(a), Self::Int(b)) => a == b,
             (Self::Bool(a), Self::Bool(b)) => a == b,
             (Self::Buffer(a), Self::Buffer(b)) => Rc::ptr_eq(a, b),
+            (Self::Dims(a), Self::Dims(b)) => a == b,
+            (Self::Reduce(op_a, ax_a), Self::Reduce(op_b, ax_b)) => op_a == op_b && ax_a == ax_b,
             _ => false,
         }
     }
@@ -123,10 +173,16 @@ impl std::hash::Hash for Arg {
         match self {
             Self::None => {}
             Self::Index(i) => i.hash(state),
+            Self::Param(s, n) => { s.hash(state); n.hash(state); }
             Self::Float(f) => f.to_bits().hash(state),
             Self::Int(i) => i.hash(state),
             Self::Bool(b) => b.hash(state),
             Self::Buffer(rc) => Rc::as_ptr(rc).hash(state),
+            Self::Dims(d) => d.hash(state),
+            Self::Reduce(op, axes) => {
+                op.hash(state);
+                axes.hash(state);
+            }
         }
     }
 }
@@ -136,10 +192,13 @@ impl fmt::Display for Arg {
         match self {
             Self::None => write!(f, ""),
             Self::Index(i) => write!(f, "{i}"),
+            Self::Param(slot, numel) => write!(f, "slot={slot},n={numel}"),
             Self::Float(v) => write!(f, "{v}"),
             Self::Int(v) => write!(f, "{v}"),
             Self::Bool(v) => write!(f, "{v}"),
             Self::Buffer(buf) => write!(f, "buf({})", buf.numel()),
+            Self::Dims(d) => write!(f, "{d:?}"),
+            Self::Reduce(op, axes) => write!(f, "{op:?}({axes:?})"),
         }
     }
 }
@@ -200,12 +259,77 @@ impl UOp {
         Rc::as_ptr(&self.0) as usize
     }
 
+    // ── Shape ─────────────────────────────────────────────────────────
+
+    /// Compute shape from the graph structure (like tinygrad's `_shape`).
+    ///
+    /// Returns `None` for scalar/kernel-level nodes (Const, Param, Range, etc.).
+    #[must_use]
+    pub fn shape(&self) -> Option<Vec<usize>> {
+        match self.op() {
+            // Buffer and Param are always flat (1D).
+            Op::Buffer => {
+                if let Arg::Buffer(ref buf) = self.arg() {
+                    return Some(vec![buf.numel()]);
+                }
+                None
+            }
+            Op::Param => {
+                if let Arg::Param(_, numel) = self.arg() {
+                    return Some(vec![*numel]);
+                }
+                None
+            }
+            // Movement ops derive shape from their arg or source.
+            Op::Reshape | Op::Expand => {
+                if let Arg::Dims(ref dims) = self.arg() {
+                    return Some(dims.clone());
+                }
+                None
+            }
+            Op::Permute => {
+                if let Arg::Dims(ref order) = self.arg() {
+                    let src_shape = self.srcs()[0].shape()?;
+                    return Some(order.iter().map(|&i| src_shape[i]).collect());
+                }
+                None
+            }
+            // Reduction: reduced axes become 1.
+            Op::ReduceAxis => {
+                if let Arg::Reduce(_, ref axes) = self.arg() {
+                    let src_shape = self.srcs()[0].shape()?;
+                    return Some(
+                        src_shape
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &s)| if axes.contains(&i) { 1 } else { s })
+                            .collect(),
+                    );
+                }
+                None
+            }
+            // ALU ops: shape of first source with shape.
+            Op::Add
+            | Op::Mul
+            | Op::Max
+            | Op::CmpLt
+            | Op::Where
+            | Op::Neg
+            | Op::Exp2
+            | Op::Log2
+            | Op::Sqrt
+            | Op::Reciprocal => self.srcs()[0].shape(),
+            // Kernel-level / scalar nodes: no shape.
+            _ => None,
+        }
+    }
+
     // ── Builder methods ─────────────────────────────────────────────────
 
     /// Kernel buffer parameter at `slot`.
     #[must_use]
-    pub fn param(slot: usize, dtype: DType) -> Self {
-        Self::new(Op::Param, dtype, vec![], Arg::Index(slot))
+    pub fn param(slot: usize, dtype: DType, numel: usize) -> Self {
+        Self::new(Op::Param, dtype, vec![], Arg::Param(slot, numel))
     }
 
     /// Scalar float constant.
@@ -232,11 +356,12 @@ impl UOp {
         Self::new(Op::End, DType::Void, vec![range], Arg::None)
     }
 
-    /// Pointer arithmetic.
+    /// Build an Index node. At the tensor level: multi-dim indexing.
+    /// At the kernel level: flat pointer arithmetic.
     #[must_use]
-    pub fn index(ptr: Self, offset: Self) -> Self {
-        let dtype = ptr.dtype();
-        Self::new(Op::Index, dtype, vec![ptr, offset], Arg::None)
+    pub fn index(src: Self, offset: Self) -> Self {
+        let dtype = src.dtype();
+        Self::new(Op::Index, dtype, vec![src, offset], Arg::None)
     }
 
     /// Load from an address.
@@ -291,11 +416,7 @@ impl UOp {
     pub fn dump(&self) -> String {
         use std::fmt::Write;
         let order = self.toposort();
-        let id_map: HashMap<&UOp, usize> = order
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n, i))
-            .collect();
+        let id_map: HashMap<&UOp, usize> = order.iter().enumerate().map(|(i, n)| (n, i)).collect();
 
         let mut out = String::new();
         for node in &order {
@@ -352,9 +473,9 @@ mod tests {
     #[test]
     fn test_build_elementwise_add_kernel() {
         // Arrange/Act — build: out[i] = a[i] + b[i]
-        let out_ptr = UOp::param(0, DType::F32);
-        let a_ptr = UOp::param(1, DType::F32);
-        let b_ptr = UOp::param(2, DType::F32);
+        let out_ptr = UOp::param(0, DType::F32, 1024);
+        let a_ptr = UOp::param(1, DType::F32, 1024);
+        let b_ptr = UOp::param(2, DType::F32, 1024);
         let n = UOp::const_int(1024, DType::I32);
         let idx = UOp::range(0, n);
         let a_val = UOp::load(UOp::index(a_ptr, idx.clone()), DType::F32);

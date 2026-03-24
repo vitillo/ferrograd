@@ -6,17 +6,17 @@
 //! ## Debug output
 //!
 //! Set `DEBUG` env var (same as tinygrad):
-//! - 1: kernel summary, 2: + timing, 3: + `UOp` dump, 4: + generated C
+//! - 1: kernel summary, 2: + timing, 3: + graph rewrite before/after, 4: + generated C
 
 use std::rc::Rc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use crate::codegen::{ClangRenderer, Renderer};
 use crate::device::{Buffer, CpuDevice, Device};
 use crate::dtype::DType;
-use crate::lower::lower_to_kernel;
+use crate::schedule::{self, rangeify::rangeify};
 use crate::uop::{Arg, Op, UOp};
 
 static DEBUG: LazyLock<u8> = LazyLock::new(|| {
@@ -39,14 +39,30 @@ pub struct Tensor {
 
 impl Tensor {
     /// Create a tensor from a float slice on the given device.
+    ///
+    /// # Panics
+    ///
+    /// Panics if data length doesn't match the product of shape.
     #[must_use]
-    pub fn from_slice(data: &[f32], device: &Rc<dyn Device>) -> Self {
+    pub fn from_slice(data: &[f32], shape: &[usize], device: &Rc<dyn Device>) -> Self {
+        assert_eq!(
+            data.len(),
+            shape.iter().product::<usize>(),
+            "data length {} doesn't match shape {shape:?}",
+            data.len()
+        );
+        let buf_uop = UOp::new(
+            Op::Buffer,
+            DType::F32,
+            vec![],
+            Arg::Buffer(Rc::new(Buffer::from_f32(data))),
+        );
         Self {
             uop: UOp::new(
-                Op::Buffer,
+                Op::Reshape,
                 DType::F32,
-                vec![],
-                Arg::Buffer(Rc::new(Buffer::from_f32(data))),
+                vec![buf_uop],
+                Arg::Dims(shape.to_vec()),
             ),
             device: device.clone(),
         }
@@ -54,10 +70,12 @@ impl Tensor {
 
     /// Create a tensor filled with zeros on the given device.
     #[must_use]
-    pub fn zeros(numel: usize, dtype: DType, device: &Rc<dyn Device>) -> Self {
+    pub fn zeros(shape: &[usize], dtype: DType, device: &Rc<dyn Device>) -> Self {
+        let numel = shape.iter().product();
         let buf = device.allocate(dtype, numel);
+        let buf_uop = UOp::new(Op::Buffer, dtype, vec![], Arg::Buffer(Rc::new(buf)));
         Self {
-            uop: UOp::new(Op::Buffer, dtype, vec![], Arg::Buffer(Rc::new(buf))),
+            uop: UOp::new(Op::Reshape, dtype, vec![buf_uop], Arg::Dims(shape.to_vec())),
             device: device.clone(),
         }
     }
@@ -68,31 +86,50 @@ impl Tensor {
         self.uop.dtype()
     }
 
-    /// Number of elements (walks to a Buffer leaf).
+    /// Number of elements (product of shape).
     #[must_use]
     pub fn numel(&self) -> usize {
-        Self::derive_numel(&self.uop)
+        self.shape().iter().product()
     }
 
-    /// The tensor's shape (1D for now).
+    /// Shape derived from the `UOp` graph.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `UOp` graph doesn't have shape info.
     #[must_use]
     pub fn shape(&self) -> Vec<usize> {
-        vec![self.numel()]
+        self.uop.shape().expect("tensor must have shape")
+    }
+
+    /// Number of dimensions.
+    #[must_use]
+    pub fn ndim(&self) -> usize {
+        self.shape().len()
     }
 
     /// Whether this tensor's data has been computed. `false` means it's
     /// still a lazy graph that needs `realize()` to execute.
     #[must_use]
     pub fn is_realized(&self) -> bool {
-        self.uop.op() == Op::Buffer
+        match self.uop.op() {
+            Op::Buffer => true,
+            Op::Reshape => self.uop.srcs()[0].op() == Op::Buffer,
+            _ => false,
+        }
     }
 
-    fn derive_numel(uop: &UOp) -> usize {
-        if let Arg::Buffer(ref buf) = uop.arg() {
-            return buf.numel();
+    /// Extract the Buffer from a realized tensor (handles Reshape wrapper).
+    fn realized_buffer(&self) -> &Rc<Buffer> {
+        let buf_uop = match self.uop.op() {
+            Op::Buffer => &self.uop,
+            Op::Reshape => &self.uop.srcs()[0],
+            _ => panic!("not a realized tensor"),
+        };
+        match buf_uop.arg() {
+            Arg::Buffer(rc) => rc,
+            _ => panic!("realized tensor must have Arg::Buffer"),
         }
-        assert!(!uop.srcs().is_empty(), "non-Buffer leaf has no sources");
-        Self::derive_numel(&uop.srcs()[0])
     }
 
     // ── Lazy ops ────────────────────────────────────────────────────────
@@ -105,7 +142,7 @@ impl Tensor {
     }
 
     fn binary(&self, other: &Self, op: Op, out_dtype: DType) -> Self {
-        assert_eq!(self.numel(), other.numel(), "shape mismatch for {op:?}");
+        assert_eq!(self.shape(), other.shape(), "shape mismatch for {op:?}");
         Self {
             uop: UOp::new(
                 op,
@@ -117,24 +154,25 @@ impl Tensor {
         }
     }
 
-    /// Element-wise addition.
-    ///
-    /// # Panics
-    ///
-    /// Panics if shapes don't match.
-    #[must_use]
-    pub fn add(&self, other: &Self) -> Self {
-        self.binary(other, Op::Add, self.dtype())
+    /// Broadcast two tensors to a common shape, then apply a binary op.
+    fn broadcasted(&self, other: &Self, op: Op, out_dtype: DType) -> Self {
+        if self.shape() == other.shape() {
+            return self.binary(other, op, out_dtype);
+        }
+        let (a, b) = broadcast_shapes(self, other);
+        a.binary(&b, op, out_dtype)
     }
 
-    /// Element-wise multiplication.
-    ///
-    /// # Panics
-    ///
-    /// Panics if shapes don't match.
+    /// Element-wise addition with broadcasting.
+    #[must_use]
+    pub fn add(&self, other: &Self) -> Self {
+        self.broadcasted(other, Op::Add, self.dtype())
+    }
+
+    /// Element-wise multiplication with broadcasting.
     #[must_use]
     pub fn mul(&self, other: &Self) -> Self {
-        self.binary(other, Op::Mul, self.dtype())
+        self.broadcasted(other, Op::Mul, self.dtype())
     }
 
     /// Element-wise negation.
@@ -146,7 +184,7 @@ impl Tensor {
     /// Relu: `where(0 < self, self, 0)`.
     #[must_use]
     pub fn relu(&self) -> Self {
-        let zero = Self::zeros(self.numel(), self.dtype(), &self.device);
+        let zero = Self::zeros(&self.shape(), self.dtype(), &self.device);
         let cond = zero.binary(self, Op::CmpLt, DType::Bool);
         Self {
             uop: UOp::new(
@@ -157,6 +195,138 @@ impl Tensor {
             ),
             device: self.device.clone(),
         }
+    }
+
+    // ── Movement ops ───────────────────────────────────────────────────
+
+    /// Change the shape without moving data.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the product of new shape differs from the current numel.
+    #[must_use]
+    pub fn reshape(&self, new_shape: &[usize]) -> Self {
+        let new_numel: usize = new_shape.iter().product();
+        assert_eq!(self.numel(), new_numel, "reshape: numel mismatch");
+        if self.shape() == new_shape {
+            return self.clone();
+        }
+        Self {
+            uop: UOp::new(
+                Op::Reshape,
+                self.dtype(),
+                vec![self.uop.clone()],
+                Arg::Dims(new_shape.to_vec()),
+            ),
+            device: self.device.clone(),
+        }
+    }
+
+    /// Reorder dimensions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `order` isn't a valid permutation.
+    #[must_use]
+    pub fn permute(&self, order: &[usize]) -> Self {
+        let shape = self.shape();
+        assert_eq!(order.len(), shape.len(), "permute: wrong number of axes");
+        let mut seen = vec![false; shape.len()];
+        for &ax in order {
+            assert!(ax < shape.len(), "permute: axis {ax} out of range");
+            assert!(!seen[ax], "permute: duplicate axis {ax}");
+            seen[ax] = true;
+        }
+        Self {
+            uop: UOp::new(
+                Op::Permute,
+                self.dtype(),
+                vec![self.uop.clone()],
+                Arg::Dims(order.to_vec()),
+            ),
+            device: self.device.clone(),
+        }
+    }
+
+    /// Broadcast dimensions of size 1 to a larger size.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any non-1 dimension doesn't match.
+    #[must_use]
+    pub fn expand(&self, new_shape: &[usize]) -> Self {
+        let shape = self.shape();
+        assert_eq!(new_shape.len(), shape.len(), "expand: ndim mismatch");
+        for (i, (&old, &new)) in shape.iter().zip(new_shape).enumerate() {
+            assert!(
+                old == new || old == 1,
+                "expand: dim {i} is {old}, can only expand from 1"
+            );
+        }
+        if shape == new_shape {
+            return self.clone();
+        }
+        Self {
+            uop: UOp::new(
+                Op::Expand,
+                self.dtype(),
+                vec![self.uop.clone()],
+                Arg::Dims(new_shape.to_vec()),
+            ),
+            device: self.device.clone(),
+        }
+    }
+
+    // ── Reduction ─────────────────────────────────────────────────────
+
+    /// Sum over the given axes. Reduced dims become size 1.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any axis is out of range.
+    #[must_use]
+    pub fn sum(&self, axes: &[usize]) -> Self {
+        for &ax in axes {
+            assert!(ax < self.ndim(), "sum: axis {ax} out of range");
+        }
+        Self {
+            uop: UOp::new(
+                Op::ReduceAxis,
+                self.dtype(),
+                vec![self.uop.clone()],
+                Arg::Reduce(Op::Add, axes.to_vec()),
+            ),
+            device: self.device.clone(),
+        }
+    }
+
+    // ── Matmul ────────────────────────────────────────────────────────
+
+    /// Matrix multiply: `[M,K] @ [K,N] → [M,N]`.
+    #[allow(clippy::many_single_char_names)]
+    ///
+    /// # Panics
+    ///
+    /// Panics if inner dimensions don't match or tensors aren't 2D.
+    #[must_use]
+    pub fn matmul(&self, other: &Self) -> Self {
+        assert_eq!(self.ndim(), 2, "matmul: lhs must be 2D");
+        assert_eq!(other.ndim(), 2, "matmul: rhs must be 2D");
+        let shape = self.shape();
+        let (m, k) = (shape[0], shape[1]);
+        let other_shape = other.shape();
+        let (k2, n) = (other_shape[0], other_shape[1]);
+        assert_eq!(k, k2, "matmul: inner dim mismatch ({k} vs {k2})");
+
+        // a[M,K] → [M,1,K] → [M,N,K]
+        let a = self.reshape(&[m, 1, k]).expand(&[m, n, k]);
+        // b[K,N] → [N,K] → [1,N,K] → [M,N,K]
+        let b = other
+            .permute(&[1, 0])
+            .reshape(&[1, n, k])
+            .expand(&[m, n, k]);
+        // element-wise multiply then sum over K axis
+        a.mul(&b).sum(&[2]).reshape(&[m, n])
     }
 
     // ── Realize ─────────────────────────────────────────────────────────
@@ -176,7 +346,13 @@ impl Tensor {
         let numel = self.numel();
         let dtype = self.dtype();
 
-        let (sink, mut input_bufs) = lower_to_kernel(&self.uop, numel);
+        let (scheduled, mut input_bufs) = schedule::schedule(&self.uop);
+        let sink = rangeify(&scheduled);
+
+        // Simplify index arithmetic (x+0→x, x*1→x, constant folding).
+        let sink =
+            crate::rewrite::graph_rewrite(&sink, &crate::rewrite::symbolic_simple(), "symbolic");
+
         let kid = KERNEL_COUNT.fetch_add(1, Ordering::Relaxed);
         let name = format!("kernel_{kid}");
         // TODO: select renderer based on device (ClangRenderer for CPU, CudaRenderer for CUDA)
@@ -214,8 +390,9 @@ impl Tensor {
             eprintln!("*** CPU {kid:>4}  {name:<16} arg {num_bufs:>2}");
         }
 
+        let buf_uop = UOp::new(Op::Buffer, dtype, vec![], Arg::Buffer(Rc::new(out)));
         Self {
-            uop: UOp::new(Op::Buffer, dtype, vec![], Arg::Buffer(Rc::new(out))),
+            uop: UOp::new(Op::Reshape, dtype, vec![buf_uop], Arg::Dims(self.shape())),
             device: self.device.clone(),
         }
     }
@@ -228,11 +405,37 @@ impl Tensor {
     #[must_use]
     pub fn to_vec(&self) -> Vec<f32> {
         let realized = self.realize();
-        match realized.uop.arg() {
-            Arg::Buffer(buf) => buf.to_f32(),
-            _ => panic!("realized tensor must have Arg::Buffer"),
+        realized.realized_buffer().to_f32()
+    }
+}
+
+/// Broadcast two tensors to a common shape (numpy-style).
+/// Pads with 1s on the left, then expands mismatched dims.
+fn broadcast_shapes(a: &Tensor, b: &Tensor) -> (Tensor, Tensor) {
+    let ndim = a.ndim().max(b.ndim());
+
+    // Pad shapes with 1s on the left to match ndim.
+    let pad = |s: &[usize]| -> Vec<usize> {
+        let mut v = vec![1; ndim - s.len()];
+        v.extend_from_slice(s);
+        v
+    };
+    let sa = pad(&a.shape());
+    let sb = pad(&b.shape());
+
+    let mut target = Vec::with_capacity(ndim);
+    for (i, (&da, &db)) in sa.iter().zip(&sb).enumerate() {
+        match (da, db) {
+            (x, y) if x == y => target.push(x),
+            (1, y) => target.push(y),
+            (x, 1) => target.push(x),
+            _ => panic!("broadcast: incompatible dims at axis {i}: {da} vs {db}"),
         }
     }
+
+    let a = a.reshape(&sa).expand(&target);
+    let b = b.reshape(&sb).expand(&target);
+    (a, b)
 }
 
 /// Create a default CPU device for convenience.
@@ -251,8 +454,8 @@ mod tests {
 
     #[test]
     fn test_from_slice_roundtrip() {
-        let t = Tensor::from_slice(&[1.0, 2.0, 3.0], &dev());
-        assert_eq!(t.shape(), vec![3]);
+        let t = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &dev());
+        assert_eq!(t.shape(), &[3]);
         assert_eq!(t.dtype(), DType::F32);
         assert!(t.is_realized());
         assert_eq!(t.to_vec(), vec![1.0, 2.0, 3.0]);
@@ -261,76 +464,214 @@ mod tests {
     #[test]
     fn test_add_is_lazy() {
         let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0], &d);
-        let b = Tensor::from_slice(&[3.0, 4.0], &d);
+        let a = Tensor::from_slice(&[1.0, 2.0], &[2], &d);
+        let b = Tensor::from_slice(&[3.0, 4.0], &[2], &d);
         let c = a.add(&b);
         assert!(!c.is_realized());
-        assert_eq!(c.shape(), vec![2]);
+        assert_eq!(c.shape(), &[2]);
     }
 
     #[test]
     fn test_add_realize() {
         let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &d);
-        let b = Tensor::from_slice(&[4.0, 5.0, 6.0], &d);
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &d);
+        let b = Tensor::from_slice(&[4.0, 5.0, 6.0], &[3], &d);
         assert_eq!(a.add(&b).to_vec(), vec![5.0, 7.0, 9.0]);
     }
 
     #[test]
     fn test_mul_realize() {
         let d = dev();
-        let a = Tensor::from_slice(&[2.0, 3.0, 4.0], &d);
-        let b = Tensor::from_slice(&[5.0, 6.0, 7.0], &d);
+        let a = Tensor::from_slice(&[2.0, 3.0, 4.0], &[3], &d);
+        let b = Tensor::from_slice(&[5.0, 6.0, 7.0], &[3], &d);
         assert_eq!(a.mul(&b).to_vec(), vec![10.0, 18.0, 28.0]);
     }
 
     #[test]
     fn test_fused_add_mul() {
         let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &d);
-        let b = Tensor::from_slice(&[10.0, 20.0, 30.0], &d);
-        let two = Tensor::from_slice(&[2.0, 2.0, 2.0], &d);
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &d);
+        let b = Tensor::from_slice(&[10.0, 20.0, 30.0], &[3], &d);
+        let two = Tensor::from_slice(&[2.0, 2.0, 2.0], &[3], &d);
         assert_eq!(a.add(&b).mul(&two).to_vec(), vec![22.0, 44.0, 66.0]);
     }
 
     #[test]
     fn test_neg() {
-        let a = Tensor::from_slice(&[1.0, -2.0, 3.0], &dev());
+        let a = Tensor::from_slice(&[1.0, -2.0, 3.0], &[3], &dev());
         assert_eq!(a.neg().to_vec(), vec![-1.0, 2.0, -3.0]);
     }
 
     #[test]
     fn test_relu() {
-        let a = Tensor::from_slice(&[1.0, -2.0, 3.0, -4.0], &dev());
+        let a = Tensor::from_slice(&[1.0, -2.0, 3.0, -4.0], &[4], &dev());
         assert_eq!(a.relu().to_vec(), vec![1.0, 0.0, 3.0, 0.0]);
     }
 
     #[test]
     fn test_shared_input() {
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &dev());
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &dev());
         assert_eq!(a.add(&a).to_vec(), vec![2.0, 4.0, 6.0]);
     }
 
     #[test]
     fn test_chained_ops() {
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &dev());
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &dev());
         assert_eq!(a.neg().neg().to_vec(), vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
     fn test_realize_idempotent() {
         let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0], &d);
-        let b = a.add(&Tensor::from_slice(&[3.0, 4.0], &d));
+        let a = Tensor::from_slice(&[1.0, 2.0], &[2], &d);
+        let b = a.add(&Tensor::from_slice(&[3.0, 4.0], &[2], &d));
         assert_eq!(b.realize().realize().to_vec(), vec![4.0, 6.0]);
     }
 
     #[test]
-    #[should_panic(expected = "shape mismatch")]
+    #[should_panic(expected = "broadcast: incompatible dims")]
     fn test_shape_mismatch() {
         let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0], &d);
-        let b = Tensor::from_slice(&[1.0, 2.0, 3.0], &d);
+        let a = Tensor::from_slice(&[1.0, 2.0], &[2], &d);
+        let b = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &d);
         let _ = a.add(&b);
+    }
+
+    // ── Multi-dimensional tests ──────────────────────────────────────
+
+    #[test]
+    fn test_2d_add() {
+        // Arrange — [2,3] + [2,3]
+        let d = dev();
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &d);
+        let b = Tensor::from_slice(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[2, 3], &d);
+
+        // Act
+        let result = a.add(&b).to_vec();
+
+        // Assert
+        assert_eq!(result, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]);
+    }
+
+    #[test]
+    fn test_reshape_lazy() {
+        // Arrange
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[6], &dev());
+
+        // Act
+        let b = a.reshape(&[2, 3]);
+
+        // Assert — reshape is lazy, shape changes but data unchanged
+        assert_eq!(b.shape(), vec![2, 3]);
+        assert_eq!(b.numel(), 6);
+    }
+
+    #[test]
+    fn test_2d_reshape_add() {
+        // Arrange — reshape then add
+        let d = dev();
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[6], &d);
+        let b = Tensor::from_slice(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[6], &d);
+
+        // Act — reshape both to [2,3] then add
+        let result = a.reshape(&[2, 3]).add(&b.reshape(&[2, 3])).to_vec();
+
+        // Assert
+        assert_eq!(result, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]);
+    }
+
+    #[test]
+    fn test_broadcast_add() {
+        // Arrange — [2,3] + [1,3] broadcasts row
+        let d = dev();
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &d);
+        let b = Tensor::from_slice(&[10.0, 20.0, 30.0], &[1, 3], &d);
+
+        // Act
+        let result = a.add(&b).to_vec();
+
+        // Assert — b is broadcast across rows
+        assert_eq!(result, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
+    }
+
+    #[test]
+    fn test_broadcast_add_col() {
+        // Arrange — [2,3] + [2,1] broadcasts column
+        let d = dev();
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &d);
+        let b = Tensor::from_slice(&[10.0, 20.0], &[2, 1], &d);
+
+        // Act
+        let result = a.add(&b).to_vec();
+
+        // Assert — b is broadcast across columns
+        assert_eq!(result, vec![11.0, 12.0, 13.0, 24.0, 25.0, 26.0]);
+    }
+
+    #[test]
+    fn test_sum_1d() {
+        // Arrange
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &dev());
+
+        // Act
+        let result = a.sum(&[0]).to_vec();
+
+        // Assert
+        assert_eq!(result, vec![6.0]);
+    }
+
+    #[test]
+    fn test_sum_2d_axis0() {
+        // Arrange — sum over rows: [2,3] → [1,3]
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &dev());
+
+        // Act
+        let result = a.sum(&[0]).to_vec();
+
+        // Assert
+        assert_eq!(result, vec![5.0, 7.0, 9.0]);
+    }
+
+    #[test]
+    fn test_sum_2d_axis1() {
+        // Arrange — sum over cols: [2,3] → [2,1]
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &dev());
+
+        // Act
+        let result = a.sum(&[1]).to_vec();
+
+        // Assert
+        assert_eq!(result, vec![6.0, 15.0]);
+    }
+
+    #[test]
+    fn test_matmul_2x3_3x2() {
+        // Arrange
+        // a = [[1,2,3],[4,5,6]]  (2x3)
+        // b = [[1,2],[3,4],[5,6]]  (3x2)
+        // expected = [[22,28],[49,64]]
+        let d = dev();
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &d);
+        let b = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2], &d);
+
+        // Act
+        let result = a.matmul(&b).to_vec();
+
+        // Assert
+        assert_eq!(result, vec![22.0, 28.0, 49.0, 64.0]);
+    }
+
+    #[test]
+    fn test_matmul_identity() {
+        // Arrange — a @ I = a
+        let d = dev();
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2], &d);
+        let eye = Tensor::from_slice(&[1.0, 0.0, 0.0, 1.0], &[2, 2], &d);
+
+        // Act
+        let result = a.matmul(&eye).to_vec();
+
+        // Assert
+        assert_eq!(result, vec![1.0, 2.0, 3.0, 4.0]);
     }
 }
