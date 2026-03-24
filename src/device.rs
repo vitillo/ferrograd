@@ -19,6 +19,17 @@ use crate::dtype::DType;
 // Re-export CpuDevice for convenience.
 pub use cpu::CpuDevice;
 
+/// Stable identifier for a backend device.
+///
+/// Tinygrad threads device identity through the graph rather than storing a
+/// runtime handle on each node. We mirror that split with a small value type
+/// that is cheap to copy and hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeviceId {
+    /// The CPU backend.
+    Cpu,
+}
+
 /// Errors that can occur during device operations.
 #[derive(Debug, thiserror::Error)]
 pub enum DeviceError {
@@ -197,6 +208,9 @@ pub enum Program {
 /// compile generated code, and execute kernels. By programming against this
 /// trait, the IR and codegen layers stay device-agnostic.
 pub trait Device {
+    /// Return this backend's stable identifier.
+    fn id(&self) -> DeviceId;
+
     /// Allocate a zero-initialized buffer on this device.
     fn allocate(&self, dtype: DType, numel: usize) -> Buffer;
 

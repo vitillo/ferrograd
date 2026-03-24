@@ -55,6 +55,10 @@ impl Renderer for ClangRenderer {
             // Side-effect-only nodes — no C expression to name.
             match node.op() {
                 Op::Sink => continue,
+                Op::Device => {
+                    names.insert(node, String::new());
+                    continue;
+                }
                 Op::End => {
                     depth -= 1;
                     let _ = writeln!(out, "{ind}}}", ind = indent(depth));
@@ -239,9 +243,11 @@ impl Renderer for ClangRenderer {
                     names.insert(node, acc_var);
                 }
                 // Sink, End, Store, After, Buffer handled above.
-                Op::Sink | Op::End | Op::Store | Op::After | Op::Buffer => unreachable!(),
+                Op::Sink | Op::End | Op::Store | Op::After | Op::Buffer | Op::Device => {
+                    unreachable!()
+                }
                 // Tensor-level and unexpanded ops should be lowered before codegen.
-                Op::Reshape | Op::Permute | Op::Expand | Op::ReduceAxis | Op::Reduce => {
+                Op::Shrink | Op::Reshape | Op::Permute | Op::Expand | Op::ReduceAxis | Op::Reduce => {
                     unreachable!("{op:?} should be lowered before codegen", op = node.op())
                 }
             }
@@ -255,31 +261,30 @@ impl Renderer for ClangRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{CpuDevice, Device};
+    use crate::device::{CpuDevice, Device, DeviceId};
 
     fn build_add_graph(n: i64) -> UOp {
-        let out_ptr = UOp::param(0, DType::F32, 3);
-        let a_ptr = UOp::param(1, DType::F32, 3);
-        let b_ptr = UOp::param(2, DType::F32, 3);
-        let bound = UOp::const_int(n, DType::I32);
-        let idx = UOp::range(0, bound);
-        let a_val = UOp::load(UOp::index(a_ptr, idx.clone()), DType::F32);
-        let b_val = UOp::load(UOp::index(b_ptr, idx.clone()), DType::F32);
-        let sum = UOp::new(Op::Add, DType::F32, vec![a_val, b_val], Arg::None);
-        let store = UOp::store(UOp::index(out_ptr, idx.clone()), sum);
-        let end = UOp::end(idx);
+        let device = DeviceId::Cpu;
+        let out_ptr = UOp::param(0, DType::F32, 3, device);
+        let a_ptr = UOp::param(1, DType::F32, 3, device);
+        let b_ptr = UOp::param(2, DType::F32, 3, device);
+        let bound = UOp::const_int(n, DType::I32, device);
+        let idx = UOp::new(Op::Range, DType::I32, vec![bound], Arg::Index(0));
+        let a_idx = UOp::new(Op::Index, a_ptr.dtype(), vec![a_ptr, idx.clone()], Arg::None);
+        let a_val = UOp::new(Op::Load, DType::F32, vec![a_idx], Arg::None);
+        let b_idx = UOp::new(Op::Index, b_ptr.dtype(), vec![b_ptr, idx.clone()], Arg::None);
+        let b_val = UOp::new(Op::Load, DType::F32, vec![b_idx], Arg::None);
+        let sum = UOp::add(a_val, b_val);
+        let out_idx = UOp::new(Op::Index, out_ptr.dtype(), vec![out_ptr, idx.clone()], Arg::None);
+        let store = UOp::new(Op::Store, DType::Void, vec![out_idx, sum], Arg::None);
+        let end = UOp::new(Op::End, DType::Void, vec![idx, store.clone()], Arg::None);
         UOp::sink(vec![store, end])
     }
 
     #[test]
     fn test_render_add_kernel_structure() {
-        // Arrange
         let sink = build_add_graph(3);
-
-        // Act
         let code = ClangRenderer.render(&sink, "add");
-
-        // Assert
         assert!(code.contains("void add("));
         assert!(code.contains("float* restrict data0"));
         assert!(code.contains("float* restrict data1"));
@@ -291,7 +296,6 @@ mod tests {
 
     #[test]
     fn test_render_add_kernel_compiles_and_runs() {
-        // Arrange
         let sink = build_add_graph(3);
         let code = ClangRenderer.render(&sink, "add");
 
@@ -301,24 +305,23 @@ mod tests {
         let mut b = crate::device::Buffer::from_f32(&[4.0, 5.0, 6.0]);
         let mut out = dev.allocate(DType::F32, 3);
 
-        // Act
         dev.execute(&program, &mut [&mut out, &mut a, &mut b]).unwrap();
-
-        // Assert
         assert_eq!(out.to_f32(), vec![5.0, 7.0, 9.0]);
     }
 
     #[test]
     fn test_render_negate_kernel() {
-        // Arrange
-        let out_ptr = UOp::param(0, DType::F32, 3);
-        let a_ptr = UOp::param(1, DType::F32, 3);
-        let n = UOp::const_int(3, DType::I32);
-        let idx = UOp::range(0, n);
-        let a_val = UOp::load(UOp::index(a_ptr, idx.clone()), DType::F32);
-        let neg = UOp::new(Op::Neg, DType::F32, vec![a_val], Arg::None);
-        let store = UOp::store(UOp::index(out_ptr, idx.clone()), neg);
-        let end = UOp::end(idx);
+        let device = DeviceId::Cpu;
+        let out_ptr = UOp::param(0, DType::F32, 3, device);
+        let a_ptr = UOp::param(1, DType::F32, 3, device);
+        let n = UOp::const_int(3, DType::I32, device);
+        let idx = UOp::new(Op::Range, DType::I32, vec![n], Arg::Index(0));
+        let a_idx = UOp::new(Op::Index, a_ptr.dtype(), vec![a_ptr, idx.clone()], Arg::None);
+        let a_val = UOp::new(Op::Load, DType::F32, vec![a_idx], Arg::None);
+        let neg = UOp::neg(a_val);
+        let out_idx = UOp::new(Op::Index, out_ptr.dtype(), vec![out_ptr, idx.clone()], Arg::None);
+        let store = UOp::new(Op::Store, DType::Void, vec![out_idx, neg], Arg::None);
+        let end = UOp::new(Op::End, DType::Void, vec![idx, store.clone()], Arg::None);
         let sink = UOp::sink(vec![store, end]);
 
         let code = ClangRenderer.render(&sink, "negate");
@@ -327,26 +330,25 @@ mod tests {
         let mut a = crate::device::Buffer::from_f32(&[1.0, -2.0, 3.0]);
         let mut out = dev.allocate(DType::F32, 3);
 
-        // Act
         dev.execute(&program, &mut [&mut out, &mut a]).unwrap();
-
-        // Assert
         assert_eq!(out.to_f32(), vec![-1.0, 2.0, -3.0]);
     }
 
     #[test]
     fn test_render_relu_kernel() {
-        // Arrange
-        let out_ptr = UOp::param(0, DType::F32, 4);
-        let a_ptr = UOp::param(1, DType::F32, 4);
-        let n = UOp::const_int(4, DType::I32);
-        let zero = UOp::const_float(0.0, DType::F32);
-        let idx = UOp::range(0, n);
-        let a_val = UOp::load(UOp::index(a_ptr, idx.clone()), DType::F32);
-        let cond = UOp::new(Op::CmpLt, DType::Bool, vec![zero.clone(), a_val.clone()], Arg::None);
-        let relu = UOp::new(Op::Where, DType::F32, vec![cond, a_val, zero], Arg::None);
-        let store = UOp::store(UOp::index(out_ptr, idx.clone()), relu);
-        let end = UOp::end(idx);
+        let device = DeviceId::Cpu;
+        let out_ptr = UOp::param(0, DType::F32, 4, device);
+        let a_ptr = UOp::param(1, DType::F32, 4, device);
+        let n = UOp::const_int(4, DType::I32, device);
+        let zero = UOp::const_float(0.0, DType::F32, device);
+        let idx = UOp::new(Op::Range, DType::I32, vec![n], Arg::Index(0));
+        let a_idx = UOp::new(Op::Index, a_ptr.dtype(), vec![a_ptr, idx.clone()], Arg::None);
+        let a_val = UOp::new(Op::Load, DType::F32, vec![a_idx], Arg::None);
+        let cond = UOp::cmplt(zero.clone(), a_val.clone());
+        let relu = UOp::where_(cond, a_val, zero);
+        let out_idx = UOp::new(Op::Index, out_ptr.dtype(), vec![out_ptr, idx.clone()], Arg::None);
+        let store = UOp::new(Op::Store, DType::Void, vec![out_idx, relu], Arg::None);
+        let end = UOp::new(Op::End, DType::Void, vec![idx, store.clone()], Arg::None);
         let sink = UOp::sink(vec![store, end]);
 
         let code = ClangRenderer.render(&sink, "relu");
@@ -355,10 +357,7 @@ mod tests {
         let mut a = crate::device::Buffer::from_f32(&[1.0, -2.0, 3.0, -4.0]);
         let mut out = dev.allocate(DType::F32, 4);
 
-        // Act
         dev.execute(&program, &mut [&mut out, &mut a]).unwrap();
-
-        // Assert
         assert_eq!(out.to_f32(), vec![1.0, 0.0, 3.0, 0.0]);
     }
 }

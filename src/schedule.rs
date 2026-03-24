@@ -1,183 +1,122 @@
 //! # Scheduling — turning lazy tensor graphs into executable kernels
 //!
-//! This module converts the lazy `UOp` graph built by [`crate::tensor`] into
-//! a list of kernel-level IR items ready for codegen + execution.
-//!
-//! ## Why scheduling exists
-//!
-//! The tensor API builds a lazy graph of high-level operations (Add, Reshape,
-//! `ReduceAxis`, etc.). These ops describe *what* to compute, but not *how* to
-//! iterate over memory. Scheduling bridges that gap:
-//!
-//! 1. **Splitting**: identifies where the graph must be cut into separate
-//!    kernels (when a `ReduceAxis` feeds another `ReduceAxis`, the inner
-//!    one must be materialized to a buffer).
-//! 2. **Parameterization**: replaces device-level `Buffer` nodes with abstract
-//!    `Param` slots, separating data placement from computation.
-//! 3. **Wrapping**: wraps each subgraph in `Store`/`Sink` — the proto-kernel.
-//!
-//! The result is a `Vec<ScheduleItem>` in dependency order: each item is a
-//! single kernel that reads from Buffers and writes one output. The executor
-//! compiles and runs them sequentially.
-//!
-//! ## Pipeline
-//!
-//! ```text
-//! Tensor ops (lazy UOp graph)
-//!   │  Buffers, Reshape, Permute, Expand, ReduceAxis, ALU ops
-//!   ▼
-//! schedule()         Split at reduction boundaries, Buffer → Param, Store/Sink
-//!   │  Returns Vec<ScheduleItem> in execution order
-//!   ▼
-//! rangeify()         Add Range loops, push Index down, expand Reduce
-//!   │  Range, End, Load, Store, DefineAcc, Assign, After, ALU ops
-//!   ▼
-//! symbolic_simple()  x+0→x, x*1→x, const fold
-//!   │  (same ops, simplified index arithmetic)
-//!   ▼
-//! codegen            Render to C source
-//! ```
-//!
-//! ## Submodules
-//!
-//! - [`indexing`] — core index transformation rules (see module docs for details)
-//! - [`rangeify`] — orchestrates all rewrite rules into a single pass
+//! This module converts the lazy tensor-level graph into a list of proto-kernel
+//! graphs, each with explicit input parameters and a reserved output buffer.
 
 pub mod indexing;
 pub mod rangeify;
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 
-use crate::device::{Buffer, Device};
 use crate::dtype::DType;
+use crate::runtime::{self, BufferId};
 use crate::rewrite::graph_rewrite;
+use crate::shape::Shape;
 use crate::uop::{Arg, Op, UOp};
 
 /// A single kernel to compile and execute.
 pub struct ScheduleItem {
-    /// Kernel-ready `UOp` graph (`Sink(Store(Param, expr))`).
+    /// Kernel-ready `Sink(Store(Param(0), expr))`.
     pub sink: UOp,
-    /// Input buffers (slot 1+), shared via `Rc` so intermediate outputs
-    /// from earlier kernels are visible to later ones.
-    pub input_bufs: Vec<Rc<Buffer>>,
-    /// Pre-allocated output buffer. For intermediate kernels, downstream
-    /// kernels already hold `Rc` clones of this buffer in their `input_bufs`.
-    /// The executor writes into this buffer so data flows automatically.
-    pub out_buf: Rc<Buffer>,
+    /// Input buffer ids in parameter-slot order, excluding output slot 0.
+    pub input_ids: Vec<BufferId>,
+    /// Output buffer id reserved for slot 0.
+    pub output_id: BufferId,
     /// Output shape.
-    pub out_shape: Vec<usize>,
-    /// Output element type.
+    pub out_shape: Shape,
+    /// Output dtype.
     pub out_dtype: DType,
 }
 
 /// Analyze a lazy `UOp` graph and produce kernels in dependency order.
-///
-/// Automatically splits at `ReduceAxis` boundaries when a reduction feeds
-/// into another reduction (directly or through element-wise ops). Each split
-/// produces an intermediate `ScheduleItem` whose output buffer becomes an
-/// input to subsequent kernels.
-///
-/// This is a pure graph transformation — no Device, no compilation.
-///
-/// # Panics
-///
-/// Panics if buffer extraction or shape inference fails.
 #[must_use]
-pub fn schedule(expr: &UOp, device: &dyn Device) -> Vec<ScheduleItem> {
+pub fn schedule(expr: &UOp) -> Vec<ScheduleItem> {
+    let order = expr.toposort();
+    let consumer_map = build_consumer_map(&order);
+    let nested_reduce_inputs = nested_reduce_inputs(&order);
+
+    let mut replacements: HashMap<UOp, UOp> = HashMap::new();
     let mut items = Vec::new();
-    let mut uop = expr.clone();
 
-    // Materialize inner reductions that feed outer reductions.
-    loop {
-        let Some(cut) = find_cut_point(&uop) else {
-            break;
-        };
+    for node in &order {
+        if !should_materialize(node, expr, &consumer_map, &nested_reduce_inputs) {
+            continue;
+        }
 
-        let item = parameterize(&cut, device);
-
-        // Replace the cut subtree with a Buffer pointing to item.out_buf.
-        // Later kernels' parameterize will pick up this Rc<Buffer> as an input.
-        let buf_uop = UOp::new(Op::Buffer, item.out_dtype, vec![], Arg::Buffer(item.out_buf.clone()));
-        let replacement = UOp::new(Op::Reshape, item.out_dtype, vec![buf_uop], Arg::Dims(item.out_shape.clone()));
-        uop = substitute_uop(&uop, &cut, &replacement);
-
+        let kernel_expr = substitute_materialized(node, &replacements);
+        let item = parameterize(&kernel_expr);
+        let replacement = buffer_replacement(&item);
+        replacements.insert(node.clone(), replacement);
         items.push(item);
     }
 
-    // Final kernel.
-    items.push(parameterize(&uop, device));
-
+    let final_expr = substitute_materialized(expr, &replacements);
+    items.push(parameterize(&final_expr));
     items
 }
 
-/// Convert a subgraph to a parameterized kernel: Buffer→Param, Store/Sink.
-fn parameterize(expr: &UOp, device: &dyn Device) -> ScheduleItem {
+fn parameterize(expr: &UOp) -> ScheduleItem {
     use std::cell::RefCell;
 
-    let input_bufs: Rc<RefCell<Vec<Rc<Buffer>>>> = Rc::new(RefCell::new(Vec::new()));
-    let buf_params: Rc<RefCell<HashMap<usize, UOp>>> = Rc::new(RefCell::new(HashMap::new()));
+    let state = runtime::state(expr.device());
+    let input_ids: RefCell<Vec<BufferId>> = RefCell::new(Vec::new());
+    let params: RefCell<HashMap<BufferId, UOp>> = RefCell::new(HashMap::new());
 
-    let bufs = input_bufs.clone();
-    let params = buf_params.clone();
-
-    let rewrite_buf = move |node: &UOp| -> Option<UOp> {
+    let rewrite_buffer = |node: &UOp| -> Option<UOp> {
         if node.op() != Op::Buffer {
             return None;
         }
-        let Arg::Buffer(ref rc) = node.arg() else {
+        let Arg::Buffer(id, numel) = node.arg() else {
             return None;
         };
-        let ptr = Rc::as_ptr(rc) as usize;
         let dtype = node.dtype();
-        let numel = rc.numel();
-        let mut params_map = params.borrow_mut();
+        let mut params = params.borrow_mut();
         Some(
-            params_map
-                .entry(ptr)
+            params
+                .entry(*id)
                 .or_insert_with(|| {
-                    let mut bufs_vec = bufs.borrow_mut();
-                    let slot = bufs_vec.len() + 1;
-                    bufs_vec.push(rc.clone());
-                    UOp::param(slot, dtype, numel)
+                    let mut ids = input_ids.borrow_mut();
+                    let slot = ids.len() + 1;
+                    ids.push(*id);
+                    UOp::param(slot, dtype, *numel, expr.device())
                 })
                 .clone(),
         )
     };
 
-    let parameterized = graph_rewrite(expr, &rewrite_buf, "schedule");
-    drop(rewrite_buf);
-
-    let out_shape = parameterized.shape().unwrap_or_else(|| vec![1]);
-    let out_numel: usize = out_shape.iter().product();
-    let out_dtype = expr.dtype();
-    let out_param = UOp::param(0, out_dtype, out_numel);
-    let store = UOp::store(out_param, parameterized);
+    let parameterized = graph_rewrite(expr, &rewrite_buffer, "schedule");
+    let out_shape = parameterized.shape().unwrap_or_else(|| Shape::flat(1));
+    let output_id = state.reserve_buffer(expr.dtype(), out_shape.numel());
+    let out_param = UOp::param(0, expr.dtype(), out_shape.numel(), expr.device());
+    let store = UOp::new(
+        Op::Store,
+        DType::Void,
+        vec![out_param, parameterized],
+        Arg::None,
+    );
     let sink = UOp::sink(vec![store]);
 
-    let bufs = Rc::try_unwrap(input_bufs).unwrap().into_inner();
-    let out_buf = Rc::new(device.allocate(out_dtype, out_numel));
     ScheduleItem {
         sink,
-        input_bufs: bufs,
-        out_buf,
+        input_ids: input_ids.into_inner(),
+        output_id,
         out_shape,
-        out_dtype,
+        out_dtype: expr.dtype(),
     }
 }
 
-// ── Multi-kernel splitting ──────────────────────────────────────────────
+fn build_consumer_map(order: &[UOp]) -> HashMap<UOp, Vec<UOp>> {
+    let mut consumers: HashMap<UOp, Vec<UOp>> = HashMap::new();
+    for node in order {
+        for src in node.srcs() {
+            consumers.entry(src.clone()).or_default().push(node.clone());
+        }
+    }
+    consumers
+}
 
-/// Find the innermost `ReduceAxis` that has a `ReduceAxis` ancestor.
-///
-/// This identifies where to split: the inner reduction must be materialized
-/// to a buffer so the outer reduction can randomly access its results.
-/// Returns `None` if no nested reductions exist (single kernel suffices).
-fn find_cut_point(root: &UOp) -> Option<UOp> {
-    let order = root.toposort();
-
-    // Mark nodes whose output eventually feeds into a ReduceAxis.
-    let mut feeds_reduce: HashSet<UOp> = HashSet::new();
+fn nested_reduce_inputs(order: &[UOp]) -> HashSet<UOp> {
+    let mut feeds_reduce = HashSet::new();
     for node in order.iter().rev() {
         if node.op() == Op::ReduceAxis || feeds_reduce.contains(node) {
             for src in node.srcs() {
@@ -185,40 +124,116 @@ fn find_cut_point(root: &UOp) -> Option<UOp> {
             }
         }
     }
-
-    // Walk bottom-up: the first ReduceAxis whose output feeds another
-    // ReduceAxis is the cut point.
-    for node in &order {
-        if node.op() == Op::ReduceAxis && feeds_reduce.contains(node) {
-            return Some(node.clone());
-        }
-    }
-    None
+    feeds_reduce
 }
 
-/// Replace all occurrences of `old` with `new` in the graph rooted at `root`.
-fn substitute_uop(root: &UOp, old: &UOp, new: &UOp) -> UOp {
+fn should_materialize(
+    node: &UOp,
+    root: &UOp,
+    consumer_map: &HashMap<UOp, Vec<UOp>>,
+    nested_reduce_inputs: &HashSet<UOp>,
+) -> bool {
+    if node == root || node.shape().is_none() {
+        return false;
+    }
+    if matches!(node.op(), Op::Buffer | Op::Const) {
+        return false;
+    }
+    if consumer_map.get(node).is_some_and(|consumers| consumers.len() > 1) {
+        return true;
+    }
+    if node.op() == Op::ReduceAxis
+        && consumer_map
+            .get(node)
+            .is_some_and(|consumers| consumers.iter().any(|consumer| consumer.op().is_alu()))
+    {
+        return true;
+    }
+    node.op() == Op::ReduceAxis && nested_reduce_inputs.contains(node)
+}
+
+fn buffer_replacement(item: &ScheduleItem) -> UOp {
+    let buffer = UOp::buffer(
+        item.output_id,
+        item.out_dtype,
+        item.out_shape.numel(),
+        item.sink.device(),
+    );
+    UOp::reshape(buffer, item.out_shape.clone())
+}
+
+fn substitute_materialized(root: &UOp, replacements: &HashMap<UOp, UOp>) -> UOp {
     let order = root.toposort();
-    let mut replace: HashMap<UOp, UOp> = HashMap::new();
-    replace.insert(old.clone(), new.clone());
+    let mut substituted: HashMap<UOp, UOp> = HashMap::new();
 
     for node in &order {
-        if replace.contains_key(node) {
-            continue;
+        if node != root {
+            if let Some(replacement) = replacements.get(node) {
+                substituted.insert(node.clone(), replacement.clone());
+                continue;
+            }
         }
+
         let new_srcs: Vec<UOp> = node
             .srcs()
             .iter()
-            .map(|s| replace.get(s).cloned().unwrap_or_else(|| s.clone()))
+            .map(|src| substituted.get(src).cloned().unwrap_or_else(|| src.clone()))
             .collect();
-        let changed = node.srcs().iter().zip(&new_srcs).any(|(o, n)| o != n);
-        if changed {
-            replace.insert(
-                node.clone(),
-                UOp::new(node.op(), node.dtype(), new_srcs, node.arg().clone()),
-            );
-        }
+        let changed = node.srcs().iter().zip(&new_srcs).any(|(old, new)| old != new);
+        let rewritten = if changed {
+            UOp::new(node.op(), node.dtype(), new_srcs, node.arg().clone())
+        } else {
+            node.clone()
+        };
+        substituted.insert(node.clone(), rewritten);
     }
 
-    replace.get(root).cloned().unwrap_or_else(|| root.clone())
+    substituted
+        .get(root)
+        .cloned()
+        .unwrap_or_else(|| root.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::DeviceId;
+    use crate::device::Buffer;
+    use crate::runtime;
+
+    fn buffer_uop(data: &[f32], shape: &[usize]) -> UOp {
+        let device = DeviceId::Cpu;
+        let id = runtime::state(device).store_buffer(Buffer::from_f32(data));
+        let buffer = UOp::buffer(id, DType::F32, data.len(), device);
+        UOp::reshape(buffer, Shape::from(shape))
+    }
+
+    #[test]
+    fn test_nested_reductions_materialize_via_buffer_ids() {
+        runtime::clear_for_tests(DeviceId::Cpu);
+        let input = buffer_uop(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let inner = UOp::reduce_axis(input, Op::Add, &[1]);
+        let outer = UOp::reduce_axis(inner, Op::Add, &[0]);
+
+        let items = schedule(&outer);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].input_ids, vec![items[0].output_id]);
+    }
+
+    #[test]
+    fn test_shared_subexpression_materializes_once() {
+        runtime::clear_for_tests(DeviceId::Cpu);
+        let left = buffer_uop(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let right = buffer_uop(&[10.0, 20.0, 30.0, 40.0], &[2, 2]);
+        let shared = UOp::add(left, right);
+        let sum = UOp::reduce_axis(shared.clone(), Op::Add, &[1]);
+        let max = UOp::reduce_axis(shared.clone(), Op::Max, &[1]);
+        let root = UOp::add(sum, max);
+
+        let items = schedule(&root);
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[1].input_ids, vec![items[0].output_id]);
+        assert_eq!(items[2].input_ids, vec![items[0].output_id]);
+        assert_eq!(items[3].input_ids, vec![items[1].output_id, items[2].output_id]);
+    }
 }

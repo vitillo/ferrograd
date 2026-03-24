@@ -47,7 +47,7 @@
 use std::io::Write;
 use std::process::Command;
 
-use crate::device::{Buffer, Device, DeviceError, Program, Storage};
+use crate::device::{Buffer, Device, DeviceError, DeviceId, Program, Storage};
 use crate::dtype::DType;
 
 // ── Errors ──────────────────────────────────────────────────────────────────
@@ -214,6 +214,10 @@ impl CompiledKernel {
 pub struct CpuDevice;
 
 impl Device for CpuDevice {
+    fn id(&self) -> DeviceId {
+        DeviceId::Cpu
+    }
+
     fn allocate(&self, dtype: DType, numel: usize) -> Buffer {
         let nbytes = dtype.size_bytes() * numel;
         Buffer::new(dtype, numel, Storage::Cpu(vec![0u8; nbytes]))

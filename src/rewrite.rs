@@ -111,6 +111,15 @@ fn fold_binary(op: Op, a: &Arg, b: &Arg) -> Option<Arg> {
     }
 }
 
+fn const_from_arg(node: &UOp, arg: &Arg) -> UOp {
+    match arg {
+        Arg::Float(value) => UOp::const_float(*value, node.dtype(), node.device()),
+        Arg::Int(value) => UOp::const_int(*value, node.dtype(), node.device()),
+        Arg::Bool(value) => UOp::const_bool(*value, node.dtype(), node.device()),
+        _ => panic!("constant folding produced non-literal arg"),
+    }
+}
+
 /// Algebraic simplification rules for index arithmetic.
 ///
 /// These run as a separate pass after rangeify to clean up redundant
@@ -127,13 +136,11 @@ pub fn symbolic_simple(node: &UOp) -> Option<UOp> {
     match (node.op(), node.srcs()) {
         // const + const → const
         (Op::Add, [a, b]) if a.is_const() && b.is_const() => {
-            fold_binary(Op::Add, a.arg(), b.arg())
-                .map(|r| UOp::new(Op::Const, a.dtype(), vec![], r))
+            fold_binary(Op::Add, a.arg(), b.arg()).as_ref().map(|arg| const_from_arg(a, arg))
         }
         // const * const → const
         (Op::Mul, [a, b]) if a.is_const() && b.is_const() => {
-            fold_binary(Op::Mul, a.arg(), b.arg())
-                .map(|r| UOp::new(Op::Const, a.dtype(), vec![], r))
+            fold_binary(Op::Mul, a.arg(), b.arg()).as_ref().map(|arg| const_from_arg(a, arg))
         }
         // x + 0 → x
         (Op::Add, [x, y]) if y.is_zero() => Some(x.clone()),
@@ -151,95 +158,66 @@ pub fn symbolic_simple(node: &UOp) -> Option<UOp> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::DeviceId;
     use crate::dtype::DType;
 
     #[test]
     fn test_rewrite_add_zero_eliminated() {
-        // Arrange
-        let x = UOp::const_float(5.0, DType::F32);
-        let zero = UOp::const_float(0.0, DType::F32);
-        let sum = UOp::new(Op::Add, DType::F32, vec![x, zero], Arg::None);
-
-        // Act
+        let x = UOp::const_float(5.0, DType::F32, DeviceId::Cpu);
+        let zero = UOp::const_float(0.0, DType::F32, DeviceId::Cpu);
+        let sum = UOp::add(x, zero);
         let result = graph_rewrite(&sum, &symbolic_simple, "test");
-
-        // Assert
         assert_eq!(result.op(), Op::Const);
         assert_eq!(*result.arg(), Arg::Float(5.0));
     }
 
     #[test]
     fn test_rewrite_zero_plus_x_eliminated() {
-        // Arrange
-        let x = UOp::const_float(5.0, DType::F32);
-        let zero = UOp::const_float(0.0, DType::F32);
-        let sum = UOp::new(Op::Add, DType::F32, vec![zero, x], Arg::None);
-
-        // Act
+        let x = UOp::const_float(5.0, DType::F32, DeviceId::Cpu);
+        let zero = UOp::const_float(0.0, DType::F32, DeviceId::Cpu);
+        let sum = UOp::add(zero, x);
         let result = graph_rewrite(&sum, &symbolic_simple, "test");
-
-        // Assert
         assert_eq!(result.op(), Op::Const);
         assert_eq!(*result.arg(), Arg::Float(5.0));
     }
 
     #[test]
     fn test_rewrite_constant_folding_add() {
-        // Arrange
-        let two = UOp::const_float(2.0, DType::F32);
-        let three = UOp::const_float(3.0, DType::F32);
-        let sum = UOp::new(Op::Add, DType::F32, vec![two, three], Arg::None);
-
-        // Act
+        let two = UOp::const_float(2.0, DType::F32, DeviceId::Cpu);
+        let three = UOp::const_float(3.0, DType::F32, DeviceId::Cpu);
+        let sum = UOp::add(two, three);
         let result = graph_rewrite(&sum, &symbolic_simple, "test");
-
-        // Assert
         assert_eq!(result.op(), Op::Const);
         assert_eq!(*result.arg(), Arg::Float(5.0));
     }
 
     #[test]
     fn test_rewrite_fixed_point() {
-        // Arrange — (x + 0) * 1 should simplify in two steps
-        let x = UOp::const_float(7.0, DType::F32);
-        let zero = UOp::const_float(0.0, DType::F32);
-        let one = UOp::const_float(1.0, DType::F32);
-        let sum = UOp::new(Op::Add, DType::F32, vec![x, zero], Arg::None);
-        let prod = UOp::new(Op::Mul, DType::F32, vec![sum, one], Arg::None);
-
-        // Act
+        let x = UOp::const_float(7.0, DType::F32, DeviceId::Cpu);
+        let zero = UOp::const_float(0.0, DType::F32, DeviceId::Cpu);
+        let one = UOp::const_float(1.0, DType::F32, DeviceId::Cpu);
+        let sum = UOp::add(x, zero);
+        let prod = UOp::mul(sum, one);
         let result = graph_rewrite(&prod, &symbolic_simple, "test");
-
-        // Assert
         assert_eq!(result.op(), Op::Const);
         assert_eq!(*result.arg(), Arg::Float(7.0));
     }
 
     #[test]
     fn test_rewrite_no_match_unchanged() {
-        // Arrange
-        let x = UOp::const_float(3.0, DType::F32);
-        let y = UOp::const_float(4.0, DType::F32);
-        let sum = UOp::new(Op::Add, DType::F32, vec![x, y], Arg::None);
-
-        // Act — no-op rewrite function
+        let x = UOp::const_float(3.0, DType::F32, DeviceId::Cpu);
+        let y = UOp::const_float(4.0, DType::F32, DeviceId::Cpu);
+        let sum = UOp::add(x, y);
         let result = graph_rewrite(&sum, &|_| None, "test");
-
-        // Assert
         assert_eq!(result, sum);
     }
 
     #[test]
     fn test_rewrite_mul_zero() {
-        // Arrange
-        let x = UOp::const_float(42.0, DType::F32);
-        let zero = UOp::const_float(0.0, DType::F32);
-        let prod = UOp::new(Op::Mul, DType::F32, vec![x, zero], Arg::None);
-
-        // Act
+        let x = UOp::const_float(42.0, DType::F32, DeviceId::Cpu);
+        let zero = UOp::const_float(0.0, DType::F32, DeviceId::Cpu);
+        let prod = UOp::mul(x, zero);
         let result = graph_rewrite(&prod, &symbolic_simple, "test");
-
-        // Assert
         assert_eq!(result.op(), Op::Const);
         assert_eq!(*result.arg(), Arg::Float(0.0));
     }

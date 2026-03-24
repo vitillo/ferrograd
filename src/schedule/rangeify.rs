@@ -34,12 +34,7 @@ use super::indexing::{
 fn chain_ends(ranges: &[UOp], body: &UOp) -> UOp {
     let mut current = body.clone();
     for range in ranges.iter().rev() {
-        current = UOp::new(
-            Op::End,
-            DType::Void,
-            vec![range.clone(), current],
-            Arg::None,
-        );
+        current = UOp::new(Op::End, DType::Void, vec![range.clone(), current], Arg::None);
     }
     current
 }
@@ -71,38 +66,49 @@ fn rewrite_store_add_ranges(store: &UOp) -> Option<UOp> {
     let out_param = &store.srcs()[0];
     let expr = &store.srcs()[1];
     let shape = expr.shape()?;
+    let device = expr.device();
 
-    let ranges: Vec<UOp> = shape
+    let axis_indices: Vec<UOp> = shape
         .iter()
         .enumerate()
         .map(|(axis, &size)| {
+            if size == 1 {
+                return UOp::const_int(0, DType::I32, device);
+            }
             #[allow(clippy::cast_possible_wrap)]
-            UOp::range(axis, UOp::const_int(size as i64, DType::I32))
+            UOp::new(
+                Op::Range,
+                DType::I32,
+                vec![UOp::const_int(size as i64, DType::I32, device)],
+                Arg::Index(axis),
+            )
         })
         .collect();
 
-    let indexed_expr = index_wrap(expr, &ranges);
+    let indexed_expr = index_wrap(expr, &axis_indices);
 
     // Size-1 dims come from reductions (e.g. sum(axis=0) on [3,4] → [1,4]).
     // They don't contribute to the output buffer size, so skip them for the
     // output flat index. The Range still exists to carry the full shape into
     // Index pushing.
-    let out_ranges: Vec<UOp> = ranges
+    let out_ranges: Vec<UOp> = axis_indices
         .iter()
-        .zip(&shape)
-        .filter(|(_, &s)| s != 1)
-        .map(|(r, _)| r.clone())
+        .filter(|idx| idx.op() == Op::Range)
+        .cloned()
         .collect();
     let squeezed: Vec<usize> = shape.iter().copied().filter(|&s| s != 1).collect();
     let out_flat = if out_ranges.is_empty() {
-        UOp::const_int(0, DType::I32)
+        UOp::const_int(0, DType::I32, device)
     } else {
         flat_index(&out_ranges, &contiguous_strides(&squeezed))
     };
-    // Tag with Arg::Index(0) so the Index-pushing rule skips this node.
-    // This is an output pointer, not an expression to push through.
-    let out_idx = UOp::new(Op::Index, out_param.dtype(), vec![out_param.clone(), out_flat], Arg::Index(0));
-    let new_store = UOp::store(out_idx, indexed_expr);
+    let out_idx = UOp::new(
+        Op::Index,
+        out_param.dtype(),
+        vec![out_param.clone(), out_flat],
+        Arg::Index(0),
+    );
+    let new_store = UOp::new(Op::Store, DType::Void, vec![out_idx, indexed_expr], Arg::None);
 
     Some(chain_ends(&out_ranges, &new_store))
 }
@@ -133,26 +139,17 @@ fn expand_reduce(reduce: &UOp) -> UOp {
     let value = &reduce.srcs()[0];
     let reduce_ranges: Vec<UOp> = reduce.srcs()[1..].to_vec();
     let dtype = reduce.dtype();
+    let device = reduce.device();
 
     let init_val = match reduce_op {
-        Op::Add => UOp::const_float(0.0, dtype),
-        Op::Max => UOp::const_float(f64::NEG_INFINITY, dtype),
+        Op::Add => UOp::const_float(0.0, dtype, device),
+        Op::Max => UOp::const_float(f64::NEG_INFINITY, dtype, device),
         _ => panic!("unsupported reduce op: {reduce_op:?}"),
     };
 
     let define_acc = UOp::new(Op::DefineAcc, dtype, vec![init_val], Arg::None);
-    let accumulated = UOp::new(
-        *reduce_op,
-        dtype,
-        vec![define_acc.clone(), value.clone()],
-        Arg::None,
-    );
-    let assign = UOp::new(
-        Op::Assign,
-        dtype,
-        vec![define_acc.clone(), accumulated],
-        Arg::None,
-    );
+    let accumulated = UOp::new(*reduce_op, dtype, vec![define_acc.clone(), value.clone()], Arg::None);
+    let assign = UOp::new(Op::Assign, dtype, vec![define_acc.clone(), accumulated], Arg::None);
 
     UOp::new(
         Op::After,
@@ -174,7 +171,9 @@ fn rangeify_rule(node: &UOp) -> Option<UOp> {
             let idxs = &node.srcs()[1..];
             match inner.op() {
                 op if op.is_alu() => rewrite_index_alu(inner, idxs),
-                Op::Expand | Op::Permute | Op::Reshape => rewrite_index_movement(inner, idxs),
+                Op::Expand | Op::Permute | Op::Reshape | Op::Shrink => {
+                    rewrite_index_movement(inner, idxs)
+                }
                 Op::ReduceAxis => rewrite_index_reduce(inner, idxs),
                 Op::Const => rewrite_index_const(inner, idxs),
                 Op::Param => rewrite_index_param(inner, idxs),
