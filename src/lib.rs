@@ -15,7 +15,7 @@
 //! - [`device`] -- Device trait, Buffer, Storage, plus backend implementations (M2)
 //! - [`uop`] -- Rc-based computation graph nodes (M3)
 //! - [`codegen`] -- Code generation: `UOp` IR to C source (M4)
-//! - [`rewrite`] -- Graph rewriting: pattern matching and algebraic simplification (M5)
+//! - [`rewrite`] -- Fixed-point graph rewriting and algebraic simplification (M5)
 //! - [`tensor`] -- Lazy tensor API with kernel fusion (M6)
 //! - [`schedule`] -- Converts tensor-level `UOps` to kernel-level `UOps` (M6)
 //! - [`gradient`] -- Reverse-mode automatic differentiation (M7)

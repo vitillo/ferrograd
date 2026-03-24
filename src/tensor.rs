@@ -477,15 +477,9 @@ impl Tensor {
 
         targets
             .iter()
-            .map(|t| {
-                let grad_uop = grad_map
-                    .get(&t.uop)
-                    .cloned()
-                    .unwrap_or_else(|| UOp::const_float(0.0, t.dtype()));
-                Self {
-                    uop: grad_uop,
-                    device: t.device.clone(),
-                }
+            .map(|t| Self {
+                uop: grad_map[&t.uop].clone(),
+                device: t.device.clone(),
             })
             .collect()
     }

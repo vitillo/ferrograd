@@ -364,6 +364,66 @@ impl UOp {
         self.op() == Op::Const && *self.arg() == Arg::Int(val)
     }
 
+    /// Whether this is a zero constant (float 0.0 or int 0).
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.is_const_float(0.0) || self.is_const_int(0)
+    }
+
+    /// Whether this is a one constant (float 1.0 or int 1).
+    #[must_use]
+    pub fn is_one(&self) -> bool {
+        self.is_const_float(1.0) || self.is_const_int(1)
+    }
+
+    // ── Arithmetic builders ──────────────────────────────────────────────
+    // These create ALU UOps, inferring dtype from the first operand.
+    // Named after the ops they wrap (not std traits — these build lazy graph nodes).
+
+    /// `a + b`
+    #[must_use]
+    #[allow(clippy::should_implement_trait)]
+    pub fn add(a: Self, b: Self) -> Self {
+        let dt = a.dtype();
+        Self::new(Op::Add, dt, vec![a, b], Arg::None)
+    }
+
+    /// `a * b`
+    #[must_use]
+    #[allow(clippy::should_implement_trait)]
+    pub fn mul(a: Self, b: Self) -> Self {
+        let dt = a.dtype();
+        Self::new(Op::Mul, dt, vec![a, b], Arg::None)
+    }
+
+    /// `-a`
+    #[must_use]
+    #[allow(clippy::should_implement_trait)]
+    pub fn neg(a: Self) -> Self {
+        let dt = a.dtype();
+        Self::new(Op::Neg, dt, vec![a], Arg::None)
+    }
+
+    /// `1/a`
+    #[must_use]
+    pub fn reciprocal(a: Self) -> Self {
+        let dt = a.dtype();
+        Self::new(Op::Reciprocal, dt, vec![a], Arg::None)
+    }
+
+    /// `a < b` (returns Bool)
+    #[must_use]
+    pub fn cmplt(a: Self, b: Self) -> Self {
+        Self::new(Op::CmpLt, DType::Bool, vec![a, b], Arg::None)
+    }
+
+    /// `if cond then t else f`
+    #[must_use]
+    pub fn where_(cond: Self, t: Self, f: Self) -> Self {
+        let dt = t.dtype();
+        Self::new(Op::Where, dt, vec![cond, t, f], Arg::None)
+    }
+
     /// Loop range with `axis` id and upper `bound`.
     #[must_use]
     pub fn range(axis: usize, bound: Self) -> Self {
