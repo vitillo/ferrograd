@@ -34,7 +34,7 @@ impl Renderer for ClangRenderer {
             .iter()
             .map(|(slot, dtype)| format!("{}* restrict data{slot}", dtype.c_type()))
             .collect();
-        let mut out = format!("void {name}({}) {{\n", args.join(", "));
+        let mut out = format!("#include <math.h>\nvoid {name}({}) {{\n", args.join(", "));
 
         // Variable name map: UOp → C expression string.
         let mut names: HashMap<&UOp, String> = HashMap::new();
@@ -91,15 +91,18 @@ impl Renderer for ClangRenderer {
                 Op::Const => {
                     let expr = match node.arg() {
                         Arg::Float(v) => {
-                            let s = if v.fract() == 0.0 {
-                                format!("{v:.1}")
+                            if v.is_infinite() {
+                                if v.is_sign_positive() { "INFINITY".to_string() }
+                                else { "(-INFINITY)".to_string() }
+                            } else if v.is_nan() {
+                                "NAN".to_string()
                             } else {
-                                format!("{v}")
-                            };
-                            if node.dtype() == DType::F32 {
-                                format!("{s}f")
-                            } else {
-                                s
+                                let s = if v.fract() == 0.0 {
+                                    format!("{v:.1}")
+                                } else {
+                                    format!("{v}")
+                                };
+                                if node.dtype() == DType::F32 { format!("{s}f") } else { s }
                             }
                         }
                         Arg::Int(v) => format!("{v}"),

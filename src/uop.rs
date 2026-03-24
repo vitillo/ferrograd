@@ -462,6 +462,33 @@ impl UOp {
         Self::new(Op::Sink, DType::Void, stores, Arg::None)
     }
 
+    // ── Structural key ────────────────────────────────────────────────────
+
+    /// Compute a structural hash of the `UOp` tree.
+    ///
+    /// Two `UOp` trees that are structurally identical (same ops, dtypes, args,
+    /// and topology) produce the same key, even if they are different `Rc`
+    /// allocations. Used for kernel caching — same key means same compiled
+    /// program.
+    #[must_use]
+    pub fn structural_key(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let order = self.toposort();
+        let mut node_keys: HashMap<UOp, u64> = HashMap::new();
+        for node in &order {
+            let mut hasher = DefaultHasher::new();
+            node.op().hash(&mut hasher);
+            node.dtype().hash(&mut hasher);
+            node.arg().hash(&mut hasher);
+            for src in node.srcs() {
+                hasher.write_u64(node_keys[src]);
+            }
+            node_keys.insert(node.clone(), hasher.finish());
+        }
+        node_keys[self]
+    }
+
     // ── Toposort ────────────────────────────────────────────────────────
 
     /// Iterative post-order DFS. Returns nodes in dependency order

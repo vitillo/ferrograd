@@ -177,7 +177,24 @@ This plan is based on a deep exploration of the tinygrad codebase. Tinygrad's pi
 
 ---
 
-## Milestone 9: CUDA Backend
+## Milestone 9: Train an MLP on MNIST
+
+**Compiler concept:** End-to-end integration -- every layer of the stack exercised.
+
+**Build:**
+- Data loading: MNIST IDX format (16-byte header + raw u8 pixels), normalize to f32
+- Model: `Linear(784, 128) → ReLU → Linear(128, 10)` where `Linear(x) = x.matmul(w) + b`
+- Loss: cross-entropy = `(-log_softmax(logits) * one_hot(labels)).sum() / batch_size`
+  - Softmax = `exp(x - x.max()) / exp(x - x.max()).sum()`
+  - Requires: `exp2`, `log2`, `max`, `sum`, `sub` (all available)
+- Training loop: forward → loss → backward → SGD step → repeat
+- Batching: iterate dataset in batches of 64-128
+
+**Test:** Loss decreases over epochs. ~95% accuracy after 5 epochs is the baseline for this architecture.
+
+---
+
+## Milestone 10: CUDA Backend
 
 **Compiler concept:** GPU programming model -- thread grids replace loops.
 
@@ -199,28 +216,12 @@ This plan is based on a deep exploration of the tinygrad codebase. Tinygrad's pi
 
 ---
 
-## Milestone 10: Train an MLP on MNIST
-
-**Compiler concept:** End-to-end integration -- every layer of the stack exercised.
-
-**Build:**
-- Data loading: MNIST IDX format (16-byte header + raw u8 pixels), normalize to f32
-- Model: `Linear(784, 128) → ReLU → Linear(128, 10)` where `Linear(x) = x.matmul(w) + b`
-- Loss: cross-entropy = `(-log_softmax(logits) * one_hot(labels)).sum() / batch_size`
-  - Softmax = `exp(x - x.max()) / exp(x - x.max()).sum()`
-  - Requires: `exp2`, `log2`, `max`, `sum`, `sub` (all available)
-- Training loop: forward → loss → backward → SGD step → repeat
-- Batching: iterate dataset in batches of 64-128
-
-**Test:** Loss decreases over epochs. ~95% accuracy after 5 epochs is the baseline for this architecture.
-
----
-
 ## Milestone Dependency Graph
 
 ```
-M1 (JIT) → M2 (Device) → M3 (IR) → M4 (Codegen) → M5 (Rewrite) → M6 (Tensor) → M7 (Reduce/Matmul) → M8 (Autograd) → M10 (MNIST)
-                                                                                                          ↘ M9 (CUDA) ↗
+M1 (JIT) → M2 (Device) → M3 (IR) → M4 (Codegen) → M5 (Rewrite) → M6 (Tensor) → M7 (Reduce/Matmul) → M8 (Autograd) → M9 (MNIST)
+                                                                                                                          ↓
+                                                                                                                        M10 (CUDA)
 ```
 
 ## Compiler Concepts Summary
@@ -235,5 +236,5 @@ M1 (JIT) → M2 (Device) → M3 (IR) → M4 (Codegen) → M5 (Rewrite) → M6 (T
 | 6 | Tensor + Lazy Eval | Lazy evaluation, kernel fusion, scheduling |
 | 7 | Reduce + Matmul | Loop nest generation, index arithmetic |
 | 8 | Autograd | Reverse-mode AD as graph transformation |
-| 9 | CUDA | GPU codegen (thread grids replace loops) |
-| 10 | MNIST | Full integration |
+| 9 | MNIST | Full integration (CPU) |
+| 10 | CUDA | GPU codegen (thread grids replace loops) |

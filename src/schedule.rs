@@ -1,8 +1,7 @@
 //! # Scheduling — turning lazy tensor graphs into executable kernels
 //!
 //! This module converts the lazy `UOp` graph built by [`crate::tensor`] into
-//! kernel-level IR that the codegen can render to C. The pipeline mirrors
-//! tinygrad's `schedule/` package.
+//! a list of kernel-level IR items ready for codegen + execution.
 //!
 //! ## Why scheduling exists
 //!
@@ -10,23 +9,16 @@
 //! `ReduceAxis`, etc.). These ops describe *what* to compute, but not *how* to
 //! iterate over memory. Scheduling bridges that gap:
 //!
-//! 1. **`schedule()`** (this file) — replaces device-level `Buffer` nodes with
-//!    abstract `Param` slots and wraps everything in `Store`/`Sink`. This
-//!    separates "what data lives where" from "what computation to do", which
-//!    is essential because the same buffer might be shared across expressions.
+//! 1. **Splitting**: identifies where the graph must be cut into separate
+//!    kernels (when a `ReduceAxis` feeds another `ReduceAxis`, the inner
+//!    one must be materialized to a buffer).
+//! 2. **Parameterization**: replaces device-level `Buffer` nodes with abstract
+//!    `Param` slots, separating data placement from computation.
+//! 3. **Wrapping**: wraps each subgraph in `Store`/`Sink` — the proto-kernel.
 //!
-//! 2. **`rangeify`** — creates loop nests (`Range`/`End`) and pushes `Index`
-//!    nodes down through the graph. Movement ops (Reshape, Permute, Expand)
-//!    transform the index expressions as they pass through, then disappear.
-//!    When Index reaches a Param leaf, it becomes a `Load` with a flat offset.
-//!    Reductions get their own inner loops with accumulator patterns.
-//!
-//! 3. **`symbolic_simple`** (in [`crate::rewrite`]) — cleans up redundant
-//!    arithmetic (`x+0`, `x*1`, constant folding) left over from index
-//!    generation.
-//!
-//! After these steps, the graph contains only kernel-level ops that map
-//! directly to C code: Range/End (loops), Load/Store (memory), and ALU ops.
+//! The result is a `Vec<ScheduleItem>` in dependency order: each item is a
+//! single kernel that reads from Buffers and writes one output. The executor
+//! compiles and runs them sequentially.
 //!
 //! ## Pipeline
 //!
@@ -34,8 +26,8 @@
 //! Tensor ops (lazy UOp graph)
 //!   │  Buffers, Reshape, Permute, Expand, ReduceAxis, ALU ops
 //!   ▼
-//! schedule()         Buffer → Param, wrap in Store/Sink
-//!   │  Params, Reshape, Permute, Expand, ReduceAxis, ALU ops
+//! schedule()         Split at reduction boundaries, Buffer → Param, Store/Sink
+//!   │  Returns Vec<ScheduleItem> in execution order
 //!   ▼
 //! rangeify()         Add Range loops, push Index down, expand Reduce
 //!   │  Range, End, Load, Store, DefineAcc, Assign, After, ALU ops
@@ -46,32 +38,6 @@
 //! codegen            Render to C source
 //! ```
 //!
-//! ## Example: `a[2,3] + b[2,3]`
-//!
-//! **After `schedule()`** — Buffers replaced with Params, wrapped in Store/Sink:
-//! ```text
-//! Sink(Store(Param(0), Add(Reshape([2,3], Param(1)), Reshape([2,3], Param(2)))))
-//! ```
-//!
-//! **After `rangeify()`** — loops created, Index pushed down to Loads:
-//! ```text
-//! for i in 0..2:
-//!   for j in 0..3:
-//!     val0 = Load(Param(1), i*3+j)
-//!     val1 = Load(Param(2), i*3+j)
-//!     Store(Param(0), i*3+j, val0 + val1)
-//! ```
-//!
-//! ## What's not here yet
-//!
-//! - **Fusion decisions**: currently every `realize()` produces exactly one
-//!   kernel. For training loops with multiple outputs, we'll need a realize
-//!   map that decides fusion boundaries.
-//! - **Multi-consumer range merging**: when one op feeds two consumers that
-//!   need different ranges.
-//! - **Buffer cost analysis**: deciding which intermediates to materialize
-//!   vs. recompute.
-//!
 //! ## Submodules
 //!
 //! - [`indexing`] — core index transformation rules (see module docs for details)
@@ -80,35 +46,76 @@
 pub mod indexing;
 pub mod rangeify;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::device::Buffer;
+use crate::device::{Buffer, Device};
+use crate::dtype::DType;
 use crate::rewrite::graph_rewrite;
 use crate::uop::{Arg, Op, UOp};
 
-/// Schedule a tensor expression for execution as a single kernel.
+/// A single kernel to compile and execute.
+pub struct ScheduleItem {
+    /// Kernel-ready `UOp` graph (`Sink(Store(Param, expr))`).
+    pub sink: UOp,
+    /// Input buffers (slot 1+), shared via `Rc` so intermediate outputs
+    /// from earlier kernels are visible to later ones.
+    pub input_bufs: Vec<Rc<Buffer>>,
+    /// Pre-allocated output buffer. For intermediate kernels, downstream
+    /// kernels already hold `Rc` clones of this buffer in their `input_bufs`.
+    /// The executor writes into this buffer so data flows automatically.
+    pub out_buf: Rc<Buffer>,
+    /// Output shape.
+    pub out_shape: Vec<usize>,
+    /// Output element type.
+    pub out_dtype: DType,
+}
+
+/// Analyze a lazy `UOp` graph and produce kernels in dependency order.
 ///
-/// This is the first step of lowering: it separates the computation graph
-/// from the concrete device buffers. Every `Buffer` node (which holds an
-/// `Rc<Buffer>` pointing to actual device memory) is replaced with a `Param`
-/// node (which just has a slot number). This way, rangeify and codegen work
-/// with abstract parameters, and the runtime binds actual buffers at launch.
+/// Automatically splits at `ReduceAxis` boundaries when a reduction feeds
+/// into another reduction (directly or through element-wise ops). Each split
+/// produces an intermediate `ScheduleItem` whose output buffer becomes an
+/// input to subsequent kernels.
 ///
-/// The same `Buffer` identity (by `Rc` pointer) always maps to the same
-/// `Param` slot, so `a + a` correctly shares a single input parameter.
-///
-/// Returns `(scheduled_sink, input_buffers)` where slot 0 is the output
-/// and slots 1+ correspond to the collected input buffers.
+/// This is a pure graph transformation — no Device, no compilation.
 ///
 /// # Panics
 ///
-/// Panics if buffer extraction fails (internal error).
+/// Panics if buffer extraction or shape inference fails.
 #[must_use]
-pub fn schedule(expr: &UOp) -> (UOp, Vec<Buffer>) {
+pub fn schedule(expr: &UOp, device: &dyn Device) -> Vec<ScheduleItem> {
+    let mut items = Vec::new();
+    let mut uop = expr.clone();
+
+    // Materialize inner reductions that feed outer reductions.
+    loop {
+        let Some(cut) = find_cut_point(&uop) else {
+            break;
+        };
+
+        let item = parameterize(&cut, device);
+
+        // Replace the cut subtree with a Buffer pointing to item.out_buf.
+        // Later kernels' parameterize will pick up this Rc<Buffer> as an input.
+        let buf_uop = UOp::new(Op::Buffer, item.out_dtype, vec![], Arg::Buffer(item.out_buf.clone()));
+        let replacement = UOp::new(Op::Reshape, item.out_dtype, vec![buf_uop], Arg::Dims(item.out_shape.clone()));
+        uop = substitute_uop(&uop, &cut, &replacement);
+
+        items.push(item);
+    }
+
+    // Final kernel.
+    items.push(parameterize(&uop, device));
+
+    items
+}
+
+/// Convert a subgraph to a parameterized kernel: Buffer→Param, Store/Sink.
+fn parameterize(expr: &UOp, device: &dyn Device) -> ScheduleItem {
     use std::cell::RefCell;
 
-    let input_bufs: Rc<RefCell<Vec<Buffer>>> = Rc::new(RefCell::new(Vec::new()));
+    let input_bufs: Rc<RefCell<Vec<Rc<Buffer>>>> = Rc::new(RefCell::new(Vec::new()));
     let buf_params: Rc<RefCell<HashMap<usize, UOp>>> = Rc::new(RefCell::new(HashMap::new()));
 
     let bufs = input_bufs.clone();
@@ -118,7 +125,9 @@ pub fn schedule(expr: &UOp) -> (UOp, Vec<Buffer>) {
         if node.op() != Op::Buffer {
             return None;
         }
-        let Arg::Buffer(ref rc) = node.arg() else { return None };
+        let Arg::Buffer(ref rc) = node.arg() else {
+            return None;
+        };
         let ptr = Rc::as_ptr(rc) as usize;
         let dtype = node.dtype();
         let numel = rc.numel();
@@ -129,7 +138,7 @@ pub fn schedule(expr: &UOp) -> (UOp, Vec<Buffer>) {
                 .or_insert_with(|| {
                     let mut bufs_vec = bufs.borrow_mut();
                     let slot = bufs_vec.len() + 1;
-                    bufs_vec.push(Buffer::clone(rc));
+                    bufs_vec.push(rc.clone());
                     UOp::param(slot, dtype, numel)
                 })
                 .clone(),
@@ -139,11 +148,77 @@ pub fn schedule(expr: &UOp) -> (UOp, Vec<Buffer>) {
     let parameterized = graph_rewrite(expr, &rewrite_buf, "schedule");
     drop(rewrite_buf);
 
-    let out_numel = parameterized.shape().map_or(1, |s| s.iter().product());
-    let out_param = UOp::param(0, expr.dtype(), out_numel);
+    let out_shape = parameterized.shape().unwrap_or_else(|| vec![1]);
+    let out_numel: usize = out_shape.iter().product();
+    let out_dtype = expr.dtype();
+    let out_param = UOp::param(0, out_dtype, out_numel);
     let store = UOp::store(out_param, parameterized);
     let sink = UOp::sink(vec![store]);
 
     let bufs = Rc::try_unwrap(input_bufs).unwrap().into_inner();
-    (sink, bufs)
+    let out_buf = Rc::new(device.allocate(out_dtype, out_numel));
+    ScheduleItem {
+        sink,
+        input_bufs: bufs,
+        out_buf,
+        out_shape,
+        out_dtype,
+    }
+}
+
+// ── Multi-kernel splitting ──────────────────────────────────────────────
+
+/// Find the innermost `ReduceAxis` that has a `ReduceAxis` ancestor.
+///
+/// This identifies where to split: the inner reduction must be materialized
+/// to a buffer so the outer reduction can randomly access its results.
+/// Returns `None` if no nested reductions exist (single kernel suffices).
+fn find_cut_point(root: &UOp) -> Option<UOp> {
+    let order = root.toposort();
+
+    // Mark nodes whose output eventually feeds into a ReduceAxis.
+    let mut feeds_reduce: HashSet<UOp> = HashSet::new();
+    for node in order.iter().rev() {
+        if node.op() == Op::ReduceAxis || feeds_reduce.contains(node) {
+            for src in node.srcs() {
+                feeds_reduce.insert(src.clone());
+            }
+        }
+    }
+
+    // Walk bottom-up: the first ReduceAxis whose output feeds another
+    // ReduceAxis is the cut point.
+    for node in &order {
+        if node.op() == Op::ReduceAxis && feeds_reduce.contains(node) {
+            return Some(node.clone());
+        }
+    }
+    None
+}
+
+/// Replace all occurrences of `old` with `new` in the graph rooted at `root`.
+fn substitute_uop(root: &UOp, old: &UOp, new: &UOp) -> UOp {
+    let order = root.toposort();
+    let mut replace: HashMap<UOp, UOp> = HashMap::new();
+    replace.insert(old.clone(), new.clone());
+
+    for node in &order {
+        if replace.contains_key(node) {
+            continue;
+        }
+        let new_srcs: Vec<UOp> = node
+            .srcs()
+            .iter()
+            .map(|s| replace.get(s).cloned().unwrap_or_else(|| s.clone()))
+            .collect();
+        let changed = node.srcs().iter().zip(&new_srcs).any(|(o, n)| o != n);
+        if changed {
+            replace.insert(
+                node.clone(),
+                UOp::new(node.op(), node.dtype(), new_srcs, node.arg().clone()),
+            );
+        }
+    }
+
+    replace.get(root).cloned().unwrap_or_else(|| root.clone())
 }

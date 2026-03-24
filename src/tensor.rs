@@ -8,13 +8,15 @@
 //! Set `DEBUG` env var (same as tinygrad):
 //! - 1: kernel summary, 2: + timing, 3: + graph rewrite before/after, 4: + generated C
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
 use std::time::Instant;
 
 use crate::codegen::{ClangRenderer, Renderer};
-use crate::device::{Buffer, CpuDevice, Device};
+use crate::device::{Buffer, CpuDevice, Device, Program};
 use crate::dtype::DType;
 use crate::gradient;
 use crate::schedule::{self, rangeify::rangeify};
@@ -28,6 +30,12 @@ static DEBUG: LazyLock<u8> = LazyLock::new(|| {
 });
 
 static KERNEL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// Kernel cache: structural hash of the Sink UOp → compiled Program.
+// Avoids recompiling identical kernels across training iterations.
+thread_local! {
+    static METHOD_CACHE: RefCell<HashMap<u64, Rc<Program>>> = RefCell::new(HashMap::new());
+}
 
 // ── Tensor ──────────────────────────────────────────────────────────────────
 
@@ -79,6 +87,19 @@ impl Tensor {
             uop: UOp::new(Op::Reshape, dtype, vec![buf_uop], Arg::Dims(shape.to_vec())),
             device: device.clone(),
         }
+    }
+
+    /// Create a tensor filled with ones on the given device.
+    #[must_use]
+    pub fn ones(shape: &[usize], device: &Rc<dyn Device>) -> Self {
+        let numel = shape.iter().product();
+        Self::from_slice(&vec![1.0_f32; numel], shape, device)
+    }
+
+    /// Create a scalar tensor (shape `[1]`).
+    #[must_use]
+    pub fn scalar(value: f32, device: &Rc<dyn Device>) -> Self {
+        Self::from_slice(&[value], &[1], device)
     }
 
     /// The tensor's element type.
@@ -331,6 +352,43 @@ impl Tensor {
         }
     }
 
+    /// Max over the given axes. Reduced dims become size 1.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any axis is out of range.
+    #[must_use]
+    pub fn max(&self, axes: &[usize]) -> Self {
+        for &ax in axes {
+            assert!(ax < self.ndim(), "max: axis {ax} out of range");
+        }
+        Self {
+            uop: UOp::new(
+                Op::ReduceAxis,
+                self.dtype(),
+                vec![self.uop.clone()],
+                Arg::Reduce(Op::Max, axes.to_vec()),
+            ),
+            device: self.device.clone(),
+        }
+    }
+
+    /// Natural exponential: `e^x`. Composed as `2^(x · log₂(e))`.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn exp(&self) -> Self {
+        let log2e = Tensor::from_slice(&[std::f64::consts::LOG2_E as f32], &[1], &self.device);
+        self.mul(&log2e).exp2()
+    }
+
+    /// Natural logarithm: `ln(x)`. Composed as `log₂(x) · ln(2)`.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn log(&self) -> Self {
+        let ln2 = Tensor::from_slice(&[std::f64::consts::LN_2 as f32], &[1], &self.device);
+        self.log2().mul(&ln2)
+    }
+
     // ── Matmul ────────────────────────────────────────────────────────
 
     /// Matrix multiply: `[M,K] @ [K,N] → [M,N]`.
@@ -362,7 +420,11 @@ impl Tensor {
 
     // ── Realize ─────────────────────────────────────────────────────────
 
-    /// Lower the lazy graph to a fused kernel, compile, and execute.
+    /// Lower the lazy graph to fused kernels, compile, and execute.
+    ///
+    /// Calls [`schedule::schedule`] to split the graph into kernels, then
+    /// compiles and executes each one sequentially. Intermediate buffers
+    /// are allocated by the scheduler and shared across kernels via `Rc`.
     ///
     /// # Panics
     ///
@@ -373,59 +435,96 @@ impl Tensor {
             return self.clone();
         }
 
+        let items = schedule::schedule(&self.uop, &*self.device);
+        for item in &items {
+            self.execute_item(item);
+        }
+
+        let last = items.last().expect("schedule produced no items");
+        let buf_uop = UOp::new(Op::Buffer, self.dtype(), vec![], Arg::Buffer(last.out_buf.clone()));
+        Self {
+            uop: UOp::new(Op::Reshape, self.dtype(), vec![buf_uop], Arg::Dims(last.out_shape.clone())),
+            device: self.device.clone(),
+        }
+    }
+
+    /// Compile and execute a single [`schedule::ScheduleItem`].
+    fn execute_item(&self, item: &schedule::ScheduleItem) {
         let debug = *DEBUG;
-        let numel = self.numel();
-        let dtype = self.dtype();
-
-        let (scheduled, mut input_bufs) = schedule::schedule(&self.uop);
-        let sink = rangeify(&scheduled);
-
-        // Simplify index arithmetic (x+0→x, x*1→x, constant folding).
-        let sink =
-            crate::rewrite::graph_rewrite(&sink, &crate::rewrite::symbolic_simple, "symbolic");
-
-        let kid = KERNEL_COUNT.fetch_add(1, Ordering::Relaxed);
-        let name = format!("kernel_{kid}");
-        // TODO: select renderer based on device (ClangRenderer for CPU, CudaRenderer for CUDA)
-        let code = ClangRenderer.render(&sink, &name);
-
-        if debug >= 4 {
-            eprintln!("{code}");
-        }
-        if debug >= 3 {
-            eprintln!("{}", sink.dump());
-        }
-
         let dev = &*self.device;
-        let num_bufs = input_bufs.len() + 1;
-        let program = dev.compile(&code, &name, num_bufs).expect("compile failed");
-        let mut out = dev.allocate(dtype, numel);
+        let num_bufs = item.input_bufs.len() + 1;
 
+        // Cache lookup by structural hash of the kernel AST.
+        let key = item.sink.structural_key();
+        let program = METHOD_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(prog) = cache.get(&key) {
+                if debug >= 1 {
+                    let kid = KERNEL_COUNT.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("*** CPU {kid:>4}  (cached)         arg {num_bufs:>2}");
+                }
+                return prog.clone();
+            }
+
+            // Cache miss: rangeify → simplify → codegen → compile.
+            let sink = rangeify(&item.sink);
+            let sink = crate::rewrite::graph_rewrite(
+                &sink,
+                &crate::rewrite::symbolic_simple,
+                "symbolic",
+            );
+
+            let kid = KERNEL_COUNT.fetch_add(1, Ordering::Relaxed);
+            let name = format!("kernel_{kid}");
+            let code = ClangRenderer.render(&sink, &name);
+
+            if debug >= 4 {
+                eprintln!("{code}");
+            }
+            if debug >= 3 {
+                eprintln!("{}", sink.dump());
+            }
+
+            let prog = Rc::new(dev.compile(&code, &name, num_bufs).expect("compile failed"));
+
+            if debug >= 2 {
+                eprintln!("*** CPU {kid:>4}  {name:<16} arg {num_bufs:>2}  (compiled)");
+            } else if debug >= 1 {
+                eprintln!("*** CPU {kid:>4}  {name:<16} arg {num_bufs:>2}");
+            }
+
+            cache.insert(key, prog.clone());
+            prog
+        });
+
+        // Execute.
+        let numel: usize = item.out_shape.iter().product();
+        let mut out = dev.allocate(item.out_dtype, numel);
+
+        let mut input_copies: Vec<Buffer> =
+            item.input_bufs.iter().map(|rc| (**rc).clone()).collect();
         let mut buf_refs: Vec<&mut Buffer> = Vec::with_capacity(num_bufs);
         buf_refs.push(&mut out);
-        for buf in &mut input_bufs {
+        for buf in &mut input_copies {
             buf_refs.push(buf);
         }
 
         let t0 = Instant::now();
         dev.execute(&program, &mut buf_refs)
             .expect("execution failed");
-        let elapsed = t0.elapsed();
 
         if debug >= 2 {
+            let elapsed = t0.elapsed();
             eprintln!(
-                "*** CPU {kid:>4}  {name:<16} arg {num_bufs:>2}  time={:.3}ms",
+                "              exec time={:.3}ms",
                 elapsed.as_secs_f64() * 1000.0,
             );
-        } else if debug >= 1 {
-            eprintln!("*** CPU {kid:>4}  {name:<16} arg {num_bufs:>2}");
         }
 
-        let buf_uop = UOp::new(Op::Buffer, dtype, vec![], Arg::Buffer(Rc::new(out)));
-        Self {
-            uop: UOp::new(Op::Reshape, dtype, vec![buf_uop], Arg::Dims(self.shape())),
-            device: self.device.clone(),
-        }
+        // Copy output into shared out_buf so downstream kernels see it.
+        // SAFETY: Sequential execution — no concurrent readers yet.
+        let out_ptr = Rc::as_ptr(&item.out_buf).cast_mut();
+        unsafe { *out_ptr = out };
     }
 
     /// Realize and extract data as `Vec<f32>`.
@@ -749,6 +848,33 @@ mod tests {
 
         // Assert
         assert_eq!(result, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_max_2d_axis1() {
+        // Arrange — max over cols: [[1,5,3],[4,2,6]] → [[5],[6]]
+        let a = Tensor::from_slice(&[1.0, 5.0, 3.0, 4.0, 2.0, 6.0], &[2, 3], &dev());
+
+        // Act
+        let result = a.max(&[1]).to_vec();
+
+        // Assert
+        assert_eq!(result, vec![5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_exp_log_roundtrip() {
+        // Arrange — exp(log(x)) ≈ x
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &dev());
+
+        // Act
+        let result = a.log().exp().to_vec();
+
+        // Assert
+        for (i, &v) in result.iter().enumerate() {
+            let expected = [1.0, 2.0, 3.0][i];
+            assert!((v - expected).abs() < 1e-5, "exp(log({expected})) = {v}");
+        }
     }
 
     // ── Autograd tests ──────────────────────────────────────────────────
