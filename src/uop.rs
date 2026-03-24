@@ -1,129 +1,100 @@
 //! # `UOp` — The Core Graph Node
 //!
 //! Every computation in the compiler is represented as a DAG of `UOp` nodes.
-//! Each node holds its op, dtype, children (srcs), and an optional argument.
-//! Nodes are reference-counted (`Rc`) for cheap sharing — this matches
-//! tinygrad where `UOp`s are Python heap objects.
+//! Each node holds its op, dtype, children, and op-specific payload.
 //!
-//! ## Tinygrad reference
-//!
-//! - `Ops` enum: `tinygrad/uop/__init__.py`
-//! - `UOp` class: `tinygrad/uop/ops.py`
+//! Tinygrad interns `UOp`s so structurally identical nodes are shared. We keep
+//! the same idea, but move graph identity onto an explicit device node while
+//! buffers, compiled kernels, and the interner stay in device-scoped state.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
-pub use crate::device::Buffer;
+use crate::device::DeviceId;
 use crate::dtype::DType;
-
-// ── Op ──────────────────────────────────────────────────────────────────────
+use crate::runtime::{self, BufferId};
+use crate::shape::Shape;
 
 /// The operations our IR supports.
-///
-/// The same `Op` enum is used at both the tensor level (lazy graph built by
-/// the user) and the kernel level (executable loops + loads + stores produced
-/// by rangeify). Tensor-level ops are lowered away before codegen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Op {
-    // ── Tensor-level ──────────────────────────────────────────────────
+    /// A device identity leaf.
+    Device,
     /// A realized data buffer.
-    /// srcs: none. arg: `Arg::Buffer(data)`.
     Buffer,
+    /// Narrow each dimension to a half-open range without copying.
+    Shrink,
     /// Change shape without moving data.
-    /// srcs: `[source]`. arg: `Arg::Dims(new_shape)`.
     Reshape,
     /// Reorder dimensions.
-    /// srcs: `[source]`. arg: `Arg::Dims(axis_order)`.
     Permute,
     /// Broadcast dimensions of size 1 to a larger size.
-    /// srcs: `[source]`. arg: `Arg::Dims(new_shape)`.
     Expand,
-    /// Reduce over axes (e.g. sum, max). Tensor-level, lowered to `Reduce`.
-    /// srcs: `[source]`. arg: `Arg::Reduce(op, axes)`.
+    /// Reduce over tensor axes.
     ReduceAxis,
-
-    // ── Kernel structure ──────────────────────────────────────────────
-    /// A kernel buffer parameter (pointer to device memory).
-    /// srcs: none. arg: `Arg::Param(slot, numel)` where slot 0 is the output.
+    /// A kernel buffer parameter.
     Param,
-    /// Loop from 0 to bound. Opens a `for` loop in codegen.
-    /// srcs: `[bound]` + optional ordering deps. arg: `Arg::Index(axis_id)`.
+    /// Loop from 0 to bound.
     Range,
-    /// Closes a `Range` loop.
-    /// srcs: `[range]` + ordering deps (e.g. the Store or Assign inside).
+    /// Close a `Range` loop.
     End,
     /// Root of a completed kernel graph.
-    /// srcs: all top-level nodes (End, Store).
     Sink,
-
-    // ── Memory / Indexing ─────────────────────────────────────────────
-    /// At the tensor level: `srcs: [expr, range0, range1, ...]` — index an
-    /// expression at loop positions. At the kernel level: `srcs: [param,
-    /// flat_offset]` — pointer arithmetic for memory access.
+    /// Tensor-level or kernel-level indexing.
     Index,
     /// Read a value from memory.
-    /// srcs: `[index]` (an Index node).
     Load,
     /// Write a value to memory.
-    /// srcs: `[index, value]`.
     Store,
-
-    // ── Constants ─────────────────────────────────────────────────────
     /// A compile-time constant.
-    /// srcs: none. arg: `Arg::Float`, `Arg::Int`, or `Arg::Bool`.
     Const,
-
-    // ── Math: unary ───────────────────────────────────────────────────
-    /// `-x`. srcs: `[x]`.
+    /// `-x`.
     Neg,
-    /// `2^x`. srcs: `[x]`.
+    /// `2^x`.
     Exp2,
-    /// `log2(x)`. srcs: `[x]`.
+    /// `log2(x)`.
     Log2,
-    /// `sqrt(x)`. srcs: `[x]`.
+    /// `sqrt(x)`.
     Sqrt,
-    /// `1/x`. srcs: `[x]`.
+    /// `1/x`.
     Reciprocal,
-
-    // ── Math: binary ──────────────────────────────────────────────────
-    /// `x + y`. srcs: `[x, y]`.
+    /// `x + y`.
     Add,
-    /// `x * y`. srcs: `[x, y]`.
+    /// `x * y`.
     Mul,
-    /// `max(x, y)`. srcs: `[x, y]`.
+    /// `max(x, y)`.
     Max,
-    /// `x < y`, returns bool. srcs: `[x, y]`.
+    /// `x < y`.
     CmpLt,
-
-    // ── Math: ternary ─────────────────────────────────────────────────
-    /// `if cond then true_val else false_val`. srcs: `[cond, true_val, false_val]`.
+    /// `if cond { t } else { f }`.
     Where,
-
-    // ── Kernel-level reduction ────────────────────────────────────────
-    /// Reduce a value over loop ranges (e.g. sum over a loop).
-    /// srcs: `[value, range0, range1, ...]`. arg: `Arg::Reduce(op, _)`.
-    /// Expanded to DefineAcc/Assign/End/After before codegen.
+    /// Kernel-level reduction placeholder.
     Reduce,
-    /// Ordering barrier: makes `value` depend on `barrier` in the toposort.
-    /// srcs: `[value, barrier]`. Codegen passes through `value`.
+    /// Ordering barrier.
     After,
-    /// Declares a mutable accumulator variable.
-    /// srcs: `[initial_value]` + optional ordering deps.
+    /// Declare an accumulator.
     DefineAcc,
-    /// Updates an accumulator: `acc = new_value`.
-    /// srcs: `[acc, new_value]`.
+    /// Update an accumulator.
     Assign,
 }
 
 impl Op {
-    /// Whether this op is an element-wise ALU operation (math on scalars).
+    /// Whether this op is a scalar ALU operation.
     #[must_use]
     pub fn is_alu(self) -> bool {
         matches!(
             self,
-            Self::Add | Self::Mul | Self::Max | Self::CmpLt | Self::Where
-                | Self::Neg | Self::Exp2 | Self::Log2 | Self::Sqrt | Self::Reciprocal
+            Self::Add
+                | Self::Mul
+                | Self::Max
+                | Self::CmpLt
+                | Self::Where
+                | Self::Neg
+                | Self::Exp2
+                | Self::Log2
+                | Self::Sqrt
+                | Self::Reciprocal
         )
     }
 }
@@ -134,43 +105,51 @@ impl fmt::Display for Op {
     }
 }
 
-// ── Arg ─────────────────────────────────────────────────────────────────────
-
-/// Op-specific payload attached to a `UOp` node.
+/// Op-specific payload attached to a `UOp`.
 #[derive(Debug, Clone)]
 pub enum Arg {
     /// No argument.
     None,
-    /// An integer index — axis id for Range.
+    /// Device identity for `Device`.
+    Device(DeviceId),
+    /// Axis id for `Range`, or sentinel tag for kernel-level `Index`.
     Index(usize),
-    /// Kernel buffer parameter: (slot, numel). Slot 0 is the output.
+    /// Kernel parameter slot and flattened element count.
     Param(usize, usize),
-    /// A constant float value.
+    /// Float literal.
     Float(f64),
-    /// A constant integer value.
+    /// Integer literal.
     Int(i64),
-    /// A constant boolean value.
+    /// Boolean literal.
     Bool(bool),
-    /// A realized tensor buffer. Rc-wrapped for cheap cloning during rewrites.
-    /// Identity is by Rc pointer, not by content.
-    Buffer(Rc<Buffer>),
-    /// Dimension list — shape for Reshape/Expand, axis order for Permute.
-    Dims(Vec<usize>),
-    /// Reduction: (`reduce_op`, axes).
-    Reduce(Op, Vec<usize>),
+    /// Device buffer id and flat element count.
+    Buffer(BufferId, usize),
+    /// Per-dimension half-open bounds for `Shrink`.
+    Bounds(Box<[(usize, usize)]>),
+    /// Shape payload for `Reshape` and `Expand`.
+    Shape(Shape),
+    /// Axis payload for `Permute`.
+    Axes(Box<[usize]>),
+    /// Reduction op and axes.
+    Reduce(Op, Box<[usize]>),
 }
 
 impl PartialEq for Arg {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::None, Self::None) => true,
+            (Self::Device(a), Self::Device(b)) => a == b,
             (Self::Index(a), Self::Index(b)) => a == b,
             (Self::Param(sa, na), Self::Param(sb, nb)) => sa == sb && na == nb,
             (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
             (Self::Int(a), Self::Int(b)) => a == b,
             (Self::Bool(a), Self::Bool(b)) => a == b,
-            (Self::Buffer(a), Self::Buffer(b)) => Rc::ptr_eq(a, b),
-            (Self::Dims(a), Self::Dims(b)) => a == b,
+            (Self::Buffer(id_a, numel_a), Self::Buffer(id_b, numel_b)) => {
+                id_a == id_b && numel_a == numel_b
+            }
+            (Self::Bounds(a), Self::Bounds(b)) => a == b,
+            (Self::Shape(a), Self::Shape(b)) => a == b,
+            (Self::Axes(a), Self::Axes(b)) => a == b,
             (Self::Reduce(op_a, ax_a), Self::Reduce(op_b, ax_b)) => op_a == op_b && ax_a == ax_b,
             _ => false,
         }
@@ -184,13 +163,22 @@ impl std::hash::Hash for Arg {
         std::mem::discriminant(self).hash(state);
         match self {
             Self::None => {}
+            Self::Device(device) => device.hash(state),
             Self::Index(i) => i.hash(state),
-            Self::Param(s, n) => { s.hash(state); n.hash(state); }
-            Self::Float(f) => f.to_bits().hash(state),
-            Self::Int(i) => i.hash(state),
-            Self::Bool(b) => b.hash(state),
-            Self::Buffer(rc) => Rc::as_ptr(rc).hash(state),
-            Self::Dims(d) => d.hash(state),
+            Self::Param(slot, numel) => {
+                slot.hash(state);
+                numel.hash(state);
+            }
+            Self::Float(value) => value.to_bits().hash(state),
+            Self::Int(value) => value.hash(state),
+            Self::Bool(value) => value.hash(state),
+            Self::Buffer(id, numel) => {
+                id.hash(state);
+                numel.hash(state);
+            }
+            Self::Bounds(bounds) => bounds.hash(state),
+            Self::Shape(shape) => shape.hash(state),
+            Self::Axes(axes) => axes.hash(state),
             Self::Reduce(op, axes) => {
                 op.hash(state);
                 axes.hash(state);
@@ -203,296 +191,370 @@ impl fmt::Display for Arg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::None => write!(f, ""),
+            Self::Device(device) => write!(f, "{device:?}"),
             Self::Index(i) => write!(f, "{i}"),
             Self::Param(slot, numel) => write!(f, "slot={slot},n={numel}"),
             Self::Float(v) => write!(f, "{v}"),
             Self::Int(v) => write!(f, "{v}"),
             Self::Bool(v) => write!(f, "{v}"),
-            Self::Buffer(buf) => write!(f, "buf({})", buf.numel()),
-            Self::Dims(d) => write!(f, "{d:?}"),
+            Self::Buffer(id, numel) => write!(f, "buf#{id}[{numel}]"),
+            Self::Bounds(bounds) => write!(f, "{bounds:?}"),
+            Self::Shape(shape) => write!(f, "{shape:?}"),
+            Self::Axes(axes) => write!(f, "{axes:?}"),
             Self::Reduce(op, axes) => write!(f, "{op:?}({axes:?})"),
         }
     }
 }
 
-// ── UOp ─────────────────────────────────────────────────────────────────────
+pub(crate) struct UOpInner {
+    pub(crate) op: Op,
+    pub(crate) dtype: DType,
+    pub(crate) srcs: Vec<UOp>,
+    pub(crate) arg: Arg,
+}
 
-struct UOpInner {
-    op: Op,
-    dtype: DType,
-    srcs: Vec<UOp>,
-    arg: Arg,
+#[derive(Clone, Hash, PartialEq, Eq)]
+pub(crate) struct UOpKey {
+    pub(crate) op: Op,
+    pub(crate) dtype: DType,
+    pub(crate) srcs: Vec<UOp>,
+    pub(crate) arg: Arg,
 }
 
 /// A node in the computation graph.
-///
-/// Reference-counted for cheap cloning and sharing.
 #[derive(Clone)]
-pub struct UOp(Rc<UOpInner>);
+pub struct UOp(pub(crate) Rc<UOpInner>);
 
 impl UOp {
-    /// Create a new node.
-    #[must_use]
-    pub fn new(op: Op, dtype: DType, srcs: Vec<Self>, arg: Arg) -> Self {
-        Self(Rc::new(UOpInner {
-            op,
-            dtype,
-            srcs,
-            arg,
-        }))
+    pub(crate) fn from_inner(inner: Rc<UOpInner>) -> Self {
+        Self(inner)
     }
 
-    /// The operation.
+    fn build(device: DeviceId, op: Op, dtype: DType, srcs: Vec<Self>, arg: Arg) -> Self {
+        runtime::state(device).intern_uop(op, dtype, srcs, arg)
+    }
+
+    fn device_from_srcs(srcs: &[Self]) -> DeviceId {
+        let device = srcs
+            .first()
+            .map(Self::device)
+            .expect("leaf UOps must be created with explicit device");
+        assert!(
+            srcs.iter().all(|src| src.device() == device),
+            "all UOp sources must belong to the same device"
+        );
+        device
+    }
+
+    /// Create a non-leaf node by deriving the device from its sources.
+    ///
+    /// This is a raw IR constructor. Tensor-level API methods do user-facing
+    /// shape validation; lowering and rewrite passes can build intermediate IR
+    /// directly and rely on later stages to reject malformed graphs.
+    #[must_use]
+    pub(crate) fn new(op: Op, dtype: DType, srcs: Vec<Self>, arg: Arg) -> Self {
+        let device = Self::device_from_srcs(&srcs);
+        Self::build(device, op, dtype, srcs, arg)
+    }
+
+    /// Create a device identity leaf.
+    #[must_use]
+    pub(crate) fn device_uop(device: DeviceId) -> Self {
+        Self::build(device, Op::Device, DType::Void, vec![], Arg::Device(device))
+    }
+
+    /// Create a kernel parameter leaf on `device`.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn param(slot: usize, dtype: DType, numel: usize, device: DeviceId) -> Self {
+        Self::build(
+            device,
+            Op::Param,
+            dtype,
+            vec![Self::device_uop(device)],
+            Arg::Param(slot, numel),
+        )
+    }
+
+    /// Create a buffer leaf on `device`.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn buffer(id: BufferId, dtype: DType, numel: usize, device: DeviceId) -> Self {
+        Self::build(
+            device,
+            Op::Buffer,
+            dtype,
+            vec![Self::device_uop(device)],
+            Arg::Buffer(id, numel),
+        )
+    }
+
+    /// Create a float constant on `device`.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn const_float(value: f64, dtype: DType, device: DeviceId) -> Self {
+        Self::build(
+            device,
+            Op::Const,
+            dtype,
+            vec![Self::device_uop(device)],
+            Arg::Float(value),
+        )
+    }
+
+    /// Create an integer constant on `device`.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn const_int(value: i64, dtype: DType, device: DeviceId) -> Self {
+        Self::build(
+            device,
+            Op::Const,
+            dtype,
+            vec![Self::device_uop(device)],
+            Arg::Int(value),
+        )
+    }
+
+    /// Create a boolean constant on `device`.
+    #[must_use]
+    pub(crate) fn const_bool(value: bool, dtype: DType, device: DeviceId) -> Self {
+        Self::build(
+            device,
+            Op::Const,
+            dtype,
+            vec![Self::device_uop(device)],
+            Arg::Bool(value),
+        )
+    }
+
+    /// Return the device this node belongs to.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a malformed non-device node has no source from which to
+    /// derive its device.
+    #[must_use]
+    pub fn device(&self) -> DeviceId {
+        match self.op() {
+            Op::Device => match self.arg() {
+                Arg::Device(device) => *device,
+                _ => unreachable!("Device UOp must carry Arg::Device"),
+            },
+            _ => self
+                .srcs()
+                .first()
+                .map(Self::device)
+                .expect("non-device UOps must derive device from sources"),
+        }
+    }
+
+    /// Return the op.
     #[must_use]
     pub fn op(&self) -> Op {
         self.0.op
     }
 
-    /// The result type.
+    /// Return the result dtype.
     #[must_use]
     pub fn dtype(&self) -> DType {
         self.0.dtype
     }
 
-    /// Input edges.
+    /// Return the source nodes.
     #[must_use]
     pub fn srcs(&self) -> &[UOp] {
         &self.0.srcs
     }
 
-    /// Op-specific payload.
+    /// Return the op-specific payload.
     #[must_use]
     pub fn arg(&self) -> &Arg {
         &self.0.arg
     }
 
-    /// Stable pointer identity, used by the `Hash` impl.
     fn ptr_id(&self) -> usize {
         Rc::as_ptr(&self.0) as usize
     }
 
-    // ── Shape ─────────────────────────────────────────────────────────
-
-    /// Compute shape from the graph structure (like tinygrad's `_shape`).
-    ///
-    /// Returns `None` for scalar/kernel-level nodes (Const, Param, Range, etc.).
+    /// Compute the tensor shape carried by this node.
     #[must_use]
-    pub fn shape(&self) -> Option<Vec<usize>> {
+    pub fn shape(&self) -> Option<Shape> {
         match self.op() {
-            // Buffer and Param are always flat (1D).
             Op::Buffer => {
-                if let Arg::Buffer(ref buf) = self.arg() {
-                    return Some(vec![buf.numel()]);
-                }
-                None
+                let Arg::Buffer(_, numel) = self.arg() else {
+                    return None;
+                };
+                Some(Shape::flat(*numel))
             }
             Op::Param => {
-                if let Arg::Param(_, numel) = self.arg() {
-                    return Some(vec![*numel]);
-                }
-                None
+                let Arg::Param(_, numel) = self.arg() else {
+                    return None;
+                };
+                Some(Shape::flat(*numel))
             }
-            // Movement ops derive shape from their arg or source.
+            Op::Shrink => {
+                let Arg::Bounds(bounds) = self.arg() else {
+                    return None;
+                };
+                Some(Shape::new(
+                    bounds
+                        .iter()
+                        .map(|&(start, end)| end.saturating_sub(start))
+                        .collect(),
+                ))
+            }
             Op::Reshape | Op::Expand => {
-                if let Arg::Dims(ref dims) = self.arg() {
-                    return Some(dims.clone());
-                }
-                None
+                let Arg::Shape(shape) = self.arg() else {
+                    return None;
+                };
+                Some(shape.clone())
             }
             Op::Permute => {
-                if let Arg::Dims(ref order) = self.arg() {
-                    let src_shape = self.srcs()[0].shape()?;
-                    return Some(order.iter().map(|&i| src_shape[i]).collect());
-                }
-                None
+                let Arg::Axes(order) = self.arg() else {
+                    return None;
+                };
+                let src_shape = self.srcs()[0].shape()?;
+                Some(Shape::new(
+                    order.iter().map(|&axis| src_shape[axis]).collect(),
+                ))
             }
-            // Reduction: reduced axes become 1.
             Op::ReduceAxis => {
-                if let Arg::Reduce(_, ref axes) = self.arg() {
-                    let src_shape = self.srcs()[0].shape()?;
-                    return Some(
-                        src_shape
-                            .iter()
-                            .enumerate()
-                            .map(|(i, &s)| if axes.contains(&i) { 1 } else { s })
-                            .collect(),
-                    );
-                }
-                None
+                let Arg::Reduce(_, axes) = self.arg() else {
+                    return None;
+                };
+                let src_shape = self.srcs()[0].shape()?;
+                Some(Shape::new(
+                    src_shape
+                        .iter()
+                        .enumerate()
+                        .map(|(axis, &dim)| if axes.contains(&axis) { 1 } else { dim })
+                        .collect(),
+                ))
             }
+            Op::Const => Some(Shape::flat(1)),
+            Op::Device => None,
             op if op.is_alu() => self.srcs()[0].shape(),
-            // Kernel-level / scalar nodes: no shape.
             _ => None,
         }
     }
 
-    // ── Builder methods ─────────────────────────────────────────────────
-
-    /// Kernel buffer parameter at `slot`.
-    #[must_use]
-    pub fn param(slot: usize, dtype: DType, numel: usize) -> Self {
-        Self::new(Op::Param, dtype, vec![], Arg::Param(slot, numel))
-    }
-
-    /// Scalar float constant.
-    #[must_use]
-    pub fn const_float(value: f64, dtype: DType) -> Self {
-        Self::new(Op::Const, dtype, vec![], Arg::Float(value))
-    }
-
-    /// Scalar integer constant.
-    #[must_use]
-    pub fn const_int(value: i64, dtype: DType) -> Self {
-        Self::new(Op::Const, dtype, vec![], Arg::Int(value))
-    }
-
-    /// Whether this is a `Const` node.
+    /// Whether this node is a literal constant.
     #[must_use]
     pub fn is_const(&self) -> bool {
         self.op() == Op::Const
     }
 
-    /// Whether this is a `Const` node with a specific float value.
+    /// Whether this node is a float constant with the given value.
     #[must_use]
     pub fn is_const_float(&self, val: f64) -> bool {
         self.op() == Op::Const && *self.arg() == Arg::Float(val)
     }
 
-    /// Whether this is a `Const` node with a specific int value.
+    /// Whether this node is an int constant with the given value.
     #[must_use]
     pub fn is_const_int(&self, val: i64) -> bool {
         self.op() == Op::Const && *self.arg() == Arg::Int(val)
     }
 
-    /// Whether this is a zero constant (float 0.0 or int 0).
+    /// Whether this constant is zero.
     #[must_use]
     pub fn is_zero(&self) -> bool {
         self.is_const_float(0.0) || self.is_const_int(0)
     }
 
-    /// Whether this is a one constant (float 1.0 or int 1).
+    /// Whether this constant is one.
     #[must_use]
     pub fn is_one(&self) -> bool {
         self.is_const_float(1.0) || self.is_const_int(1)
     }
 
-    // ── Arithmetic builders ──────────────────────────────────────────────
-    // These create ALU UOps, inferring dtype from the first operand.
-    // Named after the ops they wrap (not std traits — these build lazy graph nodes).
-
-    /// `a + b`
     #[must_use]
-    #[allow(clippy::should_implement_trait)]
-    pub fn add(a: Self, b: Self) -> Self {
-        let dt = a.dtype();
-        Self::new(Op::Add, dt, vec![a, b], Arg::None)
+    pub(crate) fn reshape(src: Self, shape: Shape) -> Self {
+        let dtype = src.dtype();
+        Self::new(Op::Reshape, dtype, vec![src], Arg::Shape(shape))
     }
 
-    /// `a * b`
     #[must_use]
-    #[allow(clippy::should_implement_trait)]
-    pub fn mul(a: Self, b: Self) -> Self {
-        let dt = a.dtype();
-        Self::new(Op::Mul, dt, vec![a, b], Arg::None)
+    pub(crate) fn shrink(src: Self, bounds: &[(usize, usize)]) -> Self {
+        let dtype = src.dtype();
+        Self::new(
+            Op::Shrink,
+            dtype,
+            vec![src],
+            Arg::Bounds(bounds.to_vec().into_boxed_slice()),
+        )
     }
 
-    /// `-a`
     #[must_use]
-    #[allow(clippy::should_implement_trait)]
-    pub fn neg(a: Self) -> Self {
-        let dt = a.dtype();
-        Self::new(Op::Neg, dt, vec![a], Arg::None)
+    pub(crate) fn permute(src: Self, axes: &[usize]) -> Self {
+        let dtype = src.dtype();
+        Self::new(
+            Op::Permute,
+            dtype,
+            vec![src],
+            Arg::Axes(axes.to_vec().into_boxed_slice()),
+        )
     }
 
-    /// `1/a`
     #[must_use]
-    pub fn reciprocal(a: Self) -> Self {
-        let dt = a.dtype();
-        Self::new(Op::Reciprocal, dt, vec![a], Arg::None)
+    pub(crate) fn expand(src: Self, shape: Shape) -> Self {
+        let dtype = src.dtype();
+        Self::new(Op::Expand, dtype, vec![src], Arg::Shape(shape))
     }
 
-    /// `a < b` (returns Bool)
     #[must_use]
-    pub fn cmplt(a: Self, b: Self) -> Self {
+    pub(crate) fn reduce_axis(src: Self, reduce_op: Op, axes: &[usize]) -> Self {
+        let dtype = src.dtype();
+        Self::new(
+            Op::ReduceAxis,
+            dtype,
+            vec![src],
+            Arg::Reduce(reduce_op, axes.to_vec().into_boxed_slice()),
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn add(a: Self, b: Self) -> Self {
+        let dtype = a.dtype();
+        Self::new(Op::Add, dtype, vec![a, b], Arg::None)
+    }
+
+    #[must_use]
+    pub(crate) fn mul(a: Self, b: Self) -> Self {
+        let dtype = a.dtype();
+        Self::new(Op::Mul, dtype, vec![a, b], Arg::None)
+    }
+
+    #[must_use]
+    pub(crate) fn neg(a: Self) -> Self {
+        let dtype = a.dtype();
+        Self::new(Op::Neg, dtype, vec![a], Arg::None)
+    }
+
+    #[must_use]
+    pub(crate) fn reciprocal(a: Self) -> Self {
+        let dtype = a.dtype();
+        Self::new(Op::Reciprocal, dtype, vec![a], Arg::None)
+    }
+
+    #[must_use]
+    pub(crate) fn cmplt(a: Self, b: Self) -> Self {
         Self::new(Op::CmpLt, DType::Bool, vec![a, b], Arg::None)
     }
 
-    /// `if cond then t else f`
     #[must_use]
-    pub fn where_(cond: Self, t: Self, f: Self) -> Self {
-        let dt = t.dtype();
-        Self::new(Op::Where, dt, vec![cond, t, f], Arg::None)
+    pub(crate) fn where_(cond: Self, t: Self, f: Self) -> Self {
+        let dtype = t.dtype();
+        Self::new(Op::Where, dtype, vec![cond, t, f], Arg::None)
     }
 
-    /// Loop range with `axis` id and upper `bound`.
     #[must_use]
-    pub fn range(axis: usize, bound: Self) -> Self {
-        Self::new(Op::Range, DType::I32, vec![bound], Arg::Index(axis))
+    pub(crate) fn sink(stores: Vec<Self>) -> Self {
+        let device = Self::device_from_srcs(&stores);
+        Self::build(device, Op::Sink, DType::Void, stores, Arg::None)
     }
 
-    /// Close a loop.
-    #[must_use]
-    pub fn end(range: Self) -> Self {
-        Self::new(Op::End, DType::Void, vec![range], Arg::None)
-    }
-
-    /// Build an Index node. At the tensor level: multi-dim indexing.
-    /// At the kernel level: flat pointer arithmetic.
-    #[must_use]
-    pub fn index(src: Self, offset: Self) -> Self {
-        let dtype = src.dtype();
-        Self::new(Op::Index, dtype, vec![src, offset], Arg::None)
-    }
-
-    /// Load from an address.
-    #[must_use]
-    pub fn load(index: Self, dtype: DType) -> Self {
-        Self::new(Op::Load, dtype, vec![index], Arg::None)
-    }
-
-    /// Store a value to an address.
-    #[must_use]
-    pub fn store(index: Self, value: Self) -> Self {
-        Self::new(Op::Store, DType::Void, vec![index, value], Arg::None)
-    }
-
-    /// Kernel root.
-    #[must_use]
-    pub fn sink(stores: Vec<Self>) -> Self {
-        Self::new(Op::Sink, DType::Void, stores, Arg::None)
-    }
-
-    // ── Structural key ────────────────────────────────────────────────────
-
-    /// Compute a structural hash of the `UOp` tree.
-    ///
-    /// Two `UOp` trees that are structurally identical (same ops, dtypes, args,
-    /// and topology) produce the same key, even if they are different `Rc`
-    /// allocations. Used for kernel caching — same key means same compiled
-    /// program.
-    #[must_use]
-    pub fn structural_key(&self) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let order = self.toposort();
-        let mut node_keys: HashMap<UOp, u64> = HashMap::new();
-        for node in &order {
-            let mut hasher = DefaultHasher::new();
-            node.op().hash(&mut hasher);
-            node.dtype().hash(&mut hasher);
-            node.arg().hash(&mut hasher);
-            for src in node.srcs() {
-                hasher.write_u64(node_keys[src]);
-            }
-            node_keys.insert(node.clone(), hasher.finish());
-        }
-        node_keys[self]
-    }
-
-    // ── Toposort ────────────────────────────────────────────────────────
-
-    /// Iterative post-order DFS. Returns nodes in dependency order
-    /// (sources before consumers).
+    /// Iterative post-order DFS. Returns nodes in dependency order.
     #[must_use]
     pub fn toposort(&self) -> Vec<UOp> {
         let mut result = Vec::new();
@@ -522,8 +584,13 @@ impl UOp {
     #[must_use]
     pub fn dump(&self) -> String {
         use std::fmt::Write;
+
         let order = self.toposort();
-        let id_map: HashMap<&UOp, usize> = order.iter().enumerate().map(|(i, n)| (n, i)).collect();
+        let id_map: HashMap<&UOp, usize> = order
+            .iter()
+            .enumerate()
+            .map(|(i, node)| (node, i))
+            .collect();
 
         let mut out = String::new();
         for node in &order {
@@ -531,7 +598,7 @@ impl UOp {
             let srcs: Vec<String> = node
                 .srcs()
                 .iter()
-                .map(|s| format!("%{}", id_map[&s]))
+                .map(|src| format!("%{}", id_map[&src]))
                 .collect();
             let src_str = if srcs.is_empty() {
                 String::new()
@@ -540,7 +607,7 @@ impl UOp {
             };
             let arg_str = match node.arg() {
                 Arg::None => String::new(),
-                a => format!("  arg={a}"),
+                arg => format!("  arg={arg}"),
             };
             let _ = writeln!(
                 out,
@@ -576,68 +643,63 @@ impl fmt::Debug for UOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::DeviceId;
+    use crate::runtime;
 
     #[test]
     fn test_build_elementwise_add_kernel() {
-        // Arrange/Act — build: out[i] = a[i] + b[i]
-        let out_ptr = UOp::param(0, DType::F32, 1024);
-        let a_ptr = UOp::param(1, DType::F32, 1024);
-        let b_ptr = UOp::param(2, DType::F32, 1024);
-        let n = UOp::const_int(1024, DType::I32);
-        let idx = UOp::range(0, n);
-        let a_val = UOp::load(UOp::index(a_ptr, idx.clone()), DType::F32);
-        let b_val = UOp::load(UOp::index(b_ptr, idx.clone()), DType::F32);
-        let sum = UOp::new(Op::Add, DType::F32, vec![a_val, b_val], Arg::None);
-        let store = UOp::store(UOp::index(out_ptr, idx.clone()), sum);
-        let end = UOp::end(idx);
+        let device = DeviceId::Cpu;
+        let out_ptr = UOp::param(0, DType::F32, 1024, device);
+        let a_ptr = UOp::param(1, DType::F32, 1024, device);
+        let b_ptr = UOp::param(2, DType::F32, 1024, device);
+        let n = UOp::const_int(1024, DType::I32, device);
+        let idx = UOp::new(Op::Range, DType::I32, vec![n], Arg::Index(0));
+        let a_idx = UOp::new(Op::Index, a_ptr.dtype(), vec![a_ptr, idx.clone()], Arg::None);
+        let a_val = UOp::new(Op::Load, DType::F32, vec![a_idx], Arg::None);
+        let b_idx = UOp::new(Op::Index, b_ptr.dtype(), vec![b_ptr, idx.clone()], Arg::None);
+        let b_val = UOp::new(Op::Load, DType::F32, vec![b_idx], Arg::None);
+        let sum = UOp::add(a_val, b_val);
+        let out_idx = UOp::new(Op::Index, out_ptr.dtype(), vec![out_ptr, idx.clone()], Arg::None);
+        let store = UOp::new(Op::Store, DType::Void, vec![out_idx, sum], Arg::None);
+        let end = UOp::new(Op::End, DType::Void, vec![idx, store.clone()], Arg::None);
         let sink = UOp::sink(vec![store, end]);
 
-        // Assert
         assert_eq!(sink.op(), Op::Sink);
         assert_eq!(sink.srcs().len(), 2);
     }
 
     #[test]
     fn test_toposort_sources_before_consumers() {
-        // Arrange
-        let a = UOp::const_float(1.0, DType::F32);
-        let b = UOp::const_float(2.0, DType::F32);
-        let sum = UOp::new(Op::Add, DType::F32, vec![a.clone(), b.clone()], Arg::None);
+        let a = UOp::const_float(1.0, DType::F32, DeviceId::Cpu);
+        let b = UOp::const_float(2.0, DType::F32, DeviceId::Cpu);
+        let sum = UOp::add(a.clone(), b.clone());
 
-        // Act
         let order = sum.toposort();
 
-        // Assert — a and b appear before sum
-        let pos = |u: &UOp| order.iter().position(|n| n == u).unwrap();
+        let pos = |u: &UOp| order.iter().position(|node| node == u).unwrap();
         assert!(pos(&a) < pos(&sum));
         assert!(pos(&b) < pos(&sum));
     }
 
     #[test]
     fn test_shared_node_appears_once_in_toposort() {
-        // Arrange — a + a shares one node
-        let a = UOp::const_float(1.0, DType::F32);
-        let sum = UOp::new(Op::Add, DType::F32, vec![a.clone(), a.clone()], Arg::None);
+        let a = UOp::const_float(1.0, DType::F32, DeviceId::Cpu);
+        let sum = UOp::add(a.clone(), a.clone());
 
-        // Act
         let order = sum.toposort();
 
-        // Assert — a appears exactly once
-        let count = order.iter().filter(|n| *n == &a).count();
+        let count = order.iter().filter(|node| *node == &a).count();
         assert_eq!(count, 1);
     }
 
     #[test]
     fn test_dump_shows_toposorted_graph() {
-        // Arrange
-        let a = UOp::const_float(1.0, DType::F32);
-        let b = UOp::const_float(2.0, DType::F32);
-        let sum = UOp::new(Op::Add, DType::F32, vec![a, b], Arg::None);
+        let a = UOp::const_float(1.0, DType::F32, DeviceId::Cpu);
+        let b = UOp::const_float(2.0, DType::F32, DeviceId::Cpu);
+        let sum = UOp::add(a, b);
 
-        // Act
         let dump = sum.dump();
 
-        // Assert
         assert!(dump.contains("Const"));
         assert!(dump.contains("Add"));
         assert!(dump.contains("%0"));
@@ -645,13 +707,25 @@ mod tests {
 
     #[test]
     fn test_pointer_identity() {
-        // Arrange
-        let a = UOp::const_float(1.0, DType::F32);
-        let b = UOp::const_float(1.0, DType::F32);
+        let a = UOp::const_float(1.0, DType::F32, DeviceId::Cpu);
+        let b = UOp::const_float(1.0, DType::F32, DeviceId::Cpu);
         let a_clone = a.clone();
 
-        // Assert — clone shares identity, separate creation does not
         assert_eq!(a, a_clone);
-        assert_ne!(a, b);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_uop_new_interns_identical_nodes() {
+        let device = DeviceId::Cpu;
+        let id = runtime::state(device).store_buffer(crate::device::Buffer::from_f32(&[1.0, 2.0]));
+        let left = UOp::buffer(id, DType::F32, 2, device);
+        let right = UOp::buffer(id, DType::F32, 2, device);
+
+        assert_eq!(left, right);
+
+        let sum_a = UOp::add(left.clone(), left);
+        let sum_b = UOp::add(right.clone(), right);
+        assert_eq!(sum_a, sum_b);
     }
 }

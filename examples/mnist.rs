@@ -1,6 +1,6 @@
 //! Train an MLP on MNIST — the full integration test.
 //!
-//! Model: Linear(784, 128) → ReLU → Linear(128, 10)
+//! Model: Linear(784, 128) → `ReLU` → Linear(128, 10)
 //! Loss: cross-entropy via log-softmax
 //! Optimizer: SGD
 //!
@@ -9,10 +9,8 @@
 //! ```
 
 use std::io::Read;
-use std::rc::Rc;
 
-use ferrograd::device::Device;
-use ferrograd::tensor::{cpu, Tensor};
+use ferrograd::tensor::Tensor;
 
 // ── MNIST data loading ──────────────────────────────────────────────────
 
@@ -36,14 +34,14 @@ fn gunzip(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn load_images(file: &str, device: &Rc<dyn Device>) -> (Tensor, usize) {
+fn load_images(file: &str) -> (Tensor, usize) {
     let raw = gunzip(&download(&format!("{MNIST_BASE}{file}")));
     // IDX format: magic(4) + count(4) + rows(4) + cols(4) + pixels...
     let count = u32::from_be_bytes(raw[4..8].try_into().unwrap()) as usize;
     let pixels = &raw[16..];
     assert_eq!(pixels.len(), count * 784);
     let f32_data: Vec<f32> = pixels.iter().map(|&b| f32::from(b) / 255.0).collect();
-    (Tensor::from_slice(&f32_data, &[count, 784], device), count)
+    (Tensor::from_slice(&f32_data, &[count, 784]), count)
 }
 
 fn load_labels(file: &str) -> Vec<u8> {
@@ -52,18 +50,19 @@ fn load_labels(file: &str) -> Vec<u8> {
     raw[8..].to_vec()
 }
 
-fn one_hot(labels: &[u8], num_classes: usize, device: &Rc<dyn Device>) -> Tensor {
+fn one_hot(labels: &[u8], num_classes: usize) -> Tensor {
     let n = labels.len();
     let mut data = vec![0.0_f32; n * num_classes];
     for (i, &label) in labels.iter().enumerate() {
         data[i * num_classes + label as usize] = 1.0;
     }
-    Tensor::from_slice(&data, &[n, num_classes], device)
+    Tensor::from_slice(&data, &[n, num_classes])
 }
 
 // ── Model ───────────────────────────────────────────────────────────────
 
-fn rand_tensor(shape: &[usize], scale: f32, device: &Rc<dyn Device>) -> Tensor {
+#[allow(clippy::cast_precision_loss)]
+fn rand_tensor(shape: &[usize], scale: f32) -> Tensor {
     // Simple deterministic "random" init using a linear congruential generator.
     // Good enough for a demo — real training would use proper RNG.
     use std::cell::Cell;
@@ -84,7 +83,7 @@ fn rand_tensor(shape: &[usize], scale: f32, device: &Rc<dyn Device>) -> Tensor {
             })
         })
         .collect();
-    Tensor::from_slice(&data, shape, device)
+    Tensor::from_slice(&data, shape)
 }
 
 fn log_softmax(x: &Tensor) -> Tensor {
@@ -105,19 +104,18 @@ fn cross_entropy(logits: &Tensor, targets: &Tensor) -> Tensor {
     per_sample.neg().sum(&[0]).reshape(&[1]) // scalar
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn main() {
-    let dev = cpu();
     let lr = 0.01_f32;
     let batch_size = 64;
     let epochs = 5;
 
-    // ── Load data ───────────────────────────────────────────────────
     println!("Downloading MNIST...");
-    let (train_images, train_count) = load_images("train-images-idx3-ubyte.gz", &dev);
+    let (train_images, train_count) = load_images("train-images-idx3-ubyte.gz");
     let train_labels_raw = load_labels("train-labels-idx1-ubyte.gz");
-    let train_targets = one_hot(&train_labels_raw, 10, &dev);
+    let train_targets = one_hot(&train_labels_raw, 10);
 
-    let (test_images, _) = load_images("t10k-images-idx3-ubyte.gz", &dev);
+    let (test_images, _) = load_images("t10k-images-idx3-ubyte.gz");
     let test_labels_raw = load_labels("t10k-labels-idx1-ubyte.gz");
 
     println!(
@@ -125,16 +123,14 @@ fn main() {
         test_labels_raw.len()
     );
 
-    // ── Init model ──────────────────────────────────────────────────
-    // Kaiming init for relu: scale = sqrt(2/fan_in)
-    let mut w1 = rand_tensor(&[784, 128], (2.0 / 784.0_f32).sqrt(), &dev);
-    let mut b1 = Tensor::zeros(&[1, 128], ferrograd::dtype::DType::F32, &dev);
-    let mut w2 = rand_tensor(&[128, 10], (1.0 / 128.0_f32).sqrt(), &dev);
-    let mut b2 = Tensor::zeros(&[1, 10], ferrograd::dtype::DType::F32, &dev);
+    let mut w1 = rand_tensor(&[784, 128], (2.0 / 784.0_f32).sqrt()).with_requires_grad(true);
+    let mut b1 =
+        Tensor::zeros(&[1, 128], ferrograd::dtype::DType::F32).with_requires_grad(true);
+    let mut w2 = rand_tensor(&[128, 10], (1.0 / 128.0_f32).sqrt()).with_requires_grad(true);
+    let mut b2 = Tensor::zeros(&[1, 10], ferrograd::dtype::DType::F32).with_requires_grad(true);
 
-    // ── Training loop ───────────────────────────────────────────────
     let num_batches = train_count / batch_size;
-    let batch_scale = Tensor::scalar(1.0 / batch_size as f32, &dev);
+    let batch_scale = Tensor::scalar(1.0 / batch_size as f32);
 
     let max_batches = std::env::var("MAX_BATCHES")
         .ok()
@@ -146,31 +142,16 @@ fn main() {
 
         for batch_idx in 0..max_batches.min(num_batches) {
             let start = batch_idx * batch_size;
+            let batch_x = train_images.narrow(0, start, batch_size);
+            let batch_t = train_targets.narrow(0, start, batch_size);
 
-            // Slice batch — realize to get concrete buffers
-            let x_data = train_images.to_vec();
-            let batch_x = Tensor::from_slice(
-                &x_data[start * 784..(start + batch_size) * 784],
-                &[batch_size, 784],
-                &dev,
-            );
-            let t_data = train_targets.to_vec();
-            let batch_t = Tensor::from_slice(
-                &t_data[start * 10..(start + batch_size) * 10],
-                &[batch_size, 10],
-                &dev,
-            );
-
-            // Forward
             let hidden = batch_x.matmul(&w1).add(&b1).relu();
             let logits = hidden.matmul(&w2).add(&b2);
             let loss = cross_entropy(&logits, &batch_t).mul(&batch_scale);
 
-            // Backward
             let grads = loss.gradient(&[&w1, &b1, &w2, &b2]);
-            let lr_t = Tensor::scalar(lr, &dev);
+            let lr_t = Tensor::scalar(lr);
 
-            // SGD update — realize to execute
             w1 = w1.sub(&grads[0].mul(&lr_t)).realize();
             b1 = b1.sub(&grads[1].mul(&lr_t)).realize();
             w2 = w2.sub(&grads[2].mul(&lr_t)).realize();
@@ -185,7 +166,6 @@ fn main() {
         let batches_run = max_batches.min(num_batches);
         let avg_loss = epoch_loss / batches_run as f32;
 
-        // ── Eval ────────────────────────────────────────────────────
         let test_logits = test_images.matmul(&w1).add(&b1).relu().matmul(&w2).add(&b2);
         let test_preds = test_logits.to_vec();
         let mut correct = 0;

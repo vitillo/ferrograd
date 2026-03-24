@@ -1,25 +1,21 @@
 //! # Tensor API — lazy evaluation and kernel fusion
 //!
-//! Tensor ops build a lazy `UOp` graph. Calling `realize()` lowers it to a
-//! fused kernel, compiles, and executes on the tensor's device.
-//!
-//! ## Debug output
-//!
-//! Set `DEBUG` env var (same as tinygrad):
-//! - 1: kernel summary, 2: + timing, 3: + graph rewrite before/after, 4: + generated C
+//! Tensor ops build a lazy `UOp` graph. Calling [`Tensor::realize`] lowers it to
+//! one or more kernels, compiles them, and executes them on the tensor's
+//! device.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::codegen::{ClangRenderer, Renderer};
-use crate::device::{Buffer, CpuDevice, Device, Program};
+use crate::device::{Buffer, DeviceId};
 use crate::dtype::DType;
 use crate::gradient;
+use crate::runtime;
 use crate::schedule::{self, rangeify::rangeify};
+use crate::shape::Shape;
 use crate::uop::{Arg, Op, UOp};
 
 static DEBUG: LazyLock<u8> = LazyLock::new(|| {
@@ -31,107 +27,99 @@ static DEBUG: LazyLock<u8> = LazyLock::new(|| {
 
 static KERNEL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-// Kernel cache: structural hash of the Sink UOp → compiled Program.
-// Avoids recompiling identical kernels across training iterations.
-thread_local! {
-    static METHOD_CACHE: RefCell<HashMap<u64, Rc<Program>>> = RefCell::new(HashMap::new());
-}
-
-// ── Tensor ──────────────────────────────────────────────────────────────────
-
 /// A lazily-evaluated tensor bound to a specific device.
 #[derive(Clone)]
 pub struct Tensor {
     uop: UOp,
-    device: Rc<dyn Device>,
+    requires_grad: bool,
 }
 
 impl Tensor {
-    /// Create a tensor from a float slice on the given device.
+    /// Create a tensor from a float slice on the default CPU device.
     ///
     /// # Panics
     ///
-    /// Panics if data length doesn't match the product of shape.
+    /// Panics if `data.len()` does not match `shape`.
     #[must_use]
-    pub fn from_slice(data: &[f32], shape: &[usize], device: &Rc<dyn Device>) -> Self {
+    pub fn from_slice(data: &[f32], shape: &[usize]) -> Self {
+        let shape = Shape::from(shape);
         assert_eq!(
             data.len(),
-            shape.iter().product::<usize>(),
+            shape.numel(),
             "data length {} doesn't match shape {shape:?}",
             data.len()
         );
-        let buf_uop = UOp::new(
-            Op::Buffer,
-            DType::F32,
-            vec![],
-            Arg::Buffer(Rc::new(Buffer::from_f32(data))),
-        );
+        let state = runtime::state(DeviceId::Cpu);
+        let buffer_id = state.store_buffer(Buffer::from_f32(data));
+        let buffer = UOp::buffer(buffer_id, DType::F32, shape.numel(), DeviceId::Cpu);
         Self {
-            uop: UOp::new(
-                Op::Reshape,
-                DType::F32,
-                vec![buf_uop],
-                Arg::Dims(shape.to_vec()),
-            ),
-            device: device.clone(),
+            uop: UOp::reshape(buffer, shape),
+            requires_grad: false,
         }
     }
 
-    /// Create a tensor filled with zeros on the given device.
+    /// Create a tensor filled with zeros on the default CPU device.
     #[must_use]
-    pub fn zeros(shape: &[usize], dtype: DType, device: &Rc<dyn Device>) -> Self {
-        let numel = shape.iter().product();
-        let buf = device.allocate(dtype, numel);
-        let buf_uop = UOp::new(Op::Buffer, dtype, vec![], Arg::Buffer(Rc::new(buf)));
+    pub fn zeros(shape: &[usize], dtype: DType) -> Self {
+        let shape = Shape::from(shape);
+        let state = runtime::state(DeviceId::Cpu);
+        let buffer_id = state.store_buffer(state.device().allocate(dtype, shape.numel()));
+        let buffer = UOp::buffer(buffer_id, dtype, shape.numel(), DeviceId::Cpu);
         Self {
-            uop: UOp::new(Op::Reshape, dtype, vec![buf_uop], Arg::Dims(shape.to_vec())),
-            device: device.clone(),
+            uop: UOp::reshape(buffer, shape),
+            requires_grad: false,
         }
     }
 
-    /// Create a tensor filled with ones on the given device.
+    /// Create a tensor filled with ones on the default CPU device.
     #[must_use]
-    pub fn ones(shape: &[usize], device: &Rc<dyn Device>) -> Self {
+    pub fn ones(shape: &[usize]) -> Self {
         let numel = shape.iter().product();
-        Self::from_slice(&vec![1.0_f32; numel], shape, device)
+        Self::from_slice(&vec![1.0_f32; numel], shape)
     }
 
-    /// Create a scalar tensor (shape `[1]`).
+    /// Create a scalar tensor of shape `[1]` on the default CPU device.
     #[must_use]
-    pub fn scalar(value: f32, device: &Rc<dyn Device>) -> Self {
-        Self::from_slice(&[value], &[1], device)
+    pub fn scalar(value: f32) -> Self {
+        Self::from_slice(&[value], &[1])
     }
 
-    /// The tensor's element type.
+    /// Return the owning device.
+    #[must_use]
+    pub fn device(&self) -> DeviceId {
+        self.uop.device()
+    }
+
+    /// Return the tensor dtype.
     #[must_use]
     pub fn dtype(&self) -> DType {
         self.uop.dtype()
     }
 
-    /// Number of elements (product of shape).
-    #[must_use]
-    pub fn numel(&self) -> usize {
-        self.shape().iter().product()
-    }
-
-    /// Shape derived from the `UOp` graph.
+    /// Return the tensor shape.
     ///
     /// # Panics
     ///
-    /// Panics if the `UOp` graph doesn't have shape info.
+    /// Panics if the underlying graph node does not carry tensor shape
+    /// information.
     #[must_use]
-    pub fn shape(&self) -> Vec<usize> {
+    pub fn shape(&self) -> Shape {
         self.uop.shape().expect("tensor must have shape")
     }
 
-    /// Number of dimensions.
+    /// Return the flat element count.
     #[must_use]
-    pub fn ndim(&self) -> usize {
-        self.shape().len()
+    pub fn numel(&self) -> usize {
+        self.shape().numel()
     }
 
-    /// Whether this tensor's data has been computed. `false` means it's
-    /// still a lazy graph that needs `realize()` to execute.
+    /// Return the rank.
+    #[must_use]
+    pub fn ndim(&self) -> usize {
+        self.shape().ndim()
+    }
+
+    /// Whether this tensor already points at a realized buffer.
     #[must_use]
     pub fn is_realized(&self) -> bool {
         match self.uop.op() {
@@ -141,29 +129,40 @@ impl Tensor {
         }
     }
 
-    /// Extract the Buffer from a realized tensor (handles Reshape wrapper).
-    fn realized_buffer(&self) -> &Rc<Buffer> {
-        let buf_uop = match self.uop.op() {
-            Op::Buffer => &self.uop,
-            Op::Reshape => &self.uop.srcs()[0],
-            _ => panic!("not a realized tensor"),
-        };
-        match buf_uop.arg() {
-            Arg::Buffer(rc) => rc,
-            _ => panic!("realized tensor must have Arg::Buffer"),
-        }
+    /// Whether this tensor should participate in gradient computation.
+    #[must_use]
+    pub fn requires_grad(&self) -> bool {
+        self.requires_grad
     }
 
-    // ── Lazy ops ────────────────────────────────────────────────────────
+    /// Return a copy with the given `requires_grad` flag.
+    ///
+    /// This mirrors the idea from tinygrad and `PyTorch`, but keeps Rust's
+    /// value-oriented API instead of mutating in place.
+    #[must_use]
+    pub fn with_requires_grad(mut self, requires_grad: bool) -> Self {
+        self.requires_grad = requires_grad;
+        self
+    }
+
+    /// Return a copy that will no longer participate in gradient computation.
+    #[must_use]
+    pub fn detach(self) -> Self {
+        self.with_requires_grad(false)
+    }
 
     fn unary(&self, op: Op) -> Self {
         Self {
-            uop: UOp::new(op, self.uop.dtype(), vec![self.uop.clone()], Arg::None),
-            device: self.device.clone(),
+            uop: UOp::new(op, self.dtype(), vec![self.uop.clone()], Arg::None),
+            requires_grad: self.requires_grad,
         }
     }
 
     fn binary(&self, other: &Self, op: Op, out_dtype: DType) -> Self {
+        assert!(
+            self.device() == other.device(),
+            "binary ops require tensors on the same device"
+        );
         assert_eq!(self.shape(), other.shape(), "shape mismatch for {op:?}");
         Self {
             uop: UOp::new(
@@ -172,17 +171,16 @@ impl Tensor {
                 vec![self.uop.clone(), other.uop.clone()],
                 Arg::None,
             ),
-            device: self.device.clone(),
+            requires_grad: self.requires_grad || other.requires_grad,
         }
     }
 
-    /// Broadcast two tensors to a common shape, then apply a binary op.
     fn broadcasted(&self, other: &Self, op: Op, out_dtype: DType) -> Self {
         if self.shape() == other.shape() {
             return self.binary(other, op, out_dtype);
         }
-        let (a, b) = broadcast_shapes(self, other);
-        a.binary(&b, op, out_dtype)
+        let (left, right) = broadcast_shapes(self, other);
+        left.binary(&right, op, out_dtype)
     }
 
     /// Element-wise addition with broadcasting.
@@ -203,10 +201,40 @@ impl Tensor {
         self.unary(Op::Neg)
     }
 
-    /// Relu: `where(0 < self, self, 0)`.
+    /// Element-wise subtraction with broadcasting.
+    #[must_use]
+    pub fn sub(&self, other: &Self) -> Self {
+        self.add(&other.neg())
+    }
+
+    /// Element-wise reciprocal.
+    #[must_use]
+    pub fn reciprocal(&self) -> Self {
+        self.unary(Op::Reciprocal)
+    }
+
+    /// Element-wise base-2 exponential.
+    #[must_use]
+    pub fn exp2(&self) -> Self {
+        self.unary(Op::Exp2)
+    }
+
+    /// Element-wise base-2 logarithm.
+    #[must_use]
+    pub fn log2(&self) -> Self {
+        self.unary(Op::Log2)
+    }
+
+    /// Element-wise square root.
+    #[must_use]
+    pub fn sqrt(&self) -> Self {
+        self.unary(Op::Sqrt)
+    }
+
+    /// `max(0, x)` implemented with `Where`.
     #[must_use]
     pub fn relu(&self) -> Self {
-        let zero = Self::zeros(&self.shape(), self.dtype(), &self.device);
+        let zero = Self::zeros(self.shape().as_slice(), self.dtype());
         let cond = zero.binary(self, Op::CmpLt, DType::Bool);
         Self {
             uop: UOp::new(
@@ -215,62 +243,75 @@ impl Tensor {
                 vec![cond.uop, self.uop.clone(), zero.uop],
                 Arg::None,
             ),
-            device: self.device.clone(),
+            requires_grad: self.requires_grad,
         }
     }
 
-    /// Element-wise subtraction with broadcasting.
-    #[must_use]
-    pub fn sub(&self, other: &Self) -> Self {
-        self.add(&other.neg())
-    }
-
-    /// Element-wise `1/x`.
-    #[must_use]
-    pub fn reciprocal(&self) -> Self {
-        self.unary(Op::Reciprocal)
-    }
-
-    /// Element-wise `2^x`.
-    #[must_use]
-    pub fn exp2(&self) -> Self {
-        self.unary(Op::Exp2)
-    }
-
-    /// Element-wise `log₂(x)`.
-    #[must_use]
-    pub fn log2(&self) -> Self {
-        self.unary(Op::Log2)
-    }
-
-    /// Element-wise `√x`.
-    #[must_use]
-    pub fn sqrt(&self) -> Self {
-        self.unary(Op::Sqrt)
-    }
-
-    // ── Movement ops ───────────────────────────────────────────────────
-
-    /// Change the shape without moving data.
+    /// Reshape without moving data.
     ///
     /// # Panics
     ///
-    /// Panics if the product of new shape differs from the current numel.
+    /// Panics if `new_shape` changes the total element count.
     #[must_use]
     pub fn reshape(&self, new_shape: &[usize]) -> Self {
-        let new_numel: usize = new_shape.iter().product();
-        assert_eq!(self.numel(), new_numel, "reshape: numel mismatch");
+        let new_shape = Shape::from(new_shape);
         if self.shape() == new_shape {
             return self.clone();
         }
+        assert_eq!(
+            self.numel(),
+            new_shape.numel(),
+            "reshape: numel mismatch for {:?} -> {:?}",
+            self.shape(),
+            new_shape
+        );
         Self {
-            uop: UOp::new(
-                Op::Reshape,
-                self.dtype(),
-                vec![self.uop.clone()],
-                Arg::Dims(new_shape.to_vec()),
-            ),
-            device: self.device.clone(),
+            uop: UOp::reshape(self.uop.clone(), new_shape),
+            requires_grad: self.requires_grad,
+        }
+    }
+
+    /// Slice a single dimension without copying.
+    ///
+    /// This is the smallest useful subset of tinygrad's `SHRINK` movement op:
+    /// keep all dimensions unchanged except `dim`, which becomes
+    /// `[start, start + len)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dim` is out of range or if `start..start + len` is not a
+    /// valid half-open interval for that dimension.
+    #[must_use]
+    pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Self {
+        let shape = self.shape();
+        assert!(dim < shape.ndim(), "narrow: dim {dim} out of range");
+        let end = start
+            .checked_add(len)
+            .expect("narrow: start + len overflowed usize");
+        assert!(
+            end <= shape[dim],
+            "narrow: range [{start}, {end}) out of bounds for axis {dim} with size {}",
+            shape[dim]
+        );
+        if start == 0 && len == shape[dim] {
+            return self.clone();
+        }
+
+        let bounds: Vec<(usize, usize)> = shape
+            .iter()
+            .enumerate()
+            .map(|(axis, &size)| {
+                if axis == dim {
+                    (start, end)
+                } else {
+                    (0, size)
+                }
+            })
+            .collect();
+
+        Self {
+            uop: UOp::shrink(self.uop.clone(), &bounds),
+            requires_grad: self.requires_grad,
         }
     }
 
@@ -278,214 +319,190 @@ impl Tensor {
     ///
     /// # Panics
     ///
-    /// Panics if `order` isn't a valid permutation.
+    /// Panics if `order` is not a permutation of `0..self.ndim()`.
     #[must_use]
     pub fn permute(&self, order: &[usize]) -> Self {
-        let shape = self.shape();
-        assert_eq!(order.len(), shape.len(), "permute: wrong number of axes");
-        let mut seen = vec![false; shape.len()];
-        for &ax in order {
-            assert!(ax < shape.len(), "permute: axis {ax} out of range");
-            assert!(!seen[ax], "permute: duplicate axis {ax}");
-            seen[ax] = true;
+        let ndim = self.ndim();
+        assert_eq!(order.len(), ndim, "permute: wrong number of axes");
+        let mut seen = vec![false; ndim];
+        for &axis in order {
+            assert!(axis < ndim, "permute: axis {axis} out of range");
+            assert!(!seen[axis], "permute: axis {axis} duplicated");
+            seen[axis] = true;
         }
         Self {
-            uop: UOp::new(
-                Op::Permute,
-                self.dtype(),
-                vec![self.uop.clone()],
-                Arg::Dims(order.to_vec()),
-            ),
-            device: self.device.clone(),
+            uop: UOp::permute(self.uop.clone(), order),
+            requires_grad: self.requires_grad,
         }
     }
 
-    /// Broadcast dimensions of size 1 to a larger size.
+    /// Broadcast size-1 dimensions.
     ///
     /// # Panics
     ///
-    /// Panics if any non-1 dimension doesn't match.
+    /// Panics if `new_shape` is not a valid broadcast target.
     #[must_use]
     pub fn expand(&self, new_shape: &[usize]) -> Self {
-        let shape = self.shape();
-        assert_eq!(new_shape.len(), shape.len(), "expand: ndim mismatch");
-        for (i, (&old, &new)) in shape.iter().zip(new_shape).enumerate() {
-            assert!(
-                old == new || old == 1,
-                "expand: dim {i} is {old}, can only expand from 1"
-            );
-        }
-        if shape == new_shape {
+        let new_shape = Shape::from(new_shape);
+        if self.shape() == new_shape {
             return self.clone();
         }
+        let src_shape = self.shape();
+        assert_eq!(
+            src_shape.ndim(),
+            new_shape.ndim(),
+            "expand: rank mismatch for {src_shape:?} -> {new_shape:?}"
+        );
+        assert!(
+            src_shape
+                .iter()
+                .zip(new_shape.iter())
+                .all(|(&src_dim, &dst_dim)| src_dim == dst_dim || src_dim == 1),
+            "expand: incompatible source shape {src_shape:?} -> {new_shape:?}"
+        );
         Self {
-            uop: UOp::new(
-                Op::Expand,
-                self.dtype(),
-                vec![self.uop.clone()],
-                Arg::Dims(new_shape.to_vec()),
-            ),
-            device: self.device.clone(),
+            uop: UOp::expand(self.uop.clone(), new_shape),
+            requires_grad: self.requires_grad,
         }
     }
 
-    // ── Reduction ─────────────────────────────────────────────────────
-
-    /// Sum over the given axes. Reduced dims become size 1.
+    /// Sum over the given axes.
     ///
     /// # Panics
     ///
     /// Panics if any axis is out of range.
     #[must_use]
     pub fn sum(&self, axes: &[usize]) -> Self {
-        for &ax in axes {
-            assert!(ax < self.ndim(), "sum: axis {ax} out of range");
-        }
+        let ndim = self.ndim();
+        assert!(
+            axes.iter().all(|&axis| axis < ndim),
+            "sum: axes {axes:?} out of range for ndim {ndim}"
+        );
         Self {
-            uop: UOp::new(
-                Op::ReduceAxis,
-                self.dtype(),
-                vec![self.uop.clone()],
-                Arg::Reduce(Op::Add, axes.to_vec()),
-            ),
-            device: self.device.clone(),
+            uop: UOp::reduce_axis(self.uop.clone(), Op::Add, axes),
+            requires_grad: self.requires_grad,
         }
     }
 
-    /// Max over the given axes. Reduced dims become size 1.
+    /// Max over the given axes.
     ///
     /// # Panics
     ///
     /// Panics if any axis is out of range.
     #[must_use]
     pub fn max(&self, axes: &[usize]) -> Self {
-        for &ax in axes {
-            assert!(ax < self.ndim(), "max: axis {ax} out of range");
-        }
+        let ndim = self.ndim();
+        assert!(
+            axes.iter().all(|&axis| axis < ndim),
+            "max: axes {axes:?} out of range for ndim {ndim}"
+        );
         Self {
-            uop: UOp::new(
-                Op::ReduceAxis,
-                self.dtype(),
-                vec![self.uop.clone()],
-                Arg::Reduce(Op::Max, axes.to_vec()),
-            ),
-            device: self.device.clone(),
+            uop: UOp::reduce_axis(self.uop.clone(), Op::Max, axes),
+            requires_grad: self.requires_grad,
         }
     }
 
-    /// Natural exponential: `e^x`. Composed as `2^(x · log₂(e))`.
+    /// Natural exponential implemented as `2^(x * log2(e))`.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn exp(&self) -> Self {
-        let log2e = Tensor::from_slice(&[std::f64::consts::LOG2_E as f32], &[1], &self.device);
+        let log2e = Self::scalar(std::f64::consts::LOG2_E as f32);
         self.mul(&log2e).exp2()
     }
 
-    /// Natural logarithm: `ln(x)`. Composed as `log₂(x) · ln(2)`.
+    /// Natural logarithm implemented as `log2(x) * ln(2)`.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn log(&self) -> Self {
-        let ln2 = Tensor::from_slice(&[std::f64::consts::LN_2 as f32], &[1], &self.device);
+        let ln2 = Self::scalar(std::f64::consts::LN_2 as f32);
         self.log2().mul(&ln2)
     }
 
-    // ── Matmul ────────────────────────────────────────────────────────
-
-    /// Matrix multiply: `[M,K] @ [K,N] → [M,N]`.
-    #[allow(clippy::many_single_char_names)]
+    /// Matrix multiply `[M,K] @ [K,N] -> [M,N]`.
     ///
     /// # Panics
     ///
-    /// Panics if inner dimensions don't match or tensors aren't 2D.
+    /// Panics if either tensor is not rank-2, if the inner dimensions do not
+    /// match, or if the tensors belong to different devices.
     #[must_use]
+    #[allow(clippy::many_single_char_names)]
     pub fn matmul(&self, other: &Self) -> Self {
         assert_eq!(self.ndim(), 2, "matmul: lhs must be 2D");
         assert_eq!(other.ndim(), 2, "matmul: rhs must be 2D");
-        let shape = self.shape();
-        let (m, k) = (shape[0], shape[1]);
-        let other_shape = other.shape();
-        let (k2, n) = (other_shape[0], other_shape[1]);
+        let lhs_shape = self.shape();
+        let rhs_shape = other.shape();
+        let (m, k) = (lhs_shape[0], lhs_shape[1]);
+        let (k2, n) = (rhs_shape[0], rhs_shape[1]);
         assert_eq!(k, k2, "matmul: inner dim mismatch ({k} vs {k2})");
 
-        // a[M,K] → [M,1,K] → [M,N,K]
         let a = self.reshape(&[m, 1, k]).expand(&[m, n, k]);
-        // b[K,N] → [N,K] → [1,N,K] → [M,N,K]
         let b = other
             .permute(&[1, 0])
             .reshape(&[1, n, k])
             .expand(&[m, n, k]);
-        // element-wise multiply then sum over K axis
         a.mul(&b).sum(&[2]).reshape(&[m, n])
     }
 
-    // ── Realize ─────────────────────────────────────────────────────────
-
-    /// Lower the lazy graph to fused kernels, compile, and execute.
-    ///
-    /// Calls [`schedule::schedule`] to split the graph into kernels, then
-    /// compiles and executes each one sequentially. Intermediate buffers
-    /// are allocated by the scheduler and shared across kernels via `Rc`.
+    /// Lower the lazy graph to kernels, compile, and execute them.
     ///
     /// # Panics
     ///
-    /// Panics if compilation or execution fails.
+    /// Panics if scheduling produces no work or if compilation/execution fails.
     #[must_use]
     pub fn realize(&self) -> Self {
         if self.is_realized() {
             return self.clone();
         }
 
-        let items = schedule::schedule(&self.uop, &*self.device);
+        let items = schedule::schedule(&self.uop);
         for item in &items {
             self.execute_item(item);
         }
 
         let last = items.last().expect("schedule produced no items");
-        let buf_uop = UOp::new(Op::Buffer, self.dtype(), vec![], Arg::Buffer(last.out_buf.clone()));
+        let buffer = UOp::buffer(last.output_id, self.dtype(), last.out_shape.numel(), self.device());
         Self {
-            uop: UOp::new(Op::Reshape, self.dtype(), vec![buf_uop], Arg::Dims(last.out_shape.clone())),
-            device: self.device.clone(),
+            uop: UOp::reshape(buffer, last.out_shape.clone()),
+            requires_grad: self.requires_grad,
         }
     }
 
-    /// Compile and execute a single [`schedule::ScheduleItem`].
     fn execute_item(&self, item: &schedule::ScheduleItem) {
+        let state = runtime::state(self.device());
         let debug = *DEBUG;
-        let dev = &*self.device;
-        let num_bufs = item.input_bufs.len() + 1;
+        let lowered = rangeify(&item.sink);
+        let lowered = crate::rewrite::graph_rewrite(
+            &lowered,
+            &crate::rewrite::symbolic_simple,
+            "symbolic",
+        );
+        assert_codegen_ready(&lowered);
 
-        // Cache lookup by structural hash of the kernel AST.
-        let key = item.sink.structural_key();
-        let program = METHOD_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            if let Some(prog) = cache.get(&key) {
-                if debug >= 1 {
-                    let kid = KERNEL_COUNT.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("*** CPU {kid:>4}  (cached)         arg {num_bufs:>2}");
-                }
-                return prog.clone();
+        let num_bufs = item.input_ids.len() + 1;
+        let program = if let Some(program) = state.cached_program(&lowered) {
+            if debug >= 1 {
+                let kid = KERNEL_COUNT.fetch_add(1, Ordering::Relaxed);
+                eprintln!("*** CPU {kid:>4}  (cached)         arg {num_bufs:>2}");
             }
-
-            // Cache miss: rangeify → simplify → codegen → compile.
-            let sink = rangeify(&item.sink);
-            let sink = crate::rewrite::graph_rewrite(
-                &sink,
-                &crate::rewrite::symbolic_simple,
-                "symbolic",
-            );
-
+            program
+        } else {
             let kid = KERNEL_COUNT.fetch_add(1, Ordering::Relaxed);
             let name = format!("kernel_{kid}");
-            let code = ClangRenderer.render(&sink, &name);
+            let code = ClangRenderer.render(&lowered, &name);
 
             if debug >= 4 {
                 eprintln!("{code}");
             }
             if debug >= 3 {
-                eprintln!("{}", sink.dump());
+                eprintln!("{}", lowered.dump());
             }
 
-            let prog = Rc::new(dev.compile(&code, &name, num_bufs).expect("compile failed"));
+            let program = Rc::new(
+                state
+                    .device()
+                    .compile(&code, &name, num_bufs)
+                    .expect("compile failed"),
+            );
 
             if debug >= 2 {
                 eprintln!("*** CPU {kid:>4}  {name:<16} arg {num_bufs:>2}  (compiled)");
@@ -493,24 +510,26 @@ impl Tensor {
                 eprintln!("*** CPU {kid:>4}  {name:<16} arg {num_bufs:>2}");
             }
 
-            cache.insert(key, prog.clone());
-            prog
-        });
+            state.insert_program(lowered.clone(), program.clone());
+            program
+        };
 
-        // Execute.
-        let numel: usize = item.out_shape.iter().product();
-        let mut out = dev.allocate(item.out_dtype, numel);
-
-        let mut input_copies: Vec<Buffer> =
-            item.input_bufs.iter().map(|rc| (**rc).clone()).collect();
+        let mut out = state.device().allocate(item.out_dtype, item.out_shape.numel());
+        let mut input_copies: Vec<Buffer> = item
+            .input_ids
+            .iter()
+            .map(|&id| state.load_buffer(id).expect("scheduled input buffer missing"))
+            .collect();
         let mut buf_refs: Vec<&mut Buffer> = Vec::with_capacity(num_bufs);
         buf_refs.push(&mut out);
-        for buf in &mut input_copies {
-            buf_refs.push(buf);
+        for buffer in &mut input_copies {
+            buf_refs.push(buffer);
         }
 
         let t0 = Instant::now();
-        dev.execute(&program, &mut buf_refs)
+        state
+            .device()
+            .execute(&program, &mut buf_refs)
             .expect("execution failed");
 
         if debug >= 2 {
@@ -520,117 +539,140 @@ impl Tensor {
                 elapsed.as_secs_f64() * 1000.0,
             );
         }
-
-        // Copy output into shared out_buf so downstream kernels see it.
-        // SAFETY: Sequential execution — no concurrent readers yet.
-        let out_ptr = Rc::as_ptr(&item.out_buf).cast_mut();
-        unsafe { *out_ptr = out };
+        state
+            .write_buffer(item.output_id, out)
+            .expect("failed to store kernel output");
     }
 
     /// Realize and extract data as `Vec<f32>`.
     ///
     /// # Panics
     ///
-    /// Panics if dtype is not `F32`.
+    /// Panics if realization fails or the device state no longer holds the
+    /// tensor's buffer.
     #[must_use]
     pub fn to_vec(&self) -> Vec<f32> {
         let realized = self.realize();
-        realized.realized_buffer().to_f32()
+        let buffer = match realized.uop.op() {
+            Op::Buffer => &realized.uop,
+            Op::Reshape => &realized.uop.srcs()[0],
+            _ => panic!("realized tensor must point at a buffer"),
+        };
+        let Arg::Buffer(id, _) = buffer.arg() else {
+            panic!("realized tensor must point at Arg::Buffer");
+        };
+        runtime::state(realized.device())
+            .load_buffer(*id)
+            .expect("realized buffer missing")
+            .to_f32()
     }
 
-    // ── Autograd ─────────────────────────────────────────────────────────
-
-    /// Compute gradients of `self` with respect to each target tensor.
+    /// Compute gradients with respect to `targets`.
     ///
-    /// Returns one gradient `Tensor` per target, in the same order.
-    /// Each gradient is a lazy tensor — call `realize()` or `to_vec()`
-    /// to execute the backward computation.
+    /// # Panics
     ///
-    /// `self` should be a scalar (e.g. a loss after `.sum()`). The initial
-    /// gradient is implicitly 1.0.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let loss = x.mul(&w).sum(&[0]);
-    /// let grads = loss.gradient(&[&w]);
-    /// let w_grad = grads[0].to_vec();
-    /// ```
+    /// Panics if any target belongs to a different device.
     #[must_use]
     pub fn gradient(&self, targets: &[&Self]) -> Vec<Self> {
-        let shape = self.shape();
-        let numel: usize = shape.iter().product();
-
-        // Initial gradient: ones with the same shape as self
-        let ones_data = vec![1.0_f32; numel];
-        let ones_buf = UOp::new(
-            Op::Buffer,
-            DType::F32,
-            vec![],
-            Arg::Buffer(Rc::new(Buffer::from_f32(&ones_data))),
+        assert!(
+            targets.iter().all(|target| self.device() == target.device()),
+            "gradient targets must share the same device"
         );
-        let root_grad = UOp::new(Op::Reshape, DType::F32, vec![ones_buf], Arg::Dims(shape));
 
-        let target_uops: Vec<UOp> = targets.iter().map(|t| t.uop.clone()).collect();
+        let root_grad = full(self.shape(), DType::F32, self.device(), 1.0);
+        let target_uops: Vec<UOp> = targets
+            .iter()
+            .filter(|target| target.requires_grad)
+            .map(|target| target.uop.clone())
+            .collect();
         let grad_map = gradient::compute_gradient(&self.uop, &root_grad, &target_uops);
 
         targets
             .iter()
-            .map(|t| Self {
-                uop: grad_map[&t.uop].clone(),
-                device: t.device.clone(),
+            .map(|target| match grad_map.get(&target.uop) {
+                Some(grad) => Self {
+                    uop: grad.clone(),
+                    requires_grad: false,
+                },
+                None => Self {
+                    uop: full(target.shape(), DType::F32, target.device(), 0.0),
+                    requires_grad: false,
+                },
             })
             .collect()
     }
 }
 
-/// Broadcast two tensors to a common shape (numpy-style).
-/// Pads with 1s on the left, then expands mismatched dims.
-fn broadcast_shapes(a: &Tensor, b: &Tensor) -> (Tensor, Tensor) {
-    let ndim = a.ndim().max(b.ndim());
-
-    // Pad shapes with 1s on the left to match ndim.
-    let pad = |s: &[usize]| -> Vec<usize> {
-        let mut v = vec![1; ndim - s.len()];
-        v.extend_from_slice(s);
-        v
-    };
-    let sa = pad(&a.shape());
-    let sb = pad(&b.shape());
-
-    let mut target = Vec::with_capacity(ndim);
-    for (i, (&da, &db)) in sa.iter().zip(&sb).enumerate() {
-        match (da, db) {
-            (x, y) if x == y => target.push(x),
-            (1, y) => target.push(y),
-            (x, 1) => target.push(x),
-            _ => panic!("broadcast: incompatible dims at axis {i}: {da} vs {db}"),
-        }
+fn full(shape: Shape, dtype: DType, device: DeviceId, value: f64) -> UOp {
+    let base_shape = Shape::new(vec![1; shape.ndim()]);
+    let scalar = UOp::const_float(value, dtype, device);
+    let base = UOp::reshape(scalar, base_shape);
+    if shape.iter().all(|&dim| dim == 1) {
+        return base;
     }
-
-    let a = a.reshape(&sa).expand(&target);
-    let b = b.reshape(&sb).expand(&target);
-    (a, b)
+    UOp::expand(base, shape)
 }
 
-/// Create a default CPU device for convenience.
+fn broadcast_shapes(left: &Tensor, right: &Tensor) -> (Tensor, Tensor) {
+    assert!(
+        left.device() == right.device(),
+        "broadcast requires tensors on the same device"
+    );
+    let target = left.shape().broadcast_with(&right.shape()).unwrap_or_else(|| {
+        panic!(
+            "broadcast: incompatible dims for {:?} vs {:?}",
+            left.shape(),
+            right.shape()
+        )
+    });
+    let left_shape = left.shape().pad_left(target.ndim());
+    let right_shape = right.shape().pad_left(target.ndim());
+    let left = left.reshape(left_shape.as_slice()).expand(target.as_slice());
+    let right = right.reshape(right_shape.as_slice()).expand(target.as_slice());
+    (left, right)
+}
+
+fn assert_codegen_ready(root: &UOp) {
+    assert_eq!(root.op(), Op::Sink, "render: root must be a Sink node");
+    for node in root.toposort() {
+        assert!(
+            !matches!(
+                node.op(),
+                Op::Buffer
+                    | Op::Shrink
+                    | Op::Reshape
+                    | Op::Permute
+                    | Op::Expand
+                    | Op::ReduceAxis
+                    | Op::Reduce
+            ),
+            "{:?} should be lowered before codegen",
+            node.op()
+        );
+    }
+}
+
+/// Return the default CPU device.
 #[must_use]
-pub fn cpu() -> Rc<dyn Device> {
-    Rc::new(CpuDevice)
+pub fn cpu() -> DeviceId {
+    DeviceId::Cpu
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn dev() -> Rc<dyn Device> {
+    fn dev() -> DeviceId {
         cpu()
     }
 
     #[test]
     fn test_from_slice_roundtrip() {
-        let t = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &dev());
-        assert_eq!(t.shape(), &[3]);
+        // Arrange.
+        let t = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3]);
+
+        // Assert.
+        assert_eq!(t.shape(), [3]);
         assert_eq!(t.dtype(), DType::F32);
         assert!(t.is_realized());
         assert_eq!(t.to_vec(), vec![1.0, 2.0, 3.0]);
@@ -638,409 +680,134 @@ mod tests {
 
     #[test]
     fn test_add_is_lazy() {
-        let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0], &[2], &d);
-        let b = Tensor::from_slice(&[3.0, 4.0], &[2], &d);
+        // Arrange.
+        let a = Tensor::from_slice(&[1.0, 2.0], &[2]);
+        let b = Tensor::from_slice(&[3.0, 4.0], &[2]);
+
+        // Act.
         let c = a.add(&b);
+
+        // Assert.
         assert!(!c.is_realized());
-        assert_eq!(c.shape(), &[2]);
+        assert_eq!(c.shape(), [2]);
     }
 
     #[test]
     fn test_add_realize() {
-        let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &d);
-        let b = Tensor::from_slice(&[4.0, 5.0, 6.0], &[3], &d);
+        // Arrange.
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3]);
+        let b = Tensor::from_slice(&[4.0, 5.0, 6.0], &[3]);
+
+        // Act / Assert.
         assert_eq!(a.add(&b).to_vec(), vec![5.0, 7.0, 9.0]);
     }
 
     #[test]
     fn test_mul_realize() {
-        let d = dev();
-        let a = Tensor::from_slice(&[2.0, 3.0, 4.0], &[3], &d);
-        let b = Tensor::from_slice(&[5.0, 6.0, 7.0], &[3], &d);
+        // Arrange.
+        let a = Tensor::from_slice(&[2.0, 3.0, 4.0], &[3]);
+        let b = Tensor::from_slice(&[5.0, 6.0, 7.0], &[3]);
+
+        // Act / Assert.
         assert_eq!(a.mul(&b).to_vec(), vec![10.0, 18.0, 28.0]);
     }
 
     #[test]
     fn test_fused_add_mul() {
-        let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &d);
-        let b = Tensor::from_slice(&[10.0, 20.0, 30.0], &[3], &d);
-        let two = Tensor::from_slice(&[2.0, 2.0, 2.0], &[3], &d);
+        // Arrange.
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3]);
+        let b = Tensor::from_slice(&[10.0, 20.0, 30.0], &[3]);
+        let two = Tensor::from_slice(&[2.0, 2.0, 2.0], &[3]);
+
+        // Act / Assert.
         assert_eq!(a.add(&b).mul(&two).to_vec(), vec![22.0, 44.0, 66.0]);
     }
 
     #[test]
     fn test_neg() {
-        let a = Tensor::from_slice(&[1.0, -2.0, 3.0], &[3], &dev());
+        // Arrange.
+        let a = Tensor::from_slice(&[1.0, -2.0, 3.0], &[3]);
+
+        // Act / Assert.
         assert_eq!(a.neg().to_vec(), vec![-1.0, 2.0, -3.0]);
     }
 
     #[test]
     fn test_relu() {
-        let a = Tensor::from_slice(&[1.0, -2.0, 3.0, -4.0], &[4], &dev());
+        // Arrange.
+        let a = Tensor::from_slice(&[1.0, -2.0, 3.0, -4.0], &[4]);
+
+        // Act / Assert.
         assert_eq!(a.relu().to_vec(), vec![1.0, 0.0, 3.0, 0.0]);
     }
 
     #[test]
+    fn test_narrow_rows() {
+        // Arrange.
+        let x = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+
+        // Act.
+        let narrowed = x.narrow(0, 1, 1);
+
+        // Assert.
+        assert_eq!(narrowed.shape(), [1, 3]);
+        assert_eq!(narrowed.to_vec(), vec![4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_gradients_skip_untracked_narrow_inputs() {
+        // Arrange.
+        let x = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2]).narrow(0, 1, 1);
+        let w = Tensor::from_slice(&[10.0, 20.0], &[2, 1]).with_requires_grad(true);
+
+        // Act.
+        let loss = x.matmul(&w).sum(&[0, 1]);
+        let grads = loss.gradient(&[&w]);
+
+        // Assert.
+        assert_eq!(grads[0].to_vec(), vec![3.0, 4.0]);
+        assert!(!grads[0].requires_grad());
+    }
+
+    #[test]
     fn test_shared_input() {
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &dev());
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3]);
         assert_eq!(a.add(&a).to_vec(), vec![2.0, 4.0, 6.0]);
     }
 
     #[test]
     fn test_chained_ops() {
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &dev());
+        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3]);
         assert_eq!(a.neg().neg().to_vec(), vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
     fn test_realize_idempotent() {
-        let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0], &[2], &d);
-        let b = a.add(&Tensor::from_slice(&[3.0, 4.0], &[2], &d));
+        let a = Tensor::from_slice(&[1.0, 2.0], &[2]);
+        let b = a.add(&Tensor::from_slice(&[3.0, 4.0], &[2]));
         assert_eq!(b.realize().realize().to_vec(), vec![4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_kernel_cache_reuses_interned_kernel() {
+        runtime::clear_for_tests(dev());
+        let first = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3])
+            .add(&Tensor::from_slice(&[4.0, 5.0, 6.0], &[3]));
+        assert_eq!(first.to_vec(), vec![5.0, 7.0, 9.0]);
+        let after_first = runtime::kernel_cache_len(dev());
+        assert_eq!(after_first, 1);
+
+        let second = Tensor::from_slice(&[10.0, 20.0, 30.0], &[3])
+            .add(&Tensor::from_slice(&[1.0, 2.0, 3.0], &[3]));
+        assert_eq!(second.to_vec(), vec![11.0, 22.0, 33.0]);
+        assert_eq!(runtime::kernel_cache_len(dev()), after_first);
     }
 
     #[test]
     #[should_panic(expected = "broadcast: incompatible dims")]
     fn test_shape_mismatch() {
-        let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0], &[2], &d);
-        let b = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &d);
+        let a = Tensor::from_slice(&[1.0, 2.0], &[2]);
+        let b = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3]);
         let _ = a.add(&b);
-    }
-
-    // ── Multi-dimensional tests ──────────────────────────────────────
-
-    #[test]
-    fn test_2d_add() {
-        // Arrange — [2,3] + [2,3]
-        let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &d);
-        let b = Tensor::from_slice(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[2, 3], &d);
-
-        // Act
-        let result = a.add(&b).to_vec();
-
-        // Assert
-        assert_eq!(result, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]);
-    }
-
-    #[test]
-    fn test_reshape_lazy() {
-        // Arrange
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[6], &dev());
-
-        // Act
-        let b = a.reshape(&[2, 3]);
-
-        // Assert — reshape is lazy, shape changes but data unchanged
-        assert_eq!(b.shape(), vec![2, 3]);
-        assert_eq!(b.numel(), 6);
-    }
-
-    #[test]
-    fn test_2d_reshape_add() {
-        // Arrange — reshape then add
-        let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[6], &d);
-        let b = Tensor::from_slice(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[6], &d);
-
-        // Act — reshape both to [2,3] then add
-        let result = a.reshape(&[2, 3]).add(&b.reshape(&[2, 3])).to_vec();
-
-        // Assert
-        assert_eq!(result, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]);
-    }
-
-    #[test]
-    fn test_broadcast_add() {
-        // Arrange — [2,3] + [1,3] broadcasts row
-        let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &d);
-        let b = Tensor::from_slice(&[10.0, 20.0, 30.0], &[1, 3], &d);
-
-        // Act
-        let result = a.add(&b).to_vec();
-
-        // Assert — b is broadcast across rows
-        assert_eq!(result, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
-    }
-
-    #[test]
-    fn test_broadcast_add_col() {
-        // Arrange — [2,3] + [2,1] broadcasts column
-        let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &d);
-        let b = Tensor::from_slice(&[10.0, 20.0], &[2, 1], &d);
-
-        // Act
-        let result = a.add(&b).to_vec();
-
-        // Assert — b is broadcast across columns
-        assert_eq!(result, vec![11.0, 12.0, 13.0, 24.0, 25.0, 26.0]);
-    }
-
-    #[test]
-    fn test_sum_1d() {
-        // Arrange
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &dev());
-
-        // Act
-        let result = a.sum(&[0]).to_vec();
-
-        // Assert
-        assert_eq!(result, vec![6.0]);
-    }
-
-    #[test]
-    fn test_sum_2d_axis0() {
-        // Arrange — sum over rows: [2,3] → [1,3]
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &dev());
-
-        // Act
-        let result = a.sum(&[0]).to_vec();
-
-        // Assert
-        assert_eq!(result, vec![5.0, 7.0, 9.0]);
-    }
-
-    #[test]
-    fn test_sum_2d_axis1() {
-        // Arrange — sum over cols: [2,3] → [2,1]
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &dev());
-
-        // Act
-        let result = a.sum(&[1]).to_vec();
-
-        // Assert
-        assert_eq!(result, vec![6.0, 15.0]);
-    }
-
-    #[test]
-    fn test_matmul_2x3_3x2() {
-        // Arrange
-        // a = [[1,2,3],[4,5,6]]  (2x3)
-        // b = [[1,2],[3,4],[5,6]]  (3x2)
-        // expected = [[22,28],[49,64]]
-        let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &d);
-        let b = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2], &d);
-
-        // Act
-        let result = a.matmul(&b).to_vec();
-
-        // Assert
-        assert_eq!(result, vec![22.0, 28.0, 49.0, 64.0]);
-    }
-
-    #[test]
-    fn test_matmul_identity() {
-        // Arrange — a @ I = a
-        let d = dev();
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2], &d);
-        let eye = Tensor::from_slice(&[1.0, 0.0, 0.0, 1.0], &[2, 2], &d);
-
-        // Act
-        let result = a.matmul(&eye).to_vec();
-
-        // Assert
-        assert_eq!(result, vec![1.0, 2.0, 3.0, 4.0]);
-    }
-
-    #[test]
-    fn test_max_2d_axis1() {
-        // Arrange — max over cols: [[1,5,3],[4,2,6]] → [[5],[6]]
-        let a = Tensor::from_slice(&[1.0, 5.0, 3.0, 4.0, 2.0, 6.0], &[2, 3], &dev());
-
-        // Act
-        let result = a.max(&[1]).to_vec();
-
-        // Assert
-        assert_eq!(result, vec![5.0, 6.0]);
-    }
-
-    #[test]
-    fn test_exp_log_roundtrip() {
-        // Arrange — exp(log(x)) ≈ x
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3], &dev());
-
-        // Act
-        let result = a.log().exp().to_vec();
-
-        // Assert
-        for (i, &v) in result.iter().enumerate() {
-            let expected = [1.0, 2.0, 3.0][i];
-            assert!((v - expected).abs() < 1e-5, "exp(log({expected})) = {v}");
-        }
-    }
-
-    // ── Autograd tests ──────────────────────────────────────────────────
-
-    /// Finite-difference gradient check: (f(x+eps) - f(x-eps)) / 2eps.
-    /// Perturbs each element of `input_data` and compares against
-    /// the analytical gradient from `Tensor::gradient`.
-    fn check_gradient(
-        input_data: &[f32],
-        shape: &[usize],
-        build_loss: impl Fn(&Tensor) -> Tensor,
-        eps: f32,
-        tol: f32,
-    ) {
-        let d = dev();
-        let x = Tensor::from_slice(input_data, shape, &d);
-        let loss = build_loss(&x);
-        let grads = loss.gradient(&[&x]);
-        let analytical = grads[0].to_vec();
-
-        let mut numerical = vec![0.0_f32; input_data.len()];
-        for i in 0..input_data.len() {
-            let mut plus = input_data.to_vec();
-            let mut minus = input_data.to_vec();
-            plus[i] += eps;
-            minus[i] -= eps;
-            let f_plus: f32 = build_loss(&Tensor::from_slice(&plus, shape, &d))
-                .to_vec()
-                .iter()
-                .sum();
-            let f_minus: f32 = build_loss(&Tensor::from_slice(&minus, shape, &d))
-                .to_vec()
-                .iter()
-                .sum();
-            numerical[i] = (f_plus - f_minus) / (2.0 * eps);
-        }
-
-        for (i, (&a, &n)) in analytical.iter().zip(&numerical).enumerate() {
-            assert!(
-                (a - n).abs() < tol,
-                "gradient mismatch at [{i}]: analytical={a}, numerical={n}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_grad_add_sum() {
-        // d/dx sum(x + y) = ones
-        check_gradient(&[1.0, 2.0, 3.0], &[3], |x| {
-            let y = Tensor::from_slice(&[4.0, 5.0, 6.0], &[3], &x.device.clone());
-            x.add(&y).sum(&[0])
-        }, 1e-3, 1e-3);
-    }
-
-    #[test]
-    fn test_grad_mul_sum() {
-        // d/dx sum(x * y) = y
-        check_gradient(&[1.0, 2.0, 3.0], &[3], |x| {
-            let y = Tensor::from_slice(&[4.0, 5.0, 6.0], &[3], &x.device.clone());
-            x.mul(&y).sum(&[0])
-        }, 1e-3, 1e-2);
-    }
-
-    #[test]
-    fn test_grad_neg_sum() {
-        // d/dx sum(-x) = -1
-        check_gradient(&[1.0, 2.0, 3.0], &[3], |x| {
-            x.neg().sum(&[0])
-        }, 1e-3, 1e-3);
-    }
-
-    #[test]
-    fn test_grad_x_squared() {
-        // d/dx sum(x * x) = 2x
-        check_gradient(&[1.0, 2.0, 3.0], &[3], |x| {
-            x.mul(x).sum(&[0])
-        }, 1e-3, 1e-3);
-    }
-
-    #[test]
-    fn test_grad_chain() {
-        // d/dx sum(x*x + x) = 2x + 1
-        check_gradient(&[1.0, 2.0, 3.0], &[3], |x| {
-            x.mul(x).add(x).sum(&[0])
-        }, 1e-3, 1e-3);
-    }
-
-    #[test]
-    fn test_grad_broadcast_mul() {
-        // x[2,3] * y[1,3] → sum. Tests Expand gradient (reduce over broadcast dim).
-        check_gradient(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], |x| {
-            let y = Tensor::from_slice(&[2.0, 3.0, 4.0], &[1, 3], &x.device.clone());
-            x.mul(&y).sum(&[0, 1])
-        }, 1e-3, 1e-2);
-    }
-
-    #[test]
-    fn test_grad_reshape() {
-        // reshape doesn't move data, gradient reshapes back
-        check_gradient(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[6], |x| {
-            x.reshape(&[2, 3]).sum(&[0, 1])
-        }, 1e-3, 1e-3);
-    }
-
-    #[test]
-    fn test_grad_relu() {
-        // d/dx relu(x) = (x > 0) ? 1 : 0
-        check_gradient(&[1.0, -2.0, 3.0, -4.0], &[4], |x| {
-            x.relu().sum(&[0])
-        }, 1e-3, 1e-3);
-    }
-
-    #[test]
-    fn test_grad_matmul() {
-        // loss = sum(a @ b), gradient w.r.t. a
-        check_gradient(&[1.0, 2.0, 3.0, 4.0], &[2, 2], |a| {
-            let b = Tensor::from_slice(&[5.0, 6.0, 7.0, 8.0], &[2, 2], &a.device.clone());
-            a.matmul(&b).sum(&[0, 1])
-        }, 1e-3, 1e-2);
-    }
-
-    #[test]
-    fn test_grad_linear_layer() {
-        // loss = sum(x @ w + b), gradients for w and b
-        let d = dev();
-        let x = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2], &d);
-        let w = Tensor::from_slice(&[0.1, 0.2, 0.3, 0.4], &[2, 2], &d);
-        let b = Tensor::from_slice(&[0.5, 0.6], &[1, 2], &d);
-
-        let loss = x.matmul(&w).add(&b).sum(&[0, 1]);
-        let grads = loss.gradient(&[&w, &b]);
-        let w_grad = grads[0].to_vec();
-        let b_grad = grads[1].to_vec();
-
-        // Numerical check for w
-        let eps = 1e-3;
-        let w_data = [0.1_f32, 0.2, 0.3, 0.4];
-        for i in 0..4 {
-            let mut plus = w_data;
-            let mut minus = w_data;
-            plus[i] += eps;
-            minus[i] -= eps;
-            let f_plus: f32 = x
-                .matmul(&Tensor::from_slice(&plus, &[2, 2], &d))
-                .add(&b)
-                .sum(&[0, 1])
-                .to_vec()
-                .iter()
-                .sum();
-            let f_minus: f32 = x
-                .matmul(&Tensor::from_slice(&minus, &[2, 2], &d))
-                .add(&b)
-                .sum(&[0, 1])
-                .to_vec()
-                .iter()
-                .sum();
-            let numerical = (f_plus - f_minus) / (2.0 * eps);
-            assert!(
-                (w_grad[i] - numerical).abs() < 1e-2,
-                "w_grad[{i}]: analytical={}, numerical={numerical}",
-                w_grad[i]
-            );
-        }
-
-        // b gradient: d/db sum(x@w + b) = [2, 2] (batch_size for each output)
-        assert!((b_grad[0] - 2.0).abs() < 1e-3, "b_grad[0] = {}", b_grad[0]);
-        assert!((b_grad[1] - 2.0).abs() < 1e-3, "b_grad[1] = {}", b_grad[1]);
     }
 }
