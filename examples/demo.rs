@@ -1,4 +1,5 @@
-//! Demonstrates the full pipeline: lazy tensor ops → fused kernel → execution.
+//! Demonstrates the full pipeline: lazy tensor ops → fused kernel → execution,
+//! including autograd for computing gradients.
 //!
 //! Run with `DEBUG=4` to see generated C source:
 //! ```sh
@@ -12,18 +13,22 @@ use ferrograd::tensor::{cpu, Tensor};
 fn main() {
     let dev = cpu();
 
-    /*let m = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &dev);
-    let n = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2], &dev);
-    let p = m.matmul(&n).to_vec();
-    println!("\n  m       = [[1,2,3],[4,5,6]]");
-    println!("  n       = [[1,2],[3,4],[5,6]]");
-    println!("  m @ n   = {p:?}");
-    assert_eq!(p, vec![22.0, 28.0, 49.0, 64.0]);*/
+    // ── Autograd: linear layer ───────────────────────────────────────────
+    println!("\n  --- Autograd: loss = sum(x @ w + b) ---");
+    let x = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2], &dev);
+    let w = Tensor::from_slice(&[0.1, 0.2, 0.3, 0.4], &[2, 2], &dev);
+    let b = Tensor::from_slice(&[0.5, 0.6], &[1, 2], &dev);
 
-    // Sum reduction
-    let s = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], &dev);
-    let row_sums = s.sum(&[1]).to_vec();
-    println!("\n  s           = [[1,2,3],[4,5,6]]");
-    println!("  s.sum(axis=1) = {row_sums:?}");
-    assert_eq!(row_sums, vec![6.0, 15.0]);
+    let loss = x.matmul(&w).add(&b).sum(&[0, 1]);
+    println!("  loss    = {:?}", loss.to_vec());
+
+    let grads = loss.gradient(&[&w, &b]);
+    println!("  dL/dw   = {:?}", grads[0].to_vec());
+    println!("  dL/db   = {:?}", grads[1].to_vec());
+
+    // ── Autograd: SGD step ───────────────────────────────────────────────
+    println!("\n  --- SGD step: w -= 0.1 * dL/dw ---");
+    let lr = Tensor::from_slice(&[0.1], &[1, 1], &dev);
+    let w_new = w.sub(&grads[0].mul(&lr));
+    println!("  w_new   = {:?}", w_new.to_vec());
 }

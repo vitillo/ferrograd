@@ -16,6 +16,7 @@ use std::time::Instant;
 use crate::codegen::{ClangRenderer, Renderer};
 use crate::device::{Buffer, CpuDevice, Device};
 use crate::dtype::DType;
+use crate::gradient;
 use crate::schedule::{self, rangeify::rangeify};
 use crate::uop::{Arg, Op, UOp};
 
@@ -195,6 +196,36 @@ impl Tensor {
             ),
             device: self.device.clone(),
         }
+    }
+
+    /// Element-wise subtraction with broadcasting.
+    #[must_use]
+    pub fn sub(&self, other: &Self) -> Self {
+        self.add(&other.neg())
+    }
+
+    /// Element-wise `1/x`.
+    #[must_use]
+    pub fn reciprocal(&self) -> Self {
+        self.unary(Op::Reciprocal)
+    }
+
+    /// Element-wise `2^x`.
+    #[must_use]
+    pub fn exp2(&self) -> Self {
+        self.unary(Op::Exp2)
+    }
+
+    /// Element-wise `log₂(x)`.
+    #[must_use]
+    pub fn log2(&self) -> Self {
+        self.unary(Op::Log2)
+    }
+
+    /// Element-wise `√x`.
+    #[must_use]
+    pub fn sqrt(&self) -> Self {
+        self.unary(Op::Sqrt)
     }
 
     // ── Movement ops ───────────────────────────────────────────────────
@@ -406,6 +437,57 @@ impl Tensor {
     pub fn to_vec(&self) -> Vec<f32> {
         let realized = self.realize();
         realized.realized_buffer().to_f32()
+    }
+
+    // ── Autograd ─────────────────────────────────────────────────────────
+
+    /// Compute gradients of `self` with respect to each target tensor.
+    ///
+    /// Returns one gradient `Tensor` per target, in the same order.
+    /// Each gradient is a lazy tensor — call `realize()` or `to_vec()`
+    /// to execute the backward computation.
+    ///
+    /// `self` should be a scalar (e.g. a loss after `.sum()`). The initial
+    /// gradient is implicitly 1.0.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let loss = x.mul(&w).sum(&[0]);
+    /// let grads = loss.gradient(&[&w]);
+    /// let w_grad = grads[0].to_vec();
+    /// ```
+    #[must_use]
+    pub fn gradient(&self, targets: &[&Self]) -> Vec<Self> {
+        let shape = self.shape();
+        let numel: usize = shape.iter().product();
+
+        // Initial gradient: ones with the same shape as self
+        let ones_data = vec![1.0_f32; numel];
+        let ones_buf = UOp::new(
+            Op::Buffer,
+            DType::F32,
+            vec![],
+            Arg::Buffer(Rc::new(Buffer::from_f32(&ones_data))),
+        );
+        let root_grad = UOp::new(Op::Reshape, DType::F32, vec![ones_buf], Arg::Dims(shape));
+
+        let target_uops: Vec<UOp> = targets.iter().map(|t| t.uop.clone()).collect();
+        let grad_map = gradient::compute_gradient(&self.uop, &root_grad, &target_uops);
+
+        targets
+            .iter()
+            .map(|t| {
+                let grad_uop = grad_map
+                    .get(&t.uop)
+                    .cloned()
+                    .unwrap_or_else(|| UOp::const_float(0.0, t.dtype()));
+                Self {
+                    uop: grad_uop,
+                    device: t.device.clone(),
+                }
+            })
+            .collect()
     }
 }
 
@@ -673,5 +755,172 @@ mod tests {
 
         // Assert
         assert_eq!(result, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    // ── Autograd tests ──────────────────────────────────────────────────
+
+    /// Finite-difference gradient check: (f(x+eps) - f(x-eps)) / 2eps.
+    /// Perturbs each element of `input_data` and compares against
+    /// the analytical gradient from `Tensor::gradient`.
+    fn check_gradient(
+        input_data: &[f32],
+        shape: &[usize],
+        build_loss: impl Fn(&Tensor) -> Tensor,
+        eps: f32,
+        tol: f32,
+    ) {
+        let d = dev();
+        let x = Tensor::from_slice(input_data, shape, &d);
+        let loss = build_loss(&x);
+        let grads = loss.gradient(&[&x]);
+        let analytical = grads[0].to_vec();
+
+        let mut numerical = vec![0.0_f32; input_data.len()];
+        for i in 0..input_data.len() {
+            let mut plus = input_data.to_vec();
+            let mut minus = input_data.to_vec();
+            plus[i] += eps;
+            minus[i] -= eps;
+            let f_plus: f32 = build_loss(&Tensor::from_slice(&plus, shape, &d))
+                .to_vec()
+                .iter()
+                .sum();
+            let f_minus: f32 = build_loss(&Tensor::from_slice(&minus, shape, &d))
+                .to_vec()
+                .iter()
+                .sum();
+            numerical[i] = (f_plus - f_minus) / (2.0 * eps);
+        }
+
+        for (i, (&a, &n)) in analytical.iter().zip(&numerical).enumerate() {
+            assert!(
+                (a - n).abs() < tol,
+                "gradient mismatch at [{i}]: analytical={a}, numerical={n}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_grad_add_sum() {
+        // d/dx sum(x + y) = ones
+        check_gradient(&[1.0, 2.0, 3.0], &[3], |x| {
+            let y = Tensor::from_slice(&[4.0, 5.0, 6.0], &[3], &x.device.clone());
+            x.add(&y).sum(&[0])
+        }, 1e-3, 1e-3);
+    }
+
+    #[test]
+    fn test_grad_mul_sum() {
+        // d/dx sum(x * y) = y
+        check_gradient(&[1.0, 2.0, 3.0], &[3], |x| {
+            let y = Tensor::from_slice(&[4.0, 5.0, 6.0], &[3], &x.device.clone());
+            x.mul(&y).sum(&[0])
+        }, 1e-3, 1e-2);
+    }
+
+    #[test]
+    fn test_grad_neg_sum() {
+        // d/dx sum(-x) = -1
+        check_gradient(&[1.0, 2.0, 3.0], &[3], |x| {
+            x.neg().sum(&[0])
+        }, 1e-3, 1e-3);
+    }
+
+    #[test]
+    fn test_grad_x_squared() {
+        // d/dx sum(x * x) = 2x
+        check_gradient(&[1.0, 2.0, 3.0], &[3], |x| {
+            x.mul(x).sum(&[0])
+        }, 1e-3, 1e-3);
+    }
+
+    #[test]
+    fn test_grad_chain() {
+        // d/dx sum(x*x + x) = 2x + 1
+        check_gradient(&[1.0, 2.0, 3.0], &[3], |x| {
+            x.mul(x).add(x).sum(&[0])
+        }, 1e-3, 1e-3);
+    }
+
+    #[test]
+    fn test_grad_broadcast_mul() {
+        // x[2,3] * y[1,3] → sum. Tests Expand gradient (reduce over broadcast dim).
+        check_gradient(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], |x| {
+            let y = Tensor::from_slice(&[2.0, 3.0, 4.0], &[1, 3], &x.device.clone());
+            x.mul(&y).sum(&[0, 1])
+        }, 1e-3, 1e-2);
+    }
+
+    #[test]
+    fn test_grad_reshape() {
+        // reshape doesn't move data, gradient reshapes back
+        check_gradient(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[6], |x| {
+            x.reshape(&[2, 3]).sum(&[0, 1])
+        }, 1e-3, 1e-3);
+    }
+
+    #[test]
+    fn test_grad_relu() {
+        // d/dx relu(x) = (x > 0) ? 1 : 0
+        check_gradient(&[1.0, -2.0, 3.0, -4.0], &[4], |x| {
+            x.relu().sum(&[0])
+        }, 1e-3, 1e-3);
+    }
+
+    #[test]
+    fn test_grad_matmul() {
+        // loss = sum(a @ b), gradient w.r.t. a
+        check_gradient(&[1.0, 2.0, 3.0, 4.0], &[2, 2], |a| {
+            let b = Tensor::from_slice(&[5.0, 6.0, 7.0, 8.0], &[2, 2], &a.device.clone());
+            a.matmul(&b).sum(&[0, 1])
+        }, 1e-3, 1e-2);
+    }
+
+    #[test]
+    fn test_grad_linear_layer() {
+        // loss = sum(x @ w + b), gradients for w and b
+        let d = dev();
+        let x = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2], &d);
+        let w = Tensor::from_slice(&[0.1, 0.2, 0.3, 0.4], &[2, 2], &d);
+        let b = Tensor::from_slice(&[0.5, 0.6], &[1, 2], &d);
+
+        let loss = x.matmul(&w).add(&b).sum(&[0, 1]);
+        let grads = loss.gradient(&[&w, &b]);
+        let w_grad = grads[0].to_vec();
+        let b_grad = grads[1].to_vec();
+
+        // Numerical check for w
+        let eps = 1e-3;
+        let w_data = [0.1_f32, 0.2, 0.3, 0.4];
+        for i in 0..4 {
+            let mut plus = w_data;
+            let mut minus = w_data;
+            plus[i] += eps;
+            minus[i] -= eps;
+            let f_plus: f32 = x
+                .matmul(&Tensor::from_slice(&plus, &[2, 2], &d))
+                .add(&b)
+                .sum(&[0, 1])
+                .to_vec()
+                .iter()
+                .sum();
+            let f_minus: f32 = x
+                .matmul(&Tensor::from_slice(&minus, &[2, 2], &d))
+                .add(&b)
+                .sum(&[0, 1])
+                .to_vec()
+                .iter()
+                .sum();
+            let numerical = (f_plus - f_minus) / (2.0 * eps);
+            assert!(
+                (w_grad[i] - numerical).abs() < 1e-2,
+                "w_grad[{i}]: analytical={}, numerical={numerical}",
+                w_grad[i]
+            );
+        }
+
+        // b gradient: d/db sum(x@w + b) = [2, 2] (batch_size for each output)
+        assert!((b_grad[0] - 2.0).abs() < 1e-3, "b_grad[0] = {}", b_grad[0]);
+        assert!((b_grad[1] - 2.0).abs() < 1e-3, "b_grad[1] = {}", b_grad[1]);
     }
 }

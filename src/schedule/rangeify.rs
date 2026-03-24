@@ -22,8 +22,8 @@ use crate::rewrite::{graph_rewrite, Captures, PatternMatcher, RewriteFn, UPat};
 use crate::uop::{Arg, Op, UOp};
 
 use super::indexing::{
-    contiguous_strides, flat_index, index_wrap, rewrite_index_alu, rewrite_index_movement,
-    rewrite_index_param, rewrite_index_reduce,
+    contiguous_strides, flat_index, index_wrap, rewrite_index_alu, rewrite_index_const,
+    rewrite_index_movement, rewrite_index_param, rewrite_index_reduce,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -188,6 +188,7 @@ fn build_rules() -> PatternMatcher {
                 None.or_else(|| rewrite_index_alu(&inner, &idxs))
                     .or_else(|| rewrite_index_movement(&inner, &idxs))
                     .or_else(|| rewrite_index_reduce(&inner, &idxs))
+                    .or_else(|| rewrite_index_const(&inner, &idxs))
                     .or_else(|| rewrite_index_param(&inner, &idxs))
             }) as RewriteFn,
         ),

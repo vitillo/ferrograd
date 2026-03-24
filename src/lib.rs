@@ -18,10 +18,12 @@
 //! - [`rewrite`] -- Graph rewriting: pattern matching and algebraic simplification (M5)
 //! - [`tensor`] -- Lazy tensor API with kernel fusion (M6)
 //! - [`schedule`] -- Converts tensor-level `UOps` to kernel-level `UOps` (M6)
+//! - [`gradient`] -- Reverse-mode automatic differentiation (M7)
 
 pub mod codegen;
 pub mod device;
 pub mod dtype;
+pub mod gradient;
 pub mod rewrite;
 pub mod schedule;
 pub mod tensor;
