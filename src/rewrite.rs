@@ -136,16 +136,14 @@ pub fn symbolic_simple(node: &UOp) -> Option<UOp> {
                 .map(|r| UOp::new(Op::Const, a.dtype(), vec![], r))
         }
         // x + 0 → x
-        (Op::Add, [x, y]) if y.is_const_float(0.0) || y.is_const_int(0) => Some(x.clone()),
-        (Op::Add, [x, y]) if x.is_const_float(0.0) || x.is_const_int(0) => Some(y.clone()),
+        (Op::Add, [x, y]) if y.is_zero() => Some(x.clone()),
+        (Op::Add, [x, y]) if x.is_zero() => Some(y.clone()),
         // x * 1 → x
-        (Op::Mul, [x, y]) if y.is_const_float(1.0) || y.is_const_int(1) => Some(x.clone()),
-        (Op::Mul, [x, y]) if x.is_const_float(1.0) || x.is_const_int(1) => Some(y.clone()),
+        (Op::Mul, [x, y]) if y.is_one() => Some(x.clone()),
+        (Op::Mul, [x, y]) if x.is_one() => Some(y.clone()),
         // x * 0 → 0
-        (Op::Mul, [_, y]) if y.is_const_float(0.0) => Some(y.clone()),
-        (Op::Mul, [x, _]) if x.is_const_float(0.0) => Some(x.clone()),
-        (Op::Mul, [_, y]) if y.is_const_int(0) => Some(y.clone()),
-        (Op::Mul, [x, _]) if x.is_const_int(0) => Some(x.clone()),
+        (Op::Mul, [_, y]) if y.is_zero() => Some(y.clone()),
+        (Op::Mul, [x, _]) if x.is_zero() => Some(x.clone()),
         _ => None,
     }
 }
