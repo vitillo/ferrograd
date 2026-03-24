@@ -47,7 +47,7 @@
 use std::io::Write;
 use std::process::Command;
 
-use crate::device::{Buffer, Device, DeviceError, DeviceId, Program, Storage};
+use crate::device::{Buffer, Device, DeviceError, DeviceId, KernelArg, Program, Storage};
 use crate::dtype::DType;
 
 // ── Errors ──────────────────────────────────────────────────────────────────
@@ -101,6 +101,13 @@ pub struct CompiledKernel {
 
     /// The function name inside the library (used for symbol lookup).
     func_name: String,
+}
+
+enum CallArg {
+    Ptr(*mut u8),
+    I32(i32),
+    F32(f32),
+    Bool(u8),
 }
 
 impl std::fmt::Debug for CompiledKernel {
@@ -227,39 +234,61 @@ impl Device for CpuDevice {
         &self,
         source: &str,
         func_name: &str,
-        num_bufs: usize,
+        num_args: usize,
     ) -> Result<Program, DeviceError> {
         let kernel = CompiledKernel::new(source, func_name)?;
-        Ok(Program::Cpu { kernel, num_bufs })
+        Ok(Program::Cpu { kernel, num_args })
     }
 
-    fn execute(&self, program: &Program, bufs: &mut [&mut Buffer]) -> Result<(), DeviceError> {
-        let Program::Cpu { kernel, num_bufs } = program;
+    fn execute(&self, program: &Program, args: &mut [KernelArg]) -> Result<(), DeviceError> {
+        let Program::Cpu { kernel, num_args } = program;
 
         assert_eq!(
-            bufs.len(),
-            *num_bufs,
-            "expected {num_bufs} buffers, got {}",
-            bufs.len()
+            args.len(),
+            *num_args,
+            "expected {num_args} kernel args, got {}",
+            args.len()
         );
 
-        let ptrs: Vec<*mut u8> = bufs.iter_mut().map(|b| b.as_mut_ptr()).collect();
+        let call_args: Vec<CallArg> = args
+            .iter_mut()
+            .map(|arg| match arg {
+                KernelArg::Buffer(buffer) => CallArg::Ptr(buffer.as_mut_ptr()),
+                KernelArg::I32(value) => CallArg::I32(*value),
+                KernelArg::F32(value) => CallArg::F32(*value),
+                KernelArg::Bool(value) => CallArg::Bool(u8::from(*value)),
+            })
+            .collect();
 
-        // Use libffi to call the kernel with a dynamic number of pointer args.
-        // The kernel signature is `void kernel(float* data0, float* data1, ...)`.
+        // Use libffi to call the kernel with a dynamic mix of pointer and scalar args.
         let cif = libffi::middle::Cif::new(
-            vec![libffi::middle::Type::pointer(); ptrs.len()],
+            call_args
+                .iter()
+                .map(|arg| match arg {
+                    CallArg::Ptr(_) => libffi::middle::Type::pointer(),
+                    CallArg::I32(_) => libffi::middle::Type::i32(),
+                    CallArg::F32(_) => libffi::middle::Type::f32(),
+                    CallArg::Bool(_) => libffi::middle::Type::u8(),
+                })
+                .collect::<Vec<_>>(),
             libffi::middle::Type::void(),
         );
-        let args: Vec<libffi::middle::Arg> =
-            ptrs.iter().map(|p| libffi::middle::arg(p)).collect();
+        let ffi_args: Vec<libffi::middle::Arg> = call_args
+            .iter()
+            .map(|arg| match arg {
+                CallArg::Ptr(value) => libffi::middle::arg(value),
+                CallArg::I32(value) => libffi::middle::arg(value),
+                CallArg::F32(value) => libffi::middle::arg(value),
+                CallArg::Bool(value) => libffi::middle::arg(value),
+            })
+            .collect();
 
         // SAFETY: We trust that the compiled kernel's signature matches
-        // the number and type of pointers we're passing.
+        // the number and type of arguments we're passing.
         unsafe {
             let func: libloading::Symbol<'_, fn()> = kernel.get_func()?;
             let code_ptr = libffi::high::CodePtr(func.into_raw().as_raw_ptr().cast());
-            cif.call::<()>(code_ptr, &args);
+            cif.call::<()>(code_ptr, &ffi_args);
         }
 
         Ok(())
@@ -403,15 +432,19 @@ mod tests {
             }
         ";
         let program = dev.compile(source, "add", 3).expect("compile failed");
-        let mut a = Buffer::from_f32(&[1.0, 2.0, 3.0]);
-        let mut b = Buffer::from_f32(&[4.0, 5.0, 6.0]);
-        let mut out = dev.allocate(DType::F32, 3);
+        let mut args = [
+            KernelArg::Buffer(dev.allocate(DType::F32, 3)),
+            KernelArg::Buffer(Buffer::from_f32(&[1.0, 2.0, 3.0])),
+            KernelArg::Buffer(Buffer::from_f32(&[4.0, 5.0, 6.0])),
+        ];
 
         // Act
-        dev.execute(&program, &mut [&mut out, &mut a, &mut b])
-            .unwrap();
+        dev.execute(&program, &mut args).unwrap();
 
         // Assert
+        let KernelArg::Buffer(out) = &args[0] else {
+            panic!("output arg should stay a buffer");
+        };
         assert_eq!(out.to_f32(), vec![5.0, 7.0, 9.0]);
     }
 
@@ -425,15 +458,19 @@ mod tests {
             }
         ";
         let program = dev.compile(source, "mul", 3).expect("compile failed");
-        let mut a = Buffer::from_f32(&[2.0, 3.0, 4.0]);
-        let mut b = Buffer::from_f32(&[5.0, 6.0, 7.0]);
-        let mut out = dev.allocate(DType::F32, 3);
+        let mut args = [
+            KernelArg::Buffer(dev.allocate(DType::F32, 3)),
+            KernelArg::Buffer(Buffer::from_f32(&[2.0, 3.0, 4.0])),
+            KernelArg::Buffer(Buffer::from_f32(&[5.0, 6.0, 7.0])),
+        ];
 
         // Act
-        dev.execute(&program, &mut [&mut out, &mut a, &mut b])
-            .unwrap();
+        dev.execute(&program, &mut args).unwrap();
 
         // Assert
+        let KernelArg::Buffer(out) = &args[0] else {
+            panic!("output arg should stay a buffer");
+        };
         assert_eq!(out.to_f32(), vec![10.0, 18.0, 28.0]);
     }
 
@@ -447,15 +484,48 @@ mod tests {
             }
         ";
         let program = dev.compile(source, "negate", 2).expect("compile failed");
-        let mut input = Buffer::from_f32(&[1.0, -2.0, 3.0]);
-        let mut output = dev.allocate(DType::F32, 3);
+        let mut args = [
+            KernelArg::Buffer(dev.allocate(DType::F32, 3)),
+            KernelArg::Buffer(Buffer::from_f32(&[1.0, -2.0, 3.0])),
+        ];
 
         // Act
-        dev.execute(&program, &mut [&mut output, &mut input])
-            .unwrap();
+        dev.execute(&program, &mut args).unwrap();
 
         // Assert
+        let KernelArg::Buffer(output) = &args[0] else {
+            panic!("output arg should stay a buffer");
+        };
         assert_eq!(output.to_f32(), vec![-1.0, 2.0, -3.0]);
+    }
+
+    #[test]
+    fn test_device_mixed_scalar_args() {
+        // Arrange
+        let dev = CpuDevice;
+        let source = r"
+            void add_offset(float* out, float* input, int offset, float scale) {
+                for (int i = 0; i < 2; i++) out[i] = (input[offset + i] * scale);
+            }
+        ";
+        let program = dev
+            .compile(source, "add_offset", 4)
+            .expect("compile failed");
+        let mut args = [
+            KernelArg::Buffer(dev.allocate(DType::F32, 2)),
+            KernelArg::Buffer(Buffer::from_f32(&[1.0, 2.0, 3.0, 4.0])),
+            KernelArg::I32(1),
+            KernelArg::F32(10.0),
+        ];
+
+        // Act
+        dev.execute(&program, &mut args).unwrap();
+
+        // Assert
+        let KernelArg::Buffer(output) = &args[0] else {
+            panic!("output arg should stay a buffer");
+        };
+        assert_eq!(output.to_f32(), vec![20.0, 30.0]);
     }
 
     #[test]

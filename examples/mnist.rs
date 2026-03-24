@@ -10,7 +10,7 @@
 
 use std::io::Read;
 
-use ferrograd::tensor::{IndexVar, Tensor};
+use ferrograd::tensor::Tensor;
 
 // ── MNIST data loading ──────────────────────────────────────────────────
 
@@ -124,8 +124,7 @@ fn main() {
     );
 
     let mut w1 = rand_tensor(&[784, 128], (2.0 / 784.0_f32).sqrt()).with_requires_grad(true);
-    let mut b1 =
-        Tensor::zeros(&[1, 128], ferrograd::dtype::DType::F32).with_requires_grad(true);
+    let mut b1 = Tensor::zeros(&[1, 128], ferrograd::dtype::DType::F32).with_requires_grad(true);
     let mut w2 = rand_tensor(&[128, 10], (1.0 / 128.0_f32).sqrt()).with_requires_grad(true);
     let mut b2 = Tensor::zeros(&[1, 10], ferrograd::dtype::DType::F32).with_requires_grad(true);
 
@@ -136,16 +135,13 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(num_batches);
-    let batch_start = IndexVar::new("batch_start", 0, train_count - batch_size);
-
     for epoch in 0..epochs {
         let mut epoch_loss = 0.0_f32;
 
         for batch_idx in 0..max_batches.min(num_batches) {
             let start = batch_idx * batch_size;
-            let start = batch_start.bind(start);
-            let batch_x = train_images.narrow_var(0, &start, batch_size);
-            let batch_t = train_targets.narrow_var(0, &start, batch_size);
+            let batch_x = train_images.narrow(0, start, batch_size);
+            let batch_t = train_targets.narrow(0, start, batch_size);
 
             let hidden = batch_x.matmul(&w1).add(&b1).relu();
             let logits = hidden.matmul(&w2).add(&b2);

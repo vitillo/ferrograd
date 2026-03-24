@@ -9,18 +9,22 @@ pub mod rangeify;
 use std::collections::{HashMap, HashSet};
 
 use crate::dtype::DType;
-use crate::device::Buffer;
-use crate::runtime::{self, BufferId};
 use crate::rewrite::graph_rewrite;
+use crate::runtime::{self, BufferId};
 use crate::shape::Shape;
 use crate::uop::{Arg, Op, UOp};
 
+#[derive(Clone)]
 /// A runtime input to a compiled kernel.
 pub enum KernelInput {
     /// A realized tensor buffer identified in device state.
     Buffer(BufferId),
-    /// A one-element scalar buffer materialized for this execution.
-    Scalar(Buffer),
+    /// A scalar `i32` input.
+    I32(i32),
+    /// A scalar `f32` input.
+    F32(f32),
+    /// A scalar boolean input.
+    Bool(bool),
 }
 
 /// A single kernel to compile and execute.
@@ -87,27 +91,52 @@ fn parameterize(expr: &UOp) -> ScheduleItem {
                             let mut inputs = inputs.borrow_mut();
                             let slot = inputs.len() + 1;
                             inputs.push(KernelInput::Buffer(*id));
-                            UOp::param(slot, dtype, *numel, expr.device())
+                            UOp::param_buffer(slot, dtype, *numel, expr.device())
                         })
                         .clone(),
                 )
             }
             Op::Bind => {
                 let variable = node.srcs()[0].clone();
-                let literal = node.srcs()[1].arg().clone();
+                let literal = scalar_input(node.srcs()[1].arg());
                 let mut scalar_params = scalar_params.borrow_mut();
                 let param = scalar_params
                     .entry(variable)
                     .or_insert_with(|| {
                         let mut inputs = inputs.borrow_mut();
                         let slot = inputs.len() + 1;
-                        inputs.push(KernelInput::Scalar(literal_buffer(node.dtype(), &literal)));
-                        UOp::param(slot, node.dtype(), 1, expr.device())
+                        inputs.push(literal.clone());
+                        UOp::param_scalar(slot, node.dtype(), expr.device())
                     })
                     .clone();
-                let zero = UOp::const_int(0, DType::I32, expr.device());
-                let index = UOp::new(Op::Index, node.dtype(), vec![param, zero], Arg::Index(0));
-                Some(UOp::new(Op::Load, node.dtype(), vec![index], Arg::None))
+                Some(param)
+            }
+            Op::Shrink => {
+                let Arg::Bounds(lengths) = node.arg() else {
+                    return None;
+                };
+                let src_shape = node.srcs()[0].shape()?;
+
+                let mut changed = false;
+                let mut new_srcs = vec![node.srcs()[0].clone()];
+                for ((axis, start), &len) in node.srcs()[1..].iter().enumerate().zip(lengths.iter())
+                {
+                    if len != src_shape[axis] && start.op() == Op::Const {
+                        let slot = {
+                            let mut inputs = inputs.borrow_mut();
+                            let slot = inputs.len() + 1;
+                            inputs.push(scalar_input(start.arg()));
+                            slot
+                        };
+                        let param = UOp::param_scalar(slot, start.dtype(), expr.device());
+                        new_srcs.push(param);
+                        changed = true;
+                        continue;
+                    }
+                    new_srcs.push(start.clone());
+                }
+
+                changed.then(|| UOp::new(Op::Shrink, node.dtype(), new_srcs, node.arg().clone()))
             }
             _ => None,
         }
@@ -116,7 +145,7 @@ fn parameterize(expr: &UOp) -> ScheduleItem {
     let parameterized = graph_rewrite(expr, &rewrite_inputs, "schedule");
     let out_shape = parameterized.shape().unwrap_or_else(|| Shape::flat(1));
     let output_id = state.reserve_buffer(expr.dtype(), out_shape.numel());
-    let out_param = UOp::param(0, expr.dtype(), out_shape.numel(), expr.device());
+    let out_param = UOp::param_buffer(0, expr.dtype(), out_shape.numel(), expr.device());
     let store = UOp::new(
         Op::Store,
         DType::Void,
@@ -134,18 +163,14 @@ fn parameterize(expr: &UOp) -> ScheduleItem {
     }
 }
 
-fn literal_buffer(dtype: DType, literal: &Arg) -> Buffer {
+fn scalar_input(literal: &Arg) -> KernelInput {
     match literal {
         #[allow(clippy::cast_possible_truncation)]
-        Arg::Float(value) => Buffer::from_f32(&[*value as f32]),
+        Arg::Float(value) => KernelInput::F32(*value as f32),
         Arg::Int(value) => {
-            let value = i32::try_from(*value).expect("kernel scalar int must fit in i32");
-            let bytes = value.to_ne_bytes().to_vec();
-            Buffer::new(dtype, 1, crate::device::Storage::Cpu(bytes))
+            KernelInput::I32(i32::try_from(*value).expect("kernel scalar int must fit in i32"))
         }
-        Arg::Bool(value) => {
-            Buffer::new(dtype, 1, crate::device::Storage::Cpu(vec![u8::from(*value)]))
-        }
+        Arg::Bool(value) => KernelInput::Bool(*value),
         _ => panic!("kernel scalar input must be a literal"),
     }
 }
@@ -184,7 +209,10 @@ fn should_materialize(
     if matches!(node.op(), Op::Buffer | Op::Const | Op::DefineVar | Op::Bind) {
         return false;
     }
-    if consumer_map.get(node).is_some_and(|consumers| consumers.len() > 1) {
+    if consumer_map
+        .get(node)
+        .is_some_and(|consumers| consumers.len() > 1)
+    {
         return true;
     }
     if node.op() == Op::ReduceAxis
@@ -224,7 +252,11 @@ fn substitute_materialized(root: &UOp, replacements: &HashMap<UOp, UOp>) -> UOp 
             .iter()
             .map(|src| substituted.get(src).cloned().unwrap_or_else(|| src.clone()))
             .collect();
-        let changed = node.srcs().iter().zip(&new_srcs).any(|(old, new)| old != new);
+        let changed = node
+            .srcs()
+            .iter()
+            .zip(&new_srcs)
+            .any(|(old, new)| old != new);
         let rewritten = if changed {
             UOp::new(node.op(), node.dtype(), new_srcs, node.arg().clone())
         } else {
@@ -242,8 +274,8 @@ fn substitute_materialized(root: &UOp, replacements: &HashMap<UOp, UOp>) -> UOp 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::DeviceId;
     use crate::device::Buffer;
+    use crate::device::DeviceId;
     use crate::runtime;
 
     fn buffer_uop(data: &[f32], shape: &[usize]) -> UOp {
@@ -281,5 +313,31 @@ mod tests {
         assert!(matches!(items[2].inputs[0], KernelInput::Buffer(id) if id == items[0].output_id));
         assert!(matches!(items[3].inputs[0], KernelInput::Buffer(id) if id == items[1].output_id));
         assert!(matches!(items[3].inputs[1], KernelInput::Buffer(id) if id == items[2].output_id));
+    }
+
+    #[test]
+    fn test_parameterize_gives_each_shrink_occurrence_its_own_scalar_input() {
+        runtime::clear_for_tests(DeviceId::Cpu);
+        let input = buffer_uop(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]);
+        let zero = UOp::const_int(0, DType::I32, DeviceId::Cpu);
+
+        let left = UOp::shrink(input.clone(), &[zero.clone(), zero.clone()], &[2, 2]);
+        let reshaped = UOp::reshape(input, Shape::from([3, 2]));
+        let right = UOp::shrink(reshaped, &[zero.clone(), zero], &[2, 2]);
+        let expr = UOp::add(left, right);
+
+        let items = schedule(&expr);
+        let scalar_count = items
+            .iter()
+            .flat_map(|item| item.inputs.iter())
+            .filter(|input| {
+                matches!(
+                    input,
+                    KernelInput::I32(_) | KernelInput::F32(_) | KernelInput::Bool(_)
+                )
+            })
+            .count();
+
+        assert_eq!(scalar_count, 2);
     }
 }

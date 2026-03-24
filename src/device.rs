@@ -186,6 +186,19 @@ impl Buffer {
     }
 }
 
+/// A runtime argument passed to a compiled kernel.
+#[derive(Debug, Clone)]
+pub enum KernelArg {
+    /// Tensor storage passed by pointer.
+    Buffer(Buffer),
+    /// Scalar `i32` argument used in indexing and loop bounds.
+    I32(i32),
+    /// Scalar `f32` argument.
+    F32(f32),
+    /// Scalar boolean argument.
+    Bool(bool),
+}
+
 /// A compiled program ready to be executed on a device.
 ///
 /// Each backend has its own program representation. `CpuDevice` wraps a
@@ -196,8 +209,8 @@ pub enum Program {
     Cpu {
         /// The compiled shared library containing the kernel.
         kernel: cpu::CompiledKernel,
-        /// Number of buffer arguments the kernel expects.
-        num_bufs: usize,
+        /// Number of runtime arguments the kernel expects.
+        num_args: usize,
     },
     // Future: Cuda { module: CudaModule, func: CudaFunction, ... }
 }
@@ -223,15 +236,15 @@ pub trait Device {
         &self,
         source: &str,
         func_name: &str,
-        num_bufs: usize,
+        num_args: usize,
     ) -> Result<Program, DeviceError>;
 
-    /// Execute a compiled program with the given buffer arguments.
+    /// Execute a compiled program with the given runtime arguments.
     ///
     /// # Errors
     ///
     /// Returns [`DeviceError`] if execution fails (e.g. symbol lookup).
-    fn execute(&self, program: &Program, bufs: &mut [&mut Buffer]) -> Result<(), DeviceError>;
+    fn execute(&self, program: &Program, args: &mut [KernelArg]) -> Result<(), DeviceError>;
 }
 
 #[cfg(test)]
