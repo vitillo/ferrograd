@@ -26,6 +26,7 @@
 //! - [`rewrite_index_alu`] — math ops: push Index into each operand
 //! - [`rewrite_index_movement`] — Reshape/Permute/Expand: transform the indices
 //! - [`rewrite_index_reduce`] — `ReduceAxis`: create inner loop ranges for reduced axes
+//! - [`rewrite_index_const`] — Const (leaf): scalars broadcast, just drop the index
 //! - [`rewrite_index_param`] — Param (leaf): convert to a flat Load — we're done
 
 use crate::dtype::DType;
@@ -236,6 +237,20 @@ pub fn rewrite_index_reduce(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
     let mut reduce_srcs = vec![indexed_src];
     reduce_srcs.extend(reduce_ranges);
     Some(UOp::new(Op::Reduce, inner.dtype(), reduce_srcs, Arg::Reduce(*reduce_op, vec![])))
+}
+
+/// **Const rule** (terminal): `Index(Const, [...])` → `Const`
+///
+/// Constants are scalars — they have the same value regardless of index.
+/// This arises in gradient computation where rules create `Const(0.0)` nodes
+/// (e.g. the zero branch of Where's gradient). The constant just passes
+/// through without any memory access.
+#[must_use]
+pub fn rewrite_index_const(inner: &UOp, _idxs: &[UOp]) -> Option<UOp> {
+    if inner.op() != Op::Const {
+        return None;
+    }
+    Some(inner.clone())
 }
 
 /// **Param rule** (terminal): `Index(Param, [flat_idx])` → `Load(Index(Param, flat_idx))`
