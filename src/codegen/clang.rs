@@ -19,20 +19,34 @@ impl Renderer for ClangRenderer {
 
         let order = root.toposort();
 
-        // Collect Param nodes for function signature.
-        let mut params: Vec<(usize, DType)> = Vec::new();
+        // Collect kernel parameter nodes for function signature.
+        let mut params: Vec<(usize, DType, bool)> = Vec::new();
         for node in &order {
-            if node.op() == Op::Param {
-                if let Arg::Param(slot, _) = node.arg() {
-                    params.push((*slot, node.dtype()));
+            match node.op() {
+                Op::ParamBuffer => {
+                    if let Arg::ParamBuffer(slot, _) = node.arg() {
+                        params.push((*slot, node.dtype(), true));
+                    }
                 }
+                Op::ParamScalar => {
+                    if let Arg::ParamScalar(slot) = node.arg() {
+                        params.push((*slot, node.dtype(), false));
+                    }
+                }
+                _ => {}
             }
         }
-        params.sort_by_key(|(slot, _)| *slot);
+        params.sort_by_key(|(slot, _, _)| *slot);
 
         let args: Vec<String> = params
             .iter()
-            .map(|(slot, dtype)| format!("{}* restrict data{slot}", dtype.c_type()))
+            .map(|(slot, dtype, is_buffer)| {
+                if *is_buffer {
+                    format!("{}* restrict data{slot}", dtype.c_type())
+                } else {
+                    format!("{} data{slot}", dtype.c_type())
+                }
+            })
             .collect();
         let mut out = format!("#include <math.h>\nvoid {name}({}) {{\n", args.join(", "));
 
@@ -87,8 +101,13 @@ impl Renderer for ClangRenderer {
                 .collect();
 
             match node.op() {
-                Op::Param => {
-                    if let Arg::Param(slot, _) = node.arg() {
+                Op::ParamBuffer => {
+                    if let Arg::ParamBuffer(slot, _) = node.arg() {
+                        names.insert(node, format!("data{slot}"));
+                    }
+                }
+                Op::ParamScalar => {
+                    if let Arg::ParamScalar(slot) = node.arg() {
                         names.insert(node, format!("data{slot}"));
                     }
                 }
@@ -243,7 +262,13 @@ impl Renderer for ClangRenderer {
                     names.insert(node, acc_var);
                 }
                 // Sink, End, Store, After, Buffer handled above.
-                Op::Sink | Op::End | Op::Store | Op::After | Op::Buffer | Op::Device | Op::DefineVar => {
+                Op::Sink
+                | Op::End
+                | Op::Store
+                | Op::After
+                | Op::Buffer
+                | Op::Device
+                | Op::DefineVar => {
                     unreachable!()
                 }
                 // Tensor-level and unexpanded ops should be lowered before codegen.
@@ -267,13 +292,13 @@ impl Renderer for ClangRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{CpuDevice, Device, DeviceId};
+    use crate::device::{CpuDevice, Device, DeviceId, KernelArg};
 
     fn build_add_graph(n: i64) -> UOp {
         let device = DeviceId::Cpu;
-        let out_ptr = UOp::param(0, DType::F32, 3, device);
-        let a_ptr = UOp::param(1, DType::F32, 3, device);
-        let b_ptr = UOp::param(2, DType::F32, 3, device);
+        let out_ptr = UOp::param_buffer(0, DType::F32, 3, device);
+        let a_ptr = UOp::param_buffer(1, DType::F32, 3, device);
+        let b_ptr = UOp::param_buffer(2, DType::F32, 3, device);
         let bound = UOp::const_int(n, DType::I32, device);
         let idx = UOp::new(Op::Range, DType::I32, vec![bound], Arg::Index(0));
         let a_idx = UOp::new(Op::Index, a_ptr.dtype(), vec![a_ptr, idx.clone()], Arg::None);
@@ -307,19 +332,24 @@ mod tests {
 
         let dev = CpuDevice;
         let program = dev.compile(&code, "add", 3).expect("compile failed");
-        let mut a = crate::device::Buffer::from_f32(&[1.0, 2.0, 3.0]);
-        let mut b = crate::device::Buffer::from_f32(&[4.0, 5.0, 6.0]);
-        let mut out = dev.allocate(DType::F32, 3);
+        let mut args = [
+            KernelArg::Buffer(dev.allocate(DType::F32, 3)),
+            KernelArg::Buffer(crate::device::Buffer::from_f32(&[1.0, 2.0, 3.0])),
+            KernelArg::Buffer(crate::device::Buffer::from_f32(&[4.0, 5.0, 6.0])),
+        ];
 
-        dev.execute(&program, &mut [&mut out, &mut a, &mut b]).unwrap();
+        dev.execute(&program, &mut args).unwrap();
+        let KernelArg::Buffer(out) = &args[0] else {
+            panic!("output arg should stay a buffer");
+        };
         assert_eq!(out.to_f32(), vec![5.0, 7.0, 9.0]);
     }
 
     #[test]
     fn test_render_negate_kernel() {
         let device = DeviceId::Cpu;
-        let out_ptr = UOp::param(0, DType::F32, 3, device);
-        let a_ptr = UOp::param(1, DType::F32, 3, device);
+        let out_ptr = UOp::param_buffer(0, DType::F32, 3, device);
+        let a_ptr = UOp::param_buffer(1, DType::F32, 3, device);
         let n = UOp::const_int(3, DType::I32, device);
         let idx = UOp::new(Op::Range, DType::I32, vec![n], Arg::Index(0));
         let a_idx = UOp::new(Op::Index, a_ptr.dtype(), vec![a_ptr, idx.clone()], Arg::None);
@@ -333,18 +363,23 @@ mod tests {
         let code = ClangRenderer.render(&sink, "negate");
         let dev = CpuDevice;
         let program = dev.compile(&code, "negate", 2).expect("compile failed");
-        let mut a = crate::device::Buffer::from_f32(&[1.0, -2.0, 3.0]);
-        let mut out = dev.allocate(DType::F32, 3);
+        let mut args = [
+            KernelArg::Buffer(dev.allocate(DType::F32, 3)),
+            KernelArg::Buffer(crate::device::Buffer::from_f32(&[1.0, -2.0, 3.0])),
+        ];
 
-        dev.execute(&program, &mut [&mut out, &mut a]).unwrap();
+        dev.execute(&program, &mut args).unwrap();
+        let KernelArg::Buffer(out) = &args[0] else {
+            panic!("output arg should stay a buffer");
+        };
         assert_eq!(out.to_f32(), vec![-1.0, 2.0, -3.0]);
     }
 
     #[test]
     fn test_render_relu_kernel() {
         let device = DeviceId::Cpu;
-        let out_ptr = UOp::param(0, DType::F32, 4, device);
-        let a_ptr = UOp::param(1, DType::F32, 4, device);
+        let out_ptr = UOp::param_buffer(0, DType::F32, 4, device);
+        let a_ptr = UOp::param_buffer(1, DType::F32, 4, device);
         let n = UOp::const_int(4, DType::I32, device);
         let zero = UOp::const_float(0.0, DType::F32, device);
         let idx = UOp::new(Op::Range, DType::I32, vec![n], Arg::Index(0));
@@ -360,10 +395,15 @@ mod tests {
         let code = ClangRenderer.render(&sink, "relu");
         let dev = CpuDevice;
         let program = dev.compile(&code, "relu", 2).expect("compile failed");
-        let mut a = crate::device::Buffer::from_f32(&[1.0, -2.0, 3.0, -4.0]);
-        let mut out = dev.allocate(DType::F32, 4);
+        let mut args = [
+            KernelArg::Buffer(dev.allocate(DType::F32, 4)),
+            KernelArg::Buffer(crate::device::Buffer::from_f32(&[1.0, -2.0, 3.0, -4.0])),
+        ];
 
-        dev.execute(&program, &mut [&mut out, &mut a]).unwrap();
+        dev.execute(&program, &mut args).unwrap();
+        let KernelArg::Buffer(out) = &args[0] else {
+            panic!("output arg should stay a buffer");
+        };
         assert_eq!(out.to_f32(), vec![1.0, 0.0, 3.0, 0.0]);
     }
 }

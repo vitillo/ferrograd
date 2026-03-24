@@ -5,12 +5,12 @@
 //! device.
 
 use std::rc::Rc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use crate::codegen::{ClangRenderer, Renderer};
-use crate::device::{Buffer, DeviceId};
+use crate::device::{Buffer, DeviceId, KernelArg};
 use crate::dtype::DType;
 use crate::gradient;
 use crate::runtime;
@@ -32,56 +32,6 @@ static KERNEL_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub struct Tensor {
     uop: UOp,
     requires_grad: bool,
-}
-
-/// A reusable symbolic index variable for view-based slicing.
-///
-/// Tinygrad models these as `DEFINE_VAR` + `BIND`. We expose a tiny wrapper so
-/// callers can reuse the same variable identity across many executions without
-/// touching raw `UOp`s.
-#[derive(Clone)]
-pub struct IndexVar {
-    name: String,
-    min: usize,
-    max: usize,
-}
-
-impl IndexVar {
-    /// Create a symbolic index variable with inclusive `[min, max]` bounds.
-    #[must_use]
-    pub fn new(name: &str, min: usize, max: usize) -> Self {
-        Self {
-            name: name.to_string(),
-            min,
-            max,
-        }
-    }
-
-    /// Bind a concrete value to this variable for one execution.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `value` falls outside the variable's declared range.
-    #[must_use]
-    pub fn bind(&self, value: usize) -> BoundIndex {
-        assert!(
-            self.min <= value && value <= self.max,
-            "bind value {value} out of range [{}, {}]",
-            self.min,
-            self.max
-        );
-        BoundIndex {
-            var: self.clone(),
-            value,
-        }
-    }
-}
-
-/// A concrete binding of an [`IndexVar`].
-#[derive(Clone)]
-pub struct BoundIndex {
-    var: IndexVar,
-    value: usize,
 }
 
 impl Tensor {
@@ -327,6 +277,10 @@ impl Tensor {
     /// keep all dimensions unchanged except `dim`, which becomes
     /// `[start, start + len)`.
     ///
+    /// The scheduler lifts the narrowed axis start into a scalar kernel input,
+    /// so repeated calls with different `start` values can still reuse one
+    /// compiled kernel.
+    ///
     /// # Panics
     ///
     /// Panics if `dim` is out of range or if `start..start + len` is not a
@@ -336,30 +290,6 @@ impl Tensor {
         let start = bound_const(start, self.device());
         self.narrow_with_start(dim, &start, len)
     }
-
-    /// Slice a single dimension using a symbolic start variable.
-    ///
-    /// Reusing the same [`IndexVar`] across executions lets the scheduler keep
-    /// one kernel shape while only the bound value changes at runtime.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `dim` is out of range or if `start..start + len` cannot fit
-    /// within that dimension.
-        #[must_use]
-        pub fn narrow_var(&self, dim: usize, start: &BoundIndex, len: usize) -> Self {
-            let var = UOp::variable(
-                &start.var.name,
-                i64::try_from(start.var.min).expect("index var min must fit in i64"),
-                i64::try_from(start.var.max).expect("index var max must fit in i64"),
-                self.device(),
-            );
-            let bound = UOp::bind(
-                var,
-                i64::try_from(start.value).expect("bound index value must fit in i64"),
-            );
-            self.narrow_with_start(dim, &bound, len)
-        }
 
     fn narrow_with_start(&self, dim: usize, start: &UOp, len: usize) -> Self {
         let shape = self.shape();
@@ -545,7 +475,12 @@ impl Tensor {
         }
 
         let last = items.last().expect("schedule produced no items");
-        let buffer = UOp::buffer(last.output_id, self.dtype(), last.out_shape.numel(), self.device());
+        let buffer = UOp::buffer(
+            last.output_id,
+            self.dtype(),
+            last.out_shape.numel(),
+            self.device(),
+        );
         Self {
             uop: UOp::reshape(buffer, last.out_shape.clone()),
             requires_grad: self.requires_grad,
@@ -556,18 +491,15 @@ impl Tensor {
         let state = runtime::state(self.device());
         let debug = *DEBUG;
         let lowered = rangeify(&item.sink);
-        let lowered = crate::rewrite::graph_rewrite(
-            &lowered,
-            &crate::rewrite::symbolic_simple,
-            "symbolic",
-        );
+        let lowered =
+            crate::rewrite::graph_rewrite(&lowered, &crate::rewrite::symbolic_simple, "symbolic");
         assert_codegen_ready(&lowered);
 
-        let num_bufs = item.inputs.len() + 1;
+        let num_args = item.inputs.len() + 1;
         let program = if let Some(program) = state.cached_program(&lowered) {
             if debug >= 1 {
                 let kid = KERNEL_COUNT.fetch_add(1, Ordering::Relaxed);
-                eprintln!("*** CPU {kid:>4}  (cached)         arg {num_bufs:>2}");
+                eprintln!("*** CPU {kid:>4}  (cached)         arg {num_args:>2}");
             }
             program
         } else {
@@ -585,41 +517,40 @@ impl Tensor {
             let program = Rc::new(
                 state
                     .device()
-                    .compile(&code, &name, num_bufs)
+                    .compile(&code, &name, num_args)
                     .expect("compile failed"),
             );
 
             if debug >= 2 {
-                eprintln!("*** CPU {kid:>4}  {name:<16} arg {num_bufs:>2}  (compiled)");
+                eprintln!("*** CPU {kid:>4}  {name:<16} arg {num_args:>2}  (compiled)");
             } else if debug >= 1 {
-                eprintln!("*** CPU {kid:>4}  {name:<16} arg {num_bufs:>2}");
+                eprintln!("*** CPU {kid:>4}  {name:<16} arg {num_args:>2}");
             }
 
             state.insert_program(lowered.clone(), program.clone());
             program
         };
 
-        let mut out = state.device().allocate(item.out_dtype, item.out_shape.numel());
-        let mut input_copies: Vec<Buffer> = item
+        let out = state.device().allocate(item.out_dtype, item.out_shape.numel());
+        let mut args: Vec<KernelArg> = Vec::with_capacity(num_args);
+        args.push(KernelArg::Buffer(out));
+        let input_args = item
             .inputs
             .iter()
             .map(|input| match input {
-                schedule::KernelInput::Buffer(id) => {
-                    state.load_buffer(*id).expect("scheduled input buffer missing")
-                }
-                schedule::KernelInput::Scalar(buffer) => buffer.clone(),
-            })
-            .collect();
-        let mut buf_refs: Vec<&mut Buffer> = Vec::with_capacity(num_bufs);
-        buf_refs.push(&mut out);
-        for buffer in &mut input_copies {
-            buf_refs.push(buffer);
-        }
+                schedule::KernelInput::Buffer(id) => KernelArg::Buffer(
+                    state.load_buffer(*id).expect("scheduled input buffer missing"),
+                ),
+                schedule::KernelInput::I32(value) => KernelArg::I32(*value),
+                schedule::KernelInput::F32(value) => KernelArg::F32(*value),
+                schedule::KernelInput::Bool(value) => KernelArg::Bool(*value),
+            });
+        args.extend(input_args);
 
         let t0 = Instant::now();
         state
             .device()
-            .execute(&program, &mut buf_refs)
+            .execute(&program, &mut args)
             .expect("execution failed");
 
         if debug >= 2 {
@@ -629,6 +560,9 @@ impl Tensor {
                 elapsed.as_secs_f64() * 1000.0,
             );
         }
+        let KernelArg::Buffer(out) = args.remove(0) else {
+            panic!("output kernel arg must remain a buffer");
+        };
         state
             .write_buffer(item.output_id, out)
             .expect("failed to store kernel output");
@@ -665,7 +599,9 @@ impl Tensor {
     #[must_use]
     pub fn gradient(&self, targets: &[&Self]) -> Vec<Self> {
         assert!(
-            targets.iter().all(|target| self.device() == target.device()),
+            targets
+                .iter()
+                .all(|target| self.device() == target.device()),
             "gradient targets must share the same device"
         );
 
@@ -731,17 +667,24 @@ fn broadcast_shapes(left: &Tensor, right: &Tensor) -> (Tensor, Tensor) {
         left.device() == right.device(),
         "broadcast requires tensors on the same device"
     );
-    let target = left.shape().broadcast_with(&right.shape()).unwrap_or_else(|| {
-        panic!(
-            "broadcast: incompatible dims for {:?} vs {:?}",
-            left.shape(),
-            right.shape()
-        )
-    });
+    let target = left
+        .shape()
+        .broadcast_with(&right.shape())
+        .unwrap_or_else(|| {
+            panic!(
+                "broadcast: incompatible dims for {:?} vs {:?}",
+                left.shape(),
+                right.shape()
+            )
+        });
     let left_shape = left.shape().pad_left(target.ndim());
     let right_shape = right.shape().pad_left(target.ndim());
-    let left = left.reshape(left_shape.as_slice()).expand(target.as_slice());
-    let right = right.reshape(right_shape.as_slice()).expand(target.as_slice());
+    let left = left
+        .reshape(left_shape.as_slice())
+        .expand(target.as_slice());
+    let right = right
+        .reshape(right_shape.as_slice())
+        .expand(target.as_slice());
     (left, right)
 }
 
@@ -870,18 +813,17 @@ mod tests {
     }
 
     #[test]
-    fn test_narrow_var_reuses_kernel_cache_across_bindings() {
+    fn test_narrow_reuses_kernel_cache_across_starts() {
         // Arrange.
         runtime::clear_for_tests(dev());
         let x = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]);
-        let start = IndexVar::new("batch_start", 0, 1);
 
         // Act.
-        let first = x.narrow_var(0, &start.bind(0), 2);
+        let first = x.narrow(0, 0, 2);
         assert_eq!(first.to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
         let after_first = runtime::kernel_cache_len(dev());
 
-        let second = x.narrow_var(0, &start.bind(1), 2);
+        let second = x.narrow(0, 1, 2);
         assert_eq!(second.to_vec(), vec![3.0, 4.0, 5.0, 6.0]);
 
         // Assert.

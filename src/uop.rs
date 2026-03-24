@@ -38,7 +38,9 @@ pub enum Op {
     /// Reduce over tensor axes.
     ReduceAxis,
     /// A kernel buffer parameter.
-    Param,
+    ParamBuffer,
+    /// A kernel scalar parameter.
+    ParamScalar,
     /// Loop from 0 to bound.
     Range,
     /// Close a `Range` loop.
@@ -120,8 +122,10 @@ pub enum Arg {
     Variable(String, i64, i64),
     /// Axis id for `Range`, or sentinel tag for kernel-level `Index`.
     Index(usize),
-    /// Kernel parameter slot and flattened element count.
-    Param(usize, usize),
+    /// Kernel buffer parameter slot and flattened element count.
+    ParamBuffer(usize, usize),
+    /// Kernel scalar parameter slot.
+    ParamScalar(usize),
     /// Float literal.
     Float(f64),
     /// Integer literal.
@@ -150,7 +154,8 @@ impl PartialEq for Arg {
                 name_a == name_b && min_a == min_b && max_a == max_b
             }
             (Self::Index(a), Self::Index(b)) => a == b,
-            (Self::Param(sa, na), Self::Param(sb, nb)) => sa == sb && na == nb,
+            (Self::ParamBuffer(sa, na), Self::ParamBuffer(sb, nb)) => sa == sb && na == nb,
+            (Self::ParamScalar(a), Self::ParamScalar(b)) => a == b,
             (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
             (Self::Int(a), Self::Int(b)) => a == b,
             (Self::Bool(a), Self::Bool(b)) => a == b,
@@ -180,10 +185,11 @@ impl std::hash::Hash for Arg {
                 max.hash(state);
             }
             Self::Index(i) => i.hash(state),
-            Self::Param(slot, numel) => {
+            Self::ParamBuffer(slot, numel) => {
                 slot.hash(state);
                 numel.hash(state);
             }
+            Self::ParamScalar(slot) => slot.hash(state),
             Self::Float(value) => value.to_bits().hash(state),
             Self::Int(value) => value.hash(state),
             Self::Bool(value) => value.hash(state),
@@ -209,7 +215,8 @@ impl fmt::Display for Arg {
             Self::Device(device) => write!(f, "{device:?}"),
             Self::Variable(name, min, max) => write!(f, "{name}[{min}, {max}]"),
             Self::Index(i) => write!(f, "{i}"),
-            Self::Param(slot, numel) => write!(f, "slot={slot},n={numel}"),
+            Self::ParamBuffer(slot, numel) => write!(f, "buf_slot={slot},n={numel}"),
+            Self::ParamScalar(slot) => write!(f, "scalar_slot={slot}"),
             Self::Float(v) => write!(f, "{v}"),
             Self::Int(v) => write!(f, "{v}"),
             Self::Bool(v) => write!(f, "{v}"),
@@ -279,28 +286,29 @@ impl UOp {
         Self::build(device, Op::Device, DType::Void, vec![], Arg::Device(device))
     }
 
-    /// Create a symbolic integer variable leaf.
+    /// Create a kernel buffer parameter leaf on `device`.
     #[must_use]
-    pub(crate) fn variable(name: &str, min: i64, max: i64, device: DeviceId) -> Self {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn param_buffer(slot: usize, dtype: DType, numel: usize, device: DeviceId) -> Self {
         Self::build(
             device,
-            Op::DefineVar,
-            DType::I32,
+            Op::ParamBuffer,
+            dtype,
             vec![Self::device_uop(device)],
-            Arg::Variable(name.to_string(), min, max),
+            Arg::ParamBuffer(slot, numel),
         )
     }
 
-    /// Create a kernel parameter leaf on `device`.
+    /// Create a kernel scalar parameter leaf on `device`.
     #[must_use]
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn param(slot: usize, dtype: DType, numel: usize, device: DeviceId) -> Self {
+    pub(crate) fn param_scalar(slot: usize, dtype: DType, device: DeviceId) -> Self {
         Self::build(
             device,
-            Op::Param,
+            Op::ParamScalar,
             dtype,
             vec![Self::device_uop(device)],
-            Arg::Param(slot, numel),
+            Arg::ParamScalar(slot),
         )
     }
 
@@ -353,25 +361,6 @@ impl UOp {
             vec![Self::device_uop(device)],
             Arg::Bool(value),
         )
-    }
-
-    /// Bind a concrete value to a symbolic variable.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `var` is not a `DefineVar` or if `value` is out of range.
-    #[must_use]
-    pub(crate) fn bind(var: Self, value: i64) -> Self {
-        let Arg::Variable(_, min, max) = var.arg() else {
-            panic!("Bind requires a DefineVar source");
-        };
-        assert!(
-            *min <= value && value <= *max,
-            "bind value {value} out of range [{min}, {max}]"
-        );
-        let device = var.device();
-        let value_uop = Self::const_int(value, DType::I32, device);
-        Self::new(Op::Bind, DType::I32, vec![var, value_uop], Arg::None)
     }
 
     /// Return the device this node belongs to.
@@ -433,8 +422,8 @@ impl UOp {
                 };
                 Some(Shape::flat(*numel))
             }
-            Op::Param => {
-                let Arg::Param(_, numel) = self.arg() else {
+            Op::ParamBuffer => {
+                let Arg::ParamBuffer(_, numel) = self.arg() else {
                     return None;
                 };
                 Some(Shape::flat(*numel))
@@ -474,7 +463,7 @@ impl UOp {
                 ))
             }
             Op::Const => Some(Shape::flat(1)),
-            Op::Device | Op::DefineVar | Op::Bind => None,
+            Op::ParamScalar | Op::Device | Op::DefineVar | Op::Bind => None,
             op if op.is_alu() => self.srcs()[0].shape(),
             _ => None,
         }
@@ -693,17 +682,32 @@ mod tests {
     #[test]
     fn test_build_elementwise_add_kernel() {
         let device = DeviceId::Cpu;
-        let out_ptr = UOp::param(0, DType::F32, 1024, device);
-        let a_ptr = UOp::param(1, DType::F32, 1024, device);
-        let b_ptr = UOp::param(2, DType::F32, 1024, device);
+        let out_ptr = UOp::param_buffer(0, DType::F32, 1024, device);
+        let a_ptr = UOp::param_buffer(1, DType::F32, 1024, device);
+        let b_ptr = UOp::param_buffer(2, DType::F32, 1024, device);
         let n = UOp::const_int(1024, DType::I32, device);
         let idx = UOp::new(Op::Range, DType::I32, vec![n], Arg::Index(0));
-        let a_idx = UOp::new(Op::Index, a_ptr.dtype(), vec![a_ptr, idx.clone()], Arg::None);
+        let a_idx = UOp::new(
+            Op::Index,
+            a_ptr.dtype(),
+            vec![a_ptr, idx.clone()],
+            Arg::None,
+        );
         let a_val = UOp::new(Op::Load, DType::F32, vec![a_idx], Arg::None);
-        let b_idx = UOp::new(Op::Index, b_ptr.dtype(), vec![b_ptr, idx.clone()], Arg::None);
+        let b_idx = UOp::new(
+            Op::Index,
+            b_ptr.dtype(),
+            vec![b_ptr, idx.clone()],
+            Arg::None,
+        );
         let b_val = UOp::new(Op::Load, DType::F32, vec![b_idx], Arg::None);
         let sum = UOp::add(a_val, b_val);
-        let out_idx = UOp::new(Op::Index, out_ptr.dtype(), vec![out_ptr, idx.clone()], Arg::None);
+        let out_idx = UOp::new(
+            Op::Index,
+            out_ptr.dtype(),
+            vec![out_ptr, idx.clone()],
+            Arg::None,
+        );
         let store = UOp::new(Op::Store, DType::Void, vec![out_idx, sum], Arg::None);
         let end = UOp::new(Op::End, DType::Void, vec![idx, store.clone()], Arg::None);
         let sink = UOp::sink(vec![store, end]);

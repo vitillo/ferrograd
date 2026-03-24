@@ -175,8 +175,8 @@ fn rangeify_rule(node: &UOp) -> Option<UOp> {
                     rewrite_index_movement(inner, idxs)
                 }
                 Op::ReduceAxis => rewrite_index_reduce(inner, idxs),
-                Op::Const => rewrite_index_const(inner, idxs),
-                Op::Param => rewrite_index_param(inner, idxs),
+                Op::Const | Op::ParamScalar => rewrite_index_const(inner, idxs),
+                Op::ParamBuffer => rewrite_index_param(inner, idxs),
                 _ => None,
             }
         }
