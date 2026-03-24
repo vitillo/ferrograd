@@ -84,7 +84,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::device::Buffer;
-use crate::rewrite::{graph_rewrite, Captures, PatternMatcher, RewriteFn, UPat};
+use crate::rewrite::graph_rewrite;
 use crate::uop::{Arg, Op, UOp};
 
 /// Schedule a tensor expression for execution as a single kernel.
@@ -114,34 +114,30 @@ pub fn schedule(expr: &UOp) -> (UOp, Vec<Buffer>) {
     let bufs = input_bufs.clone();
     let params = buf_params.clone();
 
-    let pm = PatternMatcher::new(vec![(
-        UPat::named(Op::Buffer, "buf"),
-        Box::new(move |caps: &Captures| {
-            let buf_uop = caps.get("buf");
-            let Arg::Buffer(ref rc) = buf_uop.arg() else { return None };
-            let ptr = Rc::as_ptr(rc) as usize;
-            let dtype = buf_uop.dtype();
-            let numel = rc.numel();
-            let mut params_map = params.borrow_mut();
-            Some(
-                params_map
-                    .entry(ptr)
-                    .or_insert_with(|| {
-                        let mut bufs_vec = bufs.borrow_mut();
-                        let slot = bufs_vec.len() + 1;
-                        bufs_vec.push(Buffer::clone(rc));
-                        UOp::param(slot, dtype, numel)
-                    })
-                    .clone(),
-            )
-        }) as RewriteFn,
-    )]);
-
-    let parameterized = {
-        let result = graph_rewrite(expr, &pm, "schedule");
-        drop(pm);
-        result
+    let rewrite_buf = move |node: &UOp| -> Option<UOp> {
+        if node.op() != Op::Buffer {
+            return None;
+        }
+        let Arg::Buffer(ref rc) = node.arg() else { return None };
+        let ptr = Rc::as_ptr(rc) as usize;
+        let dtype = node.dtype();
+        let numel = rc.numel();
+        let mut params_map = params.borrow_mut();
+        Some(
+            params_map
+                .entry(ptr)
+                .or_insert_with(|| {
+                    let mut bufs_vec = bufs.borrow_mut();
+                    let slot = bufs_vec.len() + 1;
+                    bufs_vec.push(Buffer::clone(rc));
+                    UOp::param(slot, dtype, numel)
+                })
+                .clone(),
+        )
     };
+
+    let parameterized = graph_rewrite(expr, &rewrite_buf, "schedule");
+    drop(rewrite_buf);
 
     let out_numel = parameterized.shape().map_or(1, |s| s.iter().product());
     let out_param = UOp::param(0, expr.dtype(), out_numel);

@@ -18,7 +18,7 @@
 //! 3. **Reduce expansion**: converts Reduce into an accumulator loop pattern
 
 use crate::dtype::DType;
-use crate::rewrite::{graph_rewrite, Captures, PatternMatcher, RewriteFn, UPat};
+use crate::rewrite::graph_rewrite;
 use crate::uop::{Arg, Op, UOp};
 
 use super::indexing::{
@@ -162,43 +162,28 @@ fn expand_reduce(reduce: &UOp) -> UOp {
     )
 }
 
-// ── Pattern matcher ───────────────────────────────────────────────────────
+// ── Combined rule dispatch ───────────────────────────────────────────────
 
-fn build_rules() -> PatternMatcher {
-    PatternMatcher::new(vec![
-        (
-            UPat::named(Op::Store, "store"),
-            Box::new(|caps: &Captures| {
-                rewrite_store_add_ranges(&caps.get("store"))
-            }) as RewriteFn,
-        ),
-        // Index pushing: dispatches to the four indexing rules. Skips
-        // kernel-level Index nodes (tagged with Arg::Index) which represent
-        // final pointer arithmetic — pushing those would loop forever.
-        (
-            UPat::named(Op::Index, "idx"),
-            Box::new(|caps: &Captures| {
-                let idx_node = caps.get("idx");
-                if *idx_node.arg() != Arg::None {
-                    return None;
-                }
-                let inner = idx_node.srcs()[0].clone();
-                let idxs: Vec<UOp> = idx_node.srcs()[1..].to_vec();
-
-                None.or_else(|| rewrite_index_alu(&inner, &idxs))
-                    .or_else(|| rewrite_index_movement(&inner, &idxs))
-                    .or_else(|| rewrite_index_reduce(&inner, &idxs))
-                    .or_else(|| rewrite_index_const(&inner, &idxs))
-                    .or_else(|| rewrite_index_param(&inner, &idxs))
-            }) as RewriteFn,
-        ),
-        (
-            UPat::named(Op::Reduce, "r"),
-            Box::new(|caps: &Captures| {
-                Some(expand_reduce(&caps.get("r")))
-            }) as RewriteFn,
-        ),
-    ])
+fn rangeify_rule(node: &UOp) -> Option<UOp> {
+    match node.op() {
+        Op::Store => rewrite_store_add_ranges(node),
+        // Index pushing: each arm handles one kind of inner node.
+        // Skips kernel-level Index (tagged with Arg::Index) to avoid infinite loops.
+        Op::Index if *node.arg() == Arg::None => {
+            let inner = &node.srcs()[0];
+            let idxs = &node.srcs()[1..];
+            match inner.op() {
+                op if op.is_alu() => rewrite_index_alu(inner, idxs),
+                Op::Expand | Op::Permute | Op::Reshape => rewrite_index_movement(inner, idxs),
+                Op::ReduceAxis => rewrite_index_reduce(inner, idxs),
+                Op::Const => rewrite_index_const(inner, idxs),
+                Op::Param => rewrite_index_param(inner, idxs),
+                _ => None,
+            }
+        }
+        Op::Reduce => Some(expand_reduce(node)),
+        _ => None,
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────
@@ -209,6 +194,5 @@ fn build_rules() -> PatternMatcher {
 /// Output: kernel-level Sink with Ranges, Loads, Stores, and accumulator loops.
 #[must_use]
 pub fn rangeify(sink: &UOp) -> UOp {
-    let pm = build_rules();
-    graph_rewrite(sink, &pm, "rangeify")
+    graph_rewrite(sink, &rangeify_rule, "rangeify")
 }

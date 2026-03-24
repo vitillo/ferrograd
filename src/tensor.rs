@@ -382,7 +382,7 @@ impl Tensor {
 
         // Simplify index arithmetic (x+0→x, x*1→x, constant folding).
         let sink =
-            crate::rewrite::graph_rewrite(&sink, &crate::rewrite::symbolic_simple(), "symbolic");
+            crate::rewrite::graph_rewrite(&sink, &crate::rewrite::symbolic_simple, "symbolic");
 
         let kid = KERNEL_COUNT.fetch_add(1, Ordering::Relaxed);
         let name = format!("kernel_{kid}");

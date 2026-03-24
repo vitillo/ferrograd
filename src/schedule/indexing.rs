@@ -108,9 +108,6 @@ pub fn index_wrap(src: &UOp, idxs: &[UOp]) -> UOp {
 /// We just distribute Index into each source and let it keep sinking.
 #[must_use]
 pub fn rewrite_index_alu(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
-    if !inner.op().is_alu() {
-        return None;
-    }
     let new_srcs: Vec<UOp> = inner.srcs().iter().map(|s| index_wrap(s, idxs)).collect();
     Some(UOp::new(inner.op(), inner.dtype(), new_srcs, inner.arg().clone()))
 }
@@ -138,8 +135,11 @@ pub fn rewrite_index_alu(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
 ///   a single offset and let the source's shape decompose it. This is correct
 ///   because both shapes describe the same contiguous memory layout.
 #[must_use]
+#[allow(clippy::missing_panics_doc)]
 pub fn rewrite_index_movement(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
-    let Arg::Dims(ref arg) = inner.arg() else { return None };
+    let Arg::Dims(ref arg) = inner.arg() else {
+        panic!("movement op must have Arg::Dims");
+    };
     let src = &inner.srcs()[0];
 
     let new_idxs = match inner.op() {
@@ -188,7 +188,7 @@ pub fn rewrite_index_movement(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
                 vec![flat_index(idxs, &contiguous_strides(arg))]
             }
         }
-        _ => return None,
+        _ => unreachable!("rangeify only sends Expand/Permute/Reshape"),
     };
 
     Some(index_wrap(src, &new_idxs))
@@ -214,8 +214,9 @@ pub fn rewrite_index_movement(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
 /// Panics if `idxs` length doesn't match the source shape.
 #[must_use]
 pub fn rewrite_index_reduce(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
-    if inner.op() != Op::ReduceAxis { return None; }
-    let Arg::Reduce(reduce_op, axes) = inner.arg() else { return None };
+    let Arg::Reduce(reduce_op, axes) = inner.arg() else {
+        panic!("ReduceAxis must have Arg::Reduce");
+    };
     let src = &inner.srcs()[0];
     let src_shape = src.shape()?;
 
@@ -247,9 +248,6 @@ pub fn rewrite_index_reduce(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
 /// through without any memory access.
 #[must_use]
 pub fn rewrite_index_const(inner: &UOp, _idxs: &[UOp]) -> Option<UOp> {
-    if inner.op() != Op::Const {
-        return None;
-    }
     Some(inner.clone())
 }
 
@@ -271,7 +269,6 @@ pub fn rewrite_index_const(inner: &UOp, _idxs: &[UOp]) -> Option<UOp> {
 /// multi-dimensional indices should have been flattened by movement rules.
 #[must_use]
 pub fn rewrite_index_param(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
-    if inner.op() != Op::Param { return None; }
     assert_eq!(idxs.len(), 1, "Param should have 1 (flat) index");
     let dtype = inner.dtype();
     let kernel_idx = UOp::new(
