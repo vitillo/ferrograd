@@ -101,6 +101,8 @@ pub fn graph_rewrite(root: &UOp, rewrite: &dyn Fn(&UOp) -> Option<UOp>, name: &s
 // Tinygrad has a much larger set of symbolic rules (see `tinygrad/uop/symbolic.py`).
 // We start with the essentials: constant folding and identity elimination.
 
+/// Evaluate a binary op on two constant `Arg` values at compile time.
+/// Returns `None` if the types or op are unsupported for folding.
 fn fold_binary(op: Op, a: &Arg, b: &Arg) -> Option<Arg> {
     match (op, a, b) {
         (Op::Add, Arg::Float(x), Arg::Float(y)) => Some(Arg::Float(x + y)),
@@ -111,6 +113,7 @@ fn fold_binary(op: Op, a: &Arg, b: &Arg) -> Option<Arg> {
     }
 }
 
+/// Reconstruct a `Const` `UOp` from a folded `Arg`, inheriting dtype/device from `node`.
 fn const_from_arg(node: &UOp, arg: &Arg) -> UOp {
     match arg {
         Arg::Float(value) => UOp::const_float(*value, node.dtype(), node.device()),

@@ -1,6 +1,21 @@
 //! # Clang renderer — `UOp` IR to C
 //!
 //! Walks a toposorted `UOp` graph and emits scalar C with for-loops.
+//! No vectorization or tiling — every element is computed one at a time
+//! inside nested `for` loops, which makes the output easy to read and debug.
+//!
+//! The mapping from IR to C is mostly 1:1:
+//! - `Range`/`End` → `for` loop open/close
+//! - `DefineAcc`/`Assign` → accumulator variable + update statement
+//! - `Load`/`Store` → pointer dereference through `Index` expressions
+//! - ALU ops (`Add`, `Mul`, …) → C operators or builtins (`exp2`, `log2`)
+//! - `ParamBuffer`/`ParamScalar` → function parameters (`float* restrict data0`)
+//!
+//! ## Tinygrad reference
+//!
+//! `tinygrad/renderer/cstyle.py` — `ClangRenderer`. Tinygrad's version
+//! shares this same structure but also handles vectorized types and
+//! local/group memory, which we don't need yet.
 
 use std::collections::HashMap;
 use std::fmt::Write;

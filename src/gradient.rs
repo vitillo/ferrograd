@@ -1,7 +1,18 @@
 //! # Autograd — reverse-mode automatic differentiation
 //!
-//! Gradient rules produce new lazy `UOp`s, so backward graphs reuse the same
-//! compiler pipeline as forward graphs.
+//! Implements the standard reverse-mode AD algorithm: walk the forward graph
+//! in reverse topological order, applying the chain rule at each op to
+//! propagate gradients from outputs back to inputs.
+//!
+//! The key insight is that gradient rules produce new lazy `UOp` nodes —
+//! they don't compute numbers, they build more graph. This means the
+//! backward pass reuses the exact same scheduling → rangeify → codegen
+//! pipeline as the forward pass, with no special runtime support needed.
+//!
+//! ## Tinygrad reference
+//!
+//! `tinygrad/autograd/gradient.py` — same reverse-toposort + chain-rule
+//! structure, same trick of emitting lazy ops for gradients.
 
 use std::collections::{HashMap, HashSet};
 
@@ -51,6 +62,7 @@ pub fn compute_gradient(root: &UOp, root_grad: &UOp, targets: &[UOp]) -> HashMap
     result
 }
 
+/// Build a map from each node to the nodes that consume it as a source.
 fn build_consumer_map(order: &[UOp]) -> HashMap<UOp, Vec<UOp>> {
     let mut consumers = HashMap::new();
     for node in order {
@@ -64,6 +76,10 @@ fn build_consumer_map(order: &[UOp]) -> HashMap<UOp, Vec<UOp>> {
     consumers
 }
 
+/// Find all nodes on any path between `targets` and `root` via consumers.
+///
+/// Only nodes reachable upward from the targets need gradients computed —
+/// this avoids wasting work on branches that don't influence any target.
 fn needed_nodes(
     root: &UOp,
     targets: &[UOp],
@@ -87,6 +103,7 @@ fn const_float_like(node: &UOp, value: f64) -> UOp {
     UOp::const_float(value, node.dtype(), node.device())
 }
 
+/// Create a tensor `UOp` filled with `value`, matching the given shape and dtype.
 fn full(shape: &Shape, dtype: DType, device: crate::device::DeviceId, value: f64) -> UOp {
     let base_shape = Shape::new(vec![1; shape.ndim()]);
     let scalar = UOp::const_float(value, dtype, device);
@@ -102,6 +119,10 @@ fn zero_like(node: &UOp) -> UOp {
     full(&shape, node.dtype(), node.device(), 0.0)
 }
 
+/// Return per-source gradients for a single op, given the upstream gradient.
+///
+/// Each entry corresponds to one source of `node`. `None` means the op is
+/// not differentiable w.r.t. that source (e.g., the condition in `Where`).
 #[allow(clippy::too_many_lines)]
 fn gradient_for_op(node: &UOp, grad: &UOp) -> Vec<Option<UOp>> {
     match node.op() {

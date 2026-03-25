@@ -70,6 +70,10 @@ pub fn index_wrap(src: &UOp, idxs: &[UOp]) -> UOp {
     UOp::new(Op::Index, src.dtype(), srcs, Arg::None)
 }
 
+/// Check whether two shapes differ only in the placement of size-1 dimensions.
+/// When true, a reshape between them is a pure squeeze/unsqueeze and indices
+/// can be mapped 1:1 (skipping the 1-dims) instead of falling back to flat
+/// index arithmetic, which avoids unnecessary mul/div/mod in the generated IR.
 fn same_squeezed_dims(src_shape: &Shape, dst_shape: &Shape) -> bool {
     let src_non1: Vec<usize> = src_shape.iter().copied().filter(|&dim| dim != 1).collect();
     let dst_non1: Vec<usize> = dst_shape.iter().copied().filter(|&dim| dim != 1).collect();

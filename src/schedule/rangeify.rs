@@ -39,6 +39,11 @@ fn chain_ends(ranges: &[UOp], body: &UOp) -> UOp {
     current
 }
 
+/// Compute the output `Index` node for a store destination that may be wrapped
+/// in movement ops (e.g. `Shrink(Buffer, ...)`). Recursively pushes indices
+/// through movements until it reaches the underlying `ParamBuffer` or `Buffer`,
+/// then builds the flat `Index` for the store target. This handles in-place
+/// assignment into a sub-region of an existing buffer.
 fn store_output_index(dest: &UOp, idxs: &[UOp]) -> Option<UOp> {
     match dest.op() {
         Op::ParamBuffer => {
@@ -201,6 +206,10 @@ fn expand_reduce(reduce: &UOp) -> UOp {
 
 // ── Combined rule dispatch ───────────────────────────────────────────────
 
+/// Single dispatch function for all rangeify rewrites. The graph rewriter calls
+/// this on every node until no more rules fire (fixed-point). The three cases:
+/// `Store` creates the loop nest, `Index` pushes indexing toward leaves, and
+/// `Reduce` expands into an accumulator pattern.
 fn rangeify_rule(node: &UOp) -> Option<UOp> {
     match node.op() {
         Op::Store => rewrite_store_add_ranges(node),
