@@ -33,6 +33,9 @@
 //!   symbolic index arithmetic generated during lowering.
 //! - [`codegen`] renders kernel-level `UOp` graphs to C for the CPU backend.
 //! - [`gradient`] builds reverse-mode graphs on top of the same lazy IR.
+//! - [`nn`] provides lightweight layer structs such as `Linear`, staying close
+//!   to tinygrad's small `nn` surface without introducing a heavy module base
+//!   class.
 //! - [`optim`] applies parameter updates using lazy tensor assignments.
 //! - [`shape`] centralizes shape metadata and shape-only transformations.
 //! - [`dataset`] provides pre-packaged datasets (MNIST) with automatic
@@ -49,6 +52,7 @@ pub mod dataset;
 pub mod device;
 pub mod dtype;
 pub mod gradient;
+pub mod nn;
 pub mod optim;
 mod runtime;
 pub mod rewrite;

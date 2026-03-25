@@ -9,6 +9,7 @@
 //! ```
 
 use ferrograd::dataset::MNISTDataset;
+use ferrograd::nn::{Linear, Parameters};
 use ferrograd::optim::Sgd;
 use ferrograd::tensor::Tensor;
 
@@ -23,49 +24,33 @@ fn one_hot(labels: &[u8], num_classes: usize) -> Tensor {
     Tensor::from_slice(&data, &[n, num_classes])
 }
 
-#[allow(clippy::cast_precision_loss)]
-fn rand_tensor(shape: &[usize], scale: f32) -> Tensor {
-    // Simple deterministic "random" init using a linear congruential generator.
-    // Good enough for a demo — real training would use proper RNG.
-    use std::cell::Cell;
-    thread_local! {
-        static SEED: Cell<u64> = const { Cell::new(42) };
-    }
-    let numel: usize = shape.iter().product();
-    let data: Vec<f32> = (0..numel)
-        .map(|_| {
-            SEED.with(|s| {
-                let x = s
-                    .get()
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1);
-                s.set(x);
-                // Map to [-scale, scale]
-                ((x >> 33) as f32 / (1u64 << 31) as f32 * 2.0 - 1.0) * scale
-            })
-        })
-        .collect();
-    Tensor::from_slice(&data, shape)
-}
-
 // ── Model ────────────────────────────────────────────────────────────────
 
-fn log_softmax(x: &Tensor) -> Tensor {
-    // log_softmax(x) = x - log(sum(exp(x - max(x))))
-    // Numerically stable: subtract max before exp.
-    let max_x = x.max(&[1]); // [N, 1]
-    let shifted = x.sub(&max_x); // [N, 10]
-    let exp_shifted = shifted.exp(); // [N, 10]
-    let sum_exp = exp_shifted.sum(&[1]); // [N, 1]
-    let log_sum = sum_exp.log(); // [N, 1]
-    shifted.sub(&log_sum) // [N, 10]
+struct Mlp {
+    l1: Linear,
+    l2: Linear,
 }
 
-fn cross_entropy(logits: &Tensor, targets: &Tensor) -> Tensor {
-    // -mean(sum(targets * log_softmax(logits), axis=1))
-    let log_probs = log_softmax(logits);
-    let per_sample = targets.mul(&log_probs).sum(&[1]); // [N, 1]
-    per_sample.neg().sum(&[0]).reshape(&[1]) // scalar
+impl Mlp {
+    fn new() -> Self {
+        Self {
+            l1: Linear::new(784, 128),
+            l2: Linear::new(128, 10),
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Tensor {
+        let hidden = self.l1.forward(x).relu();
+        self.l2.forward(&hidden)
+    }
+}
+
+impl Parameters for Mlp {
+    fn parameters(&self) -> Vec<Tensor> {
+        let mut params = self.l1.parameters();
+        params.extend(self.l2.parameters());
+        params
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -84,14 +69,10 @@ fn main() {
         dataset.test_len(),
     );
 
-    let w1 = rand_tensor(&[784, 128], (2.0 / 784.0_f32).sqrt()).with_requires_grad(true);
-    let b1 = Tensor::zeros(&[1, 128], ferrograd::dtype::DType::F32).with_requires_grad(true);
-    let w2 = rand_tensor(&[128, 10], (1.0 / 128.0_f32).sqrt()).with_requires_grad(true);
-    let b2 = Tensor::zeros(&[1, 10], ferrograd::dtype::DType::F32).with_requires_grad(true);
-    let optim = Sgd::new(vec![w1.clone(), b1.clone(), w2.clone(), b2.clone()], lr);
+    let model = Mlp::new();
+    let optim = Sgd::new(model.parameters(), lr);
 
     let num_batches = dataset.train_len() / batch_size;
-    let batch_scale = Tensor::scalar(1.0 / batch_size as f32);
 
     let max_batches = std::env::var("MAX_BATCHES")
         .ok()
@@ -106,9 +87,8 @@ fn main() {
             let batch_x = dataset.train_images.narrow(0, start, batch_size);
             let batch_t = train_targets.narrow(0, start, batch_size);
 
-            let hidden = batch_x.matmul(&w1).add(&b1).relu();
-            let logits = hidden.matmul(&w2).add(&b2);
-            let loss = cross_entropy(&logits, &batch_t).mul(&batch_scale);
+            let logits = model.forward(&batch_x);
+            let loss = logits.cross_entropy(&batch_t);
 
             optim.zero_grad();
             loss.backward();
@@ -124,13 +104,7 @@ fn main() {
         let batches_run = max_batches.min(num_batches);
         let avg_loss = epoch_loss / batches_run as f32;
 
-        let test_logits = dataset
-            .test_images
-            .matmul(&w1)
-            .add(&b1)
-            .relu()
-            .matmul(&w2)
-            .add(&b2);
+        let test_logits = model.forward(&dataset.test_images);
         let test_preds = test_logits.to_vec();
         let mut correct = 0;
         for (i, label) in dataset.test_labels.iter().enumerate() {
