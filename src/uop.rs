@@ -103,6 +103,12 @@ impl Op {
                 | Self::Reciprocal
         )
     }
+
+    /// Whether this op is a zero-copy movement/view operation.
+    #[must_use]
+    pub fn is_movement(self) -> bool {
+        matches!(self, Self::Shrink | Self::Reshape | Self::Permute | Self::Expand)
+    }
 }
 
 impl fmt::Display for Op {
@@ -463,9 +469,21 @@ impl UOp {
                 ))
             }
             Op::Const => Some(Shape::flat(1)),
+            Op::After => self.srcs()[0].shape(),
             Op::ParamScalar | Op::Device | Op::DefineVar | Op::Bind => None,
             op if op.is_alu() => self.srcs()[0].shape(),
             _ => None,
+        }
+    }
+
+    /// Whether this node has a concrete buffer identity under movement ops.
+    #[must_use]
+    pub fn has_buffer_identity(&self) -> bool {
+        match self.op() {
+            Op::Buffer => true,
+            Op::After => self.srcs()[0].has_buffer_identity(),
+            op if op.is_movement() => self.srcs()[0].has_buffer_identity(),
+            _ => false,
         }
     }
 
@@ -579,6 +597,16 @@ impl UOp {
     pub(crate) fn where_(cond: Self, t: Self, f: Self) -> Self {
         let dtype = t.dtype();
         Self::new(Op::Where, dtype, vec![cond, t, f], Arg::None)
+    }
+
+    #[must_use]
+    pub(crate) fn store(dest: Self, value: Self) -> Self {
+        Self::new(Op::Store, DType::Void, vec![dest, value], Arg::None)
+    }
+
+    #[must_use]
+    pub(crate) fn after(value: Self, effect: Self) -> Self {
+        Self::new(Op::After, value.dtype(), vec![value, effect], Arg::None)
     }
 
     #[must_use]
