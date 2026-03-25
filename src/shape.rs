@@ -1,4 +1,27 @@
-//! Immutable shape metadata.
+//! # Shape — Immutable Tensor Dimensions
+//!
+//! A [`Shape`] is a thin wrapper around a boxed slice of dimension sizes. It's
+//! separate from tensors because shape metadata is needed in many places that
+//! don't involve actual data: broadcasting rules, stride calculation, axis
+//! validation, and IR construction all operate purely on shapes.
+//!
+//! ## Tinygrad equivalent
+//!
+//! Tinygrad doesn't have a dedicated `Shape` type — it passes around plain
+//! Python tuples of ints. We use a named type instead because Rust benefits
+//! from the type safety (you can't accidentally pass an axis list where a
+//! shape is expected), and because it gives us a natural place to hang
+//! shape-related operations.
+//!
+//! ## Key operations
+//!
+//! - **Broadcasting** ([`Shape::broadcast_with`]): numpy-style broadcast, used
+//!   to align operand shapes before elementwise ops.
+//! - **Left-padding** ([`Shape::pad_left`]): prepend size-1 dimensions so two
+//!   shapes have the same rank — the first step of broadcasting.
+//! - **Permutation inversion** ([`Shape::invert_permutation`]): given an axis
+//!   reordering `[2,0,1]`, compute the inverse `[1,2,0]`. Needed to undo
+//!   transposes during gradient backpropagation.
 
 use std::fmt;
 use std::ops::Deref;

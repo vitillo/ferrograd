@@ -235,13 +235,28 @@ impl fmt::Display for Arg {
     }
 }
 
+/// The heap-allocated interior of a [`UOp`].
+///
+/// Every `UOp` is an `Rc<UOpInner>`, so cloning a node is cheap (reference
+/// count bump) and two nodes can be compared by pointer identity. The interner
+/// guarantees that structurally identical inner values share the same allocation.
 pub(crate) struct UOpInner {
+    /// Which IR operation this node represents.
     pub(crate) op: Op,
+    /// The result data type (e.g. `F32`, `Bool`, `Void` for side-effects).
     pub(crate) dtype: DType,
+    /// Operand edges — ordering matters (e.g. `srcs[0]` is the data source
+    /// for movement ops, `srcs[1..]` may carry index expressions).
     pub(crate) srcs: Vec<UOp>,
+    /// Op-specific payload (shape, axis list, literal value, etc.).
     pub(crate) arg: Arg,
 }
 
+/// Value-based key used by the interner's `HashMap` to detect duplicate nodes.
+///
+/// Unlike [`UOp`] itself (which compares by pointer identity for speed),
+/// `UOpKey` implements `Hash`/`Eq` structurally so the interner can find an
+/// existing allocation for a `(op, dtype, srcs, arg)` combination.
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub(crate) struct UOpKey {
     pub(crate) op: Op,
@@ -259,10 +274,23 @@ impl UOp {
         Self(inner)
     }
 
+    /// Central constructor — interns the node through the device's runtime state.
+    ///
+    /// All `UOp` creation funnels through here. The runtime's interner either
+    /// returns an existing `Rc<UOpInner>` if an identical node already exists,
+    /// or allocates a new one and caches it. This is how tinygrad achieves
+    /// graph deduplication: structurally identical sub-expressions become the
+    /// same object in memory, which makes equality checks O(1) and naturally
+    /// deduplicates common sub-expressions in the graph.
     fn build(device: DeviceId, op: Op, dtype: DType, srcs: Vec<Self>, arg: Arg) -> Self {
         runtime::state(device).intern_uop(op, dtype, srcs, arg)
     }
 
+    /// Derive the device for a non-leaf node from its sources.
+    ///
+    /// All sources must belong to the same device — cross-device ops are not
+    /// supported (tinygrad enforces the same constraint). Leaf nodes like
+    /// `Const` and `Buffer` carry an explicit `Device` source instead.
     fn device_from_srcs(srcs: &[Self]) -> DeviceId {
         let device = srcs
             .first()
@@ -414,6 +442,11 @@ impl UOp {
         &self.0.arg
     }
 
+    /// Cast the `Rc` pointer to a `usize` for use as a hash key.
+    ///
+    /// Because the interner guarantees structural uniqueness, pointer identity
+    /// is equivalent to value equality — so we can hash/compare `UOp`s in O(1)
+    /// instead of walking the entire sub-graph.
     fn ptr_id(&self) -> usize {
         Rc::as_ptr(&self.0) as usize
     }

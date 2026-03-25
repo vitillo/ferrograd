@@ -3,6 +3,36 @@
 //! `Tensor` is a shared handle to lazy `UOp` graph state. Clones alias the same
 //! tensor identity, so realization rewrites, in-place updates, and gradient
 //! storage are visible through all handles.
+//!
+//! ## Lazy evaluation model
+//!
+//! Operations like `add`, `matmul`, and `reshape` do not compute anything
+//! immediately. They append nodes to an internal `UOp` directed acyclic graph
+//! (the "lazy graph"). Computation only happens when [`Tensor::realize`] or
+//! [`Tensor::realize_many`] is called, which lowers the graph through a
+//! multi-stage pipeline:
+//!
+//! 1. **Schedule** — partition the lazy graph into individual kernels and
+//!    identify buffer inputs/outputs.
+//! 2. **Rangeify** — lower high-level tensor ops (reshape, permute, reduce) into
+//!    explicit index arithmetic with range loops, producing the kernel IR.
+//! 3. **Symbolic simplification** — constant-fold and simplify the index math.
+//! 4. **Codegen** — render the kernel IR into C source code.
+//! 5. **Compile** — invoke the platform C compiler (via the `Device` trait).
+//! 6. **Execute** — run the compiled kernel, writing results into device buffers.
+//!
+//! This mirrors tinygrad's `Tensor` class, where `.realize()` triggers the same
+//! lazy-graph → schedule → lower → codegen → run pipeline.
+//!
+//! ## Shared handle pattern
+//!
+//! `Tensor` wraps `Rc<RefCell<TensorInner>>`, so cloning a tensor produces a
+//! second handle to the *same* underlying state. This is essential because
+//! realization must rewrite every handle's `uop` from the old lazy expression
+//! to a realized buffer reference. Without shared identity, an optimizer holding
+//! a parameter clone would go stale after the training loop realizes it. This
+//! matches tinygrad, where `Tensor` objects are mutable Python references that
+//! get rewritten in-place by the scheduler.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -27,15 +57,29 @@ static DEBUG: LazyLock<u8> = LazyLock::new(|| {
         .unwrap_or(0)
 });
 
+/// Global monotonic counter for naming compiled kernels (`kernel_0`, `kernel_1`, …).
+/// Also used in debug output to correlate log lines with specific kernel invocations.
 static KERNEL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+// Weak references to every live tensor on this thread.
+//
+// After realization, the scheduler produces a replacement map (old lazy UOp →
+// new buffer UOp). We walk this list to patch every tensor that transitively
+// referenced a realized subgraph, so all handles stay consistent. Weak refs
+// let tensors be dropped normally; dead entries are pruned during traversal.
 thread_local! {
     static LIVE_TENSORS: RefCell<Vec<Weak<RefCell<TensorInner>>>> = const { RefCell::new(Vec::new()) };
 }
 
+/// The mutable state behind every [`Tensor`] handle.
 struct TensorInner {
+    /// The current lazy graph expression (pre-realization) or realized buffer
+    /// reference (post-realization). Rewritten in-place by `apply_map_to_tensors`.
     uop: UOp,
+    /// Whether this tensor participates in autograd. Set at creation or via
+    /// `with_requires_grad`; never toggled by the framework itself.
     requires_grad: bool,
+    /// Accumulated gradient from `backward()`, if any.
     grad: Option<Tensor>,
 }
 
@@ -44,6 +88,8 @@ struct TensorInner {
 pub struct Tensor(Rc<RefCell<TensorInner>>);
 
 impl Tensor {
+    /// Create a tensor handle and register it in `LIVE_TENSORS` so
+    /// post-realization graph rewrites can reach it.
     fn new(uop: UOp, requires_grad: bool) -> Self {
         let tensor = Self(Rc::new(RefCell::new(TensorInner {
             uop,
@@ -54,6 +100,7 @@ impl Tensor {
         tensor
     }
 
+    /// Read the current lazy graph node (or realized buffer reference).
     fn uop(&self) -> UOp {
         self.0.borrow().uop.clone()
     }
@@ -63,6 +110,7 @@ impl Tensor {
         Rc::ptr_eq(&self.0, &other.0)
     }
 
+    /// Overwrite the graph node, visible through all cloned handles.
     fn set_uop(&self, uop: UOp) {
         self.0.borrow_mut().uop = uop;
     }
@@ -75,6 +123,11 @@ impl Tensor {
         self.0.borrow_mut().grad = grad;
     }
 
+    /// Return the "target" buffer identity, stripping any `After` wrapper.
+    ///
+    /// `assign` wraps a tensor as `After(base, Store(base, value))` to express
+    /// an in-place write. When we need the underlying buffer identity (e.g. for
+    /// a second assign), we strip the `After` to get back to `base`.
     fn target_uop(&self) -> UOp {
         let current = self.uop();
         if current.op() == Op::After {
@@ -83,6 +136,10 @@ impl Tensor {
         current
     }
 
+    /// Collect all live tensor handles on this thread, pruning dead weak refs.
+    ///
+    /// Used after realization to apply the replacement map to every tensor
+    /// whose graph references a now-realized subexpression.
     fn live_tensors() -> Vec<Self> {
         LIVE_TENSORS.with(|live| {
             let mut live = live.borrow_mut();
@@ -98,6 +155,12 @@ impl Tensor {
         })
     }
 
+    /// Rewrite every live tensor's graph using the scheduler's replacement map.
+    ///
+    /// After realization, each realized subexpression is replaced by a direct
+    /// buffer reference. This walks all live tensors, finds those whose graphs
+    /// transitively contain a replaced node, and substitutes in one pass per
+    /// device (so shared subgraphs are rewritten only once).
     fn apply_map_to_tensors(replacements: &HashMap<UOp, UOp>) {
         if replacements.is_empty() {
             return;
@@ -660,6 +723,8 @@ impl Tensor {
         self.clone()
     }
 
+    /// Run the full pipeline for a single scheduled kernel: rangeify → symbolic
+    /// simplification → codegen → compile (or cache hit) → execute.
     fn execute_item(item: &ScheduleItem) {
         let state = runtime::state(item.sink.device());
         let debug = *DEBUG;
@@ -859,6 +924,8 @@ impl Tensor {
     }
 }
 
+/// Convert scheduled kernel inputs (buffer ids and scalar constants) into
+/// concrete `KernelArg` values by loading buffers from device state.
 fn execute_inputs(
     state: &runtime::DeviceState,
     inputs: &[schedule::KernelInput],
@@ -875,6 +942,8 @@ fn execute_inputs(
     args.extend(input_args);
 }
 
+/// Build a `UOp` expression for a constant-filled tensor (e.g. all-ones for the
+/// initial backward gradient, or all-zeros for missing gradients).
 fn full(shape: Shape, dtype: DType, device: DeviceId, value: f64) -> UOp {
     let base_shape = Shape::new(vec![1; shape.ndim()]);
     let scalar = UOp::const_float(value, dtype, device);
@@ -885,6 +954,10 @@ fn full(shape: Shape, dtype: DType, device: DeviceId, value: f64) -> UOp {
     UOp::expand(base, shape)
 }
 
+/// Walk `root` in topological order and replace any node found in
+/// `replacements`. Children of replaced nodes are *not* traversed — the
+/// replacement is taken as-is, which is correct because replaced subtrees are
+/// fully realized and self-contained.
 fn substitute_with_map(root: &UOp, replacements: &HashMap<UOp, UOp>) -> UOp {
     let order = root.toposort();
     let mut substituted: HashMap<UOp, UOp> = HashMap::new();
@@ -919,6 +992,8 @@ fn substitute_with_map(root: &UOp, replacements: &HashMap<UOp, UOp>) -> UOp {
         .unwrap_or_else(|| root.clone())
 }
 
+/// Substitute multiple roots in a single pass by wrapping them in a temporary
+/// `Sink` node, so shared subgraphs between roots are only rewritten once.
 fn substitute_roots_with_map(roots: &[UOp], replacements: &HashMap<UOp, UOp>) -> Vec<UOp> {
     if roots.is_empty() {
         return Vec::new();
@@ -929,11 +1004,14 @@ fn substitute_roots_with_map(roots: &[UOp], replacements: &HashMap<UOp, UOp>) ->
     rewritten_sink.srcs().to_vec()
 }
 
+/// Wrap a compile-time `usize` as a `Const` i32 `UOp`, used for narrow offsets.
 fn bound_const(value: usize, device: DeviceId) -> UOp {
     #[allow(clippy::cast_possible_wrap)]
     UOp::const_int(value as i64, DType::I32, device)
 }
 
+/// Extract the concrete `usize` from a narrow start `UOp` (either a plain
+/// `Const` or a `Bind` whose second source carries the current value).
 fn bound_value(start: &UOp) -> usize {
     match start.op() {
         Op::Const => {
@@ -952,6 +1030,7 @@ fn bound_value(start: &UOp) -> usize {
     }
 }
 
+/// Numpy-style broadcasting: pad ranks to match, then expand size-1 dims.
 fn broadcast_shapes(left: &Tensor, right: &Tensor) -> (Tensor, Tensor) {
     assert!(
         left.device() == right.device(),
@@ -974,6 +1053,9 @@ fn broadcast_shapes(left: &Tensor, right: &Tensor) -> (Tensor, Tensor) {
     (left, right)
 }
 
+/// Validate that rangeify and symbolic passes have lowered all high-level ops.
+/// Any surviving tensor-level op (`Reshape`, `Permute`, `ReduceAxis`, etc.) indicates
+/// a bug in the lowering pipeline and would produce nonsense in codegen.
 fn assert_codegen_ready(root: &UOp) {
     assert_eq!(root.op(), Op::Sink, "render: root must be a Sink node");
     for node in root.toposort() {

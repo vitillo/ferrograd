@@ -2,6 +2,12 @@
 //!
 //! Training updates are expressed as lazy tensor assignments and then realized
 //! together, matching tinygrad's "build more graph, then realize it" model.
+//!
+//! `Sgd::step` builds a lazy `assign` graph for every parameter (`param =
+//! param - lr * grad`), then calls `realize_many` once to execute all updates
+//! in a single scheduling pass. This keeps the optimizer out of the execution
+//! path — it only constructs graph nodes — and lets the scheduler fuse or
+//! reorder kernels freely.
 
 use crate::tensor::Tensor;
 

@@ -1,7 +1,25 @@
 //! Device-scoped execution state owned outside the graph.
 //!
 //! Tinygrad keeps device identity in the graph and stores concrete buffers and
-//! compiled kernels on the device side. This module follows the same split.
+//! compiled kernels on the device side. This module follows the same split:
+//! the lazy `UOp` graph knows *which* device a tensor lives on (via `DeviceId`),
+//! but concrete resources — allocated memory buffers, compiled kernel objects,
+//! and the `UOp` interner — live here in [`DeviceState`].
+//!
+//! ## Thread-local storage
+//!
+//! Each thread gets its own `DeviceState` per `DeviceId`, stored in the
+//! `DEVICE_STATES` thread-local. This avoids interior-mutability contention
+//! since the current execution model is single-threaded per device, matching
+//! tinygrad's design where each `Device` instance owns its state.
+//!
+//! ## `BufferId` indirection
+//!
+//! Kernels and schedule items refer to buffers by [`BufferId`] rather than
+//! holding direct `Buffer` references. This lets the scheduler *reserve* an
+//! output slot before a kernel runs (so downstream kernels can reference it),
+//! then fill it in after execution. It also decouples the graph layer from the
+//! concrete buffer type, which will matter when we add GPU backends.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -30,13 +48,21 @@ impl fmt::Display for BufferId {
     }
 }
 
+/// One slot in the buffer registry. A record is created at reservation time
+/// with metadata (dtype, numel) but no concrete buffer yet; the buffer is
+/// filled in after kernel execution.
 #[derive(Debug)]
 struct BufferRecord {
     dtype: DType,
     numel: usize,
+    /// `None` between reservation and execution; `Some` once a kernel has
+    /// written the output or the buffer was inserted directly.
     buffer: Option<Buffer>,
 }
 
+/// Internal buffer registry with a two-phase lifecycle: `reserve` allocates an
+/// id with metadata, `set` fills in the concrete buffer. This mirrors how the
+/// scheduler plans output slots before kernels run.
 #[derive(Debug, Default)]
 struct BufferStore {
     next_id: usize,
@@ -60,7 +86,8 @@ impl BufferStore {
 
     fn insert(&mut self, buffer: Buffer) -> BufferId {
         let id = self.reserve(buffer.dtype(), buffer.numel());
-        self.set(id, buffer).expect("inserted buffer must match reservation");
+        self.set(id, buffer)
+            .expect("inserted buffer must match reservation");
         id
     }
 
@@ -83,7 +110,10 @@ impl BufferStore {
     }
 
     fn get(&self, id: BufferId) -> Result<Buffer, RuntimeError> {
-        let record = self.buffers.get(&id).ok_or(RuntimeError::UnknownBuffer(id))?;
+        let record = self
+            .buffers
+            .get(&id)
+            .ok_or(RuntimeError::UnknownBuffer(id))?;
         record
             .buffer
             .clone()
@@ -127,6 +157,7 @@ pub(crate) struct DeviceState {
 }
 
 impl DeviceState {
+    /// Create a fresh device state wrapping the given backend.
     fn new(device: Rc<dyn Device>) -> Rc<Self> {
         Rc::new(Self {
             device,
@@ -182,6 +213,10 @@ impl DeviceState {
         self.kernels.borrow_mut().insert(sink, program);
     }
 
+    /// Hash-cons a `UOp`: if an identical node (same op, dtype, srcs, arg) already
+    /// exists and is still alive, return the existing `Rc` instead of allocating
+    /// a new one. This keeps the graph compact and makes pointer equality a
+    /// valid structural identity check during scheduling and rewriting.
     pub(crate) fn intern_uop(&self, op: Op, dtype: DType, srcs: Vec<UOp>, arg: Arg) -> UOp {
         let key = UOpKey {
             op,
@@ -204,6 +239,8 @@ impl DeviceState {
         UOp::from_inner(inner)
     }
 
+    /// Reset all state so tests start with a clean device. Test-only because
+    /// clearing buffers that live tensors still reference would cause panics.
     #[cfg(test)]
     pub(crate) fn clear_for_tests(&self) {
         *self.buffers.borrow_mut() = BufferStore::default();
@@ -212,10 +249,13 @@ impl DeviceState {
     }
 }
 
+// Per-thread registry of device states, lazily initialized on first access.
 thread_local! {
     static DEVICE_STATES: RefCell<HashMap<DeviceId, Rc<DeviceState>>> = RefCell::new(HashMap::new());
 }
 
+/// Instantiate the concrete `Device` backend for a `DeviceId` and wrap it in
+/// a new `DeviceState`.
 fn new_state(device: DeviceId) -> Rc<DeviceState> {
     match device {
         DeviceId::Cpu => DeviceState::new(Rc::new(CpuDevice)),

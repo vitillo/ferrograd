@@ -2,6 +2,19 @@
 //!
 //! This module converts the lazy tensor-level graph into a list of proto-kernel
 //! graphs, each with explicit input parameters and a reserved output buffer.
+//!
+//! ## Why scheduling exists
+//!
+//! Lazy tensor operations build up an unbounded DAG of math. We can't compile
+//! the whole thing as one kernel — shared subexpressions and chained reductions
+//! need separate kernels with intermediate buffers. Scheduling decides *where*
+//! to cut the graph by choosing which nodes to **materialize** (write to a
+//! device buffer), then extracts each resulting subgraph into a self-contained
+//! kernel with numbered parameter slots.
+//!
+//! This mirrors tinygrad's `schedule.py`: walk the lazy graph in topological
+//! order, materialize nodes that are multi-consumer or chained reductions, and
+//! parameterize each kernel subgraph so it's ready for lowering.
 
 pub mod indexing;
 pub mod rangeify;
@@ -76,6 +89,15 @@ pub fn schedule_many(exprs: &[UOp]) -> SchedulePlan {
     let mut replacements: HashMap<UOp, UOp> = HashMap::new();
     let mut items = Vec::new();
 
+    // Phase 1: materialize intermediates.
+    //
+    // Walk the graph in dependency order and create kernels for internal nodes
+    // that need their own buffer (multi-consumer, chained reductions, etc.).
+    // Roots are excluded here — they're handled in phase 2.
+    //
+    // Each materialized node gets a replacement entry mapping the original UOp
+    // to a Buffer UOp, so downstream nodes (and the roots) will see realized
+    // buffers instead of the original lazy subgraph.
     for node in &order {
         if !should_materialize(node, &roots, &consumer_map, &nested_reduce_inputs) {
             continue;
@@ -88,6 +110,16 @@ pub fn schedule_many(exprs: &[UOp]) -> SchedulePlan {
         items.push(item);
     }
 
+    // Phase 2: compile the requested roots.
+    //
+    // This runs *after* all intermediates are materialized, so
+    // `substitute_materialized` can replace them with buffer references —
+    // the root's kernel only contains its own math, not the intermediates'.
+    //
+    // Roots need separate handling because:
+    // - They always produce a kernel (intermediates use heuristics).
+    // - They may be assignments (`After(value, Store(dest, expr))`), which
+    //   write into an existing buffer instead of allocating a new one.
     for expr in exprs {
         let final_expr = substitute_materialized(expr, &replacements);
         if let Some((store, replacement)) = assignment_effect(&final_expr) {
@@ -107,6 +139,9 @@ pub fn schedule_many(exprs: &[UOp]) -> SchedulePlan {
     }
 }
 
+/// Turn a lazy expression into a kernel that allocates a fresh output buffer.
+/// Wraps the expression in `Sink(Store(Param(0), expr))` and assigns numbered
+/// parameter slots to every buffer and scalar input.
 fn parameterize(expr: &UOp) -> ScheduleItem {
     let state = runtime::state(expr.device());
     let (parameterized, inputs) = parameterize_inputs(expr, 1, "schedule");
@@ -130,6 +165,9 @@ fn parameterize(expr: &UOp) -> ScheduleItem {
     }
 }
 
+/// Like [`parameterize`], but for in-place stores (e.g. assignment into an
+/// existing buffer). No output buffer is allocated — the destination is already
+/// present in the graph as a regular buffer input at slot 0.
 fn parameterize_store(store: &UOp) -> ScheduleItem {
     assert_eq!(
         store.op(),
@@ -146,6 +184,10 @@ fn parameterize_store(store: &UOp) -> ScheduleItem {
     }
 }
 
+/// Walk `root` and replace every `Buffer`, `Bind`, and `Shrink` offset with
+/// numbered `Param` nodes, collecting the corresponding runtime inputs.
+/// `slot_offset` reserves slot 0 for the output in allocating kernels (1) or
+/// starts at 0 for in-place stores where the destination is a regular input.
 fn parameterize_inputs(root: &UOp, slot_offset: usize, pass_name: &str) -> (UOp, Vec<KernelInput>) {
     use std::cell::RefCell;
 
@@ -224,6 +266,7 @@ fn parameterize_inputs(root: &UOp, slot_offset: usize, pass_name: &str) -> (UOp,
     )
 }
 
+/// Convert a `Const` literal arg into the corresponding [`KernelInput`] scalar variant.
 fn scalar_input(literal: &Arg) -> KernelInput {
     match literal {
         #[allow(clippy::cast_possible_truncation)]
@@ -236,6 +279,8 @@ fn scalar_input(literal: &Arg) -> KernelInput {
     }
 }
 
+/// Build a map from each node to its consumers. Used by [`should_materialize`]
+/// to detect multi-consumer nodes that need their own kernel.
 fn build_consumer_map(order: &[UOp]) -> HashMap<UOp, Vec<UOp>> {
     let mut consumers: HashMap<UOp, Vec<UOp>> = HashMap::new();
     for node in order {
@@ -246,6 +291,11 @@ fn build_consumer_map(order: &[UOp]) -> HashMap<UOp, Vec<UOp>> {
     consumers
 }
 
+/// Identify nodes that feed into a reduction which itself feeds another
+/// reduction (e.g. `sum(sum(x))`). Chained reductions must be materialized
+/// between stages because a single kernel can't nest two independent
+/// accumulator loops — the inner reduce's output must be written to a buffer
+/// before the outer reduce reads it.
 fn nested_reduce_inputs(order: &[UOp]) -> HashSet<UOp> {
     let mut feeds_reduce = HashSet::new();
     for node in order.iter().rev() {
@@ -258,6 +308,21 @@ fn nested_reduce_inputs(order: &[UOp]) -> HashSet<UOp> {
     feeds_reduce
 }
 
+/// Decide whether `node` needs its own kernel with a materialized output buffer.
+///
+/// A node is materialized when fusing it into its consumers' kernels would be
+/// incorrect or wasteful:
+/// - **Multi-consumer**: recomputing would duplicate work across kernels.
+/// - **Reduce consumed by ALU**: the reduce result must be stored before the
+///   elementwise op can read it (tinygrad splits these the same way).
+/// - **Chained reductions**: a reduce whose output feeds another reduce needs
+///   an intermediate buffer (see [`nested_reduce_inputs`]).
+///
+/// Nodes that are already leaf-like (Buffer, Const, Bind) or structural
+/// (Sink, Store) are never materialized — they're either inputs or handled
+/// by the kernel extraction logic directly. Movement ops are also never
+/// materialized: they are views, so forcing them into their own kernel just
+/// copies data instead of letting consumers inline the indexing math.
 fn should_materialize(
     node: &UOp,
     roots: &HashSet<UOp>,
@@ -281,6 +346,9 @@ fn should_materialize(
     ) {
         return false;
     }
+    if node.op().is_movement() {
+        return false;
+    }
     if node.has_buffer_identity() {
         return false;
     }
@@ -300,6 +368,9 @@ fn should_materialize(
     node.op() == Op::ReduceAxis && nested_reduce_inputs.contains(node)
 }
 
+/// Create the `Buffer` node that replaces a materialized expression in the
+/// lazy graph. Downstream consumers will see this buffer instead of the
+/// original computation, creating the kernel boundary.
 fn buffer_replacement(item: &ScheduleItem) -> UOp {
     let output_id = item
         .output_id
@@ -315,6 +386,10 @@ fn buffer_replacement(item: &ScheduleItem) -> UOp {
     UOp::reshape(buffer, out_shape)
 }
 
+/// Check if `root` is an `After(value, Store)` — an in-place assignment that
+/// writes into an existing buffer as a side effect. Returns `(store, value)`
+/// so the caller can schedule the store separately and use `value` as the
+/// replacement in the lazy graph.
 fn assignment_effect(root: &UOp) -> Option<(UOp, UOp)> {
     if root.op() != Op::After || root.srcs().len() != 2 {
         return None;
@@ -323,6 +398,10 @@ fn assignment_effect(root: &UOp) -> Option<(UOp, UOp)> {
     (store.op() == Op::Store).then(|| (store, root.srcs()[0].clone()))
 }
 
+/// Rewrite `root` by swapping every materialized subexpression with its
+/// replacement buffer. This isolates the subgraph for the current kernel,
+/// cutting it off at the buffer boundaries established by earlier scheduling
+/// decisions.
 fn substitute_materialized(root: &UOp, replacements: &HashMap<UOp, UOp>) -> UOp {
     let order = root.toposort();
     let mut substituted: HashMap<UOp, UOp> = HashMap::new();
@@ -458,5 +537,69 @@ mod tests {
         assert!(matches!(item.inputs[0], KernelInput::Buffer(_)));
         assert!(matches!(item.inputs[1], KernelInput::Buffer(_)));
         assert!(matches!(item.inputs[2], KernelInput::I32(1)));
+    }
+
+    #[test]
+    fn test_shared_movement_view_does_not_materialize() {
+        // Arrange
+        runtime::clear_for_tests(DeviceId::Cpu);
+        let left = buffer_uop(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let right = buffer_uop(&[10.0, 20.0, 30.0, 40.0], &[2, 2]);
+        let base = UOp::add(left, right);
+        let moved = UOp::reshape(base, Shape::from([2, 2]));
+        let sum = UOp::reduce_axis(moved.clone(), Op::Add, &[1]);
+        let max = UOp::reduce_axis(moved, Op::Max, &[1]);
+        let root = UOp::add(sum, max);
+
+        // Act
+        let items = schedule(&root);
+
+        // Assert
+        assert_eq!(items.len(), 3);
+        assert!(matches!(items[0].inputs[0], KernelInput::Buffer(_)));
+        assert!(matches!(items[0].inputs[1], KernelInput::Buffer(_)));
+        assert!(matches!(items[1].inputs[0], KernelInput::Buffer(_)));
+        assert!(matches!(items[1].inputs[1], KernelInput::Buffer(_)));
+        assert!(matches!(
+            items[2].inputs[0],
+            KernelInput::Buffer(id) if Some(id) == items[0].output_id
+        ));
+        assert!(matches!(
+            items[2].inputs[1],
+            KernelInput::Buffer(id) if Some(id) == items[1].output_id
+        ));
+    }
+
+    #[test]
+    fn test_shared_movement_view_stays_inlined_for_assignments() {
+        // Arrange
+        runtime::clear_for_tests(DeviceId::Cpu);
+        let left = buffer_uop(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let right = buffer_uop(&[10.0, 20.0, 30.0, 40.0], &[2, 2]);
+        let dst_a = buffer_uop(&[0.0, 0.0, 0.0, 0.0], &[2, 2]);
+        let dst_b = buffer_uop(&[0.0, 0.0, 0.0, 0.0], &[2, 2]);
+        let base = UOp::add(left, right);
+        let moved = UOp::permute(base, &[1, 0]);
+        let assign_a = UOp::after(dst_a.clone(), UOp::store(dst_a, moved.clone()));
+        let assign_b = UOp::after(dst_b.clone(), UOp::store(dst_b, moved));
+
+        // Act
+        let plan = schedule_many(&[assign_a, assign_b]);
+
+        // Assert
+        assert_eq!(plan.items.len(), 2);
+        assert!(plan.items.iter().all(|item| item.output_id.is_none()));
+        assert!(plan
+            .items
+            .iter()
+            .all(|item| matches!(item.inputs[0], KernelInput::Buffer(_))));
+        assert!(plan
+            .items
+            .iter()
+            .all(|item| matches!(item.inputs[1], KernelInput::Buffer(_))));
+        assert!(plan
+            .items
+            .iter()
+            .all(|item| matches!(item.inputs[2], KernelInput::Buffer(_))));
     }
 }
