@@ -8,23 +8,24 @@
 
 #![allow(clippy::many_single_char_names)]
 
+use ferrograd::optim::Sgd;
 use ferrograd::tensor::Tensor;
 
 fn main() {
     println!("\n  --- Autograd: loss = sum(x @ w + b) ---");
     let x = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
-    let w = Tensor::from_slice(&[0.1, 0.2, 0.3, 0.4], &[2, 2]);
-    let b = Tensor::from_slice(&[0.5, 0.6], &[1, 2]);
+    let w = Tensor::from_slice(&[0.1, 0.2, 0.3, 0.4], &[2, 2]).with_requires_grad(true);
+    let b = Tensor::from_slice(&[0.5, 0.6], &[1, 2]).with_requires_grad(true);
 
     let loss = x.matmul(&w).add(&b).sum(&[0, 1]);
     println!("  loss    = {:?}", loss.to_vec());
 
-    let grads = loss.gradient(&[&w, &b]);
-    println!("  dL/dw   = {:?}", grads[0].to_vec());
-    println!("  dL/db   = {:?}", grads[1].to_vec());
+    loss.backward();
+    println!("  dL/dw   = {:?}", w.grad().expect("weight grad").to_vec());
+    println!("  dL/db   = {:?}", b.grad().expect("bias grad").to_vec());
 
     println!("\n  --- SGD step: w -= 0.1 * dL/dw ---");
-    let lr = Tensor::from_slice(&[0.1], &[1, 1]);
-    let w_new = w.sub(&grads[0].mul(&lr));
-    println!("  w_new   = {:?}", w_new.to_vec());
+    let optim = Sgd::new(vec![w.clone()], 0.1);
+    optim.step();
+    println!("  w_new   = {:?}", w.to_vec());
 }

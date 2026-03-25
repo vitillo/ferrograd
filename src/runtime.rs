@@ -210,11 +210,6 @@ impl DeviceState {
         self.kernels.borrow_mut().clear();
         self.interner.borrow_mut().clear();
     }
-
-    #[cfg(test)]
-    pub(crate) fn kernel_cache_len(&self) -> usize {
-        self.kernels.borrow().len()
-    }
 }
 
 thread_local! {
@@ -242,9 +237,4 @@ pub(crate) fn state(device: DeviceId) -> Rc<DeviceState> {
 #[cfg(test)]
 pub(crate) fn clear_for_tests(device: DeviceId) {
     state(device).clear_for_tests();
-}
-
-#[cfg(test)]
-pub(crate) fn kernel_cache_len(device: DeviceId) -> usize {
-    state(device).kernel_cache_len()
 }

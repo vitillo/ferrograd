@@ -9,6 +9,7 @@
 //! ```
 
 use ferrograd::dataset::MNISTDataset;
+use ferrograd::optim::Sgd;
 use ferrograd::tensor::Tensor;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -83,10 +84,11 @@ fn main() {
         dataset.test_len(),
     );
 
-    let mut w1 = rand_tensor(&[784, 128], (2.0 / 784.0_f32).sqrt()).with_requires_grad(true);
-    let mut b1 = Tensor::zeros(&[1, 128], ferrograd::dtype::DType::F32).with_requires_grad(true);
-    let mut w2 = rand_tensor(&[128, 10], (1.0 / 128.0_f32).sqrt()).with_requires_grad(true);
-    let mut b2 = Tensor::zeros(&[1, 10], ferrograd::dtype::DType::F32).with_requires_grad(true);
+    let w1 = rand_tensor(&[784, 128], (2.0 / 784.0_f32).sqrt()).with_requires_grad(true);
+    let b1 = Tensor::zeros(&[1, 128], ferrograd::dtype::DType::F32).with_requires_grad(true);
+    let w2 = rand_tensor(&[128, 10], (1.0 / 128.0_f32).sqrt()).with_requires_grad(true);
+    let b2 = Tensor::zeros(&[1, 10], ferrograd::dtype::DType::F32).with_requires_grad(true);
+    let optim = Sgd::new(vec![w1.clone(), b1.clone(), w2.clone(), b2.clone()], lr);
 
     let num_batches = dataset.train_len() / batch_size;
     let batch_scale = Tensor::scalar(1.0 / batch_size as f32);
@@ -108,13 +110,9 @@ fn main() {
             let logits = hidden.matmul(&w2).add(&b2);
             let loss = cross_entropy(&logits, &batch_t).mul(&batch_scale);
 
-            let grads = loss.gradient(&[&w1, &b1, &w2, &b2]);
-            let lr_t = Tensor::scalar(lr);
-
-            w1 = w1.sub(&grads[0].mul(&lr_t)).realize();
-            b1 = b1.sub(&grads[1].mul(&lr_t)).realize();
-            w2 = w2.sub(&grads[2].mul(&lr_t)).realize();
-            b2 = b2.sub(&grads[3].mul(&lr_t)).realize();
+            optim.zero_grad();
+            loss.backward();
+            optim.step();
 
             let loss_val = loss.to_vec()[0];
             epoch_loss += loss_val;

@@ -33,26 +33,51 @@ pub struct ScheduleItem {
     pub sink: UOp,
     /// Runtime inputs in parameter-slot order, excluding output slot 0.
     pub inputs: Vec<KernelInput>,
-    /// Output buffer id reserved for slot 0.
-    pub output_id: BufferId,
-    /// Output shape.
-    pub out_shape: Shape,
-    /// Output dtype.
-    pub out_dtype: DType,
+    /// Output buffer id reserved for slot 0, or `None` for in-place stores.
+    pub output_id: Option<BufferId>,
+    /// Output shape for allocated outputs.
+    pub out_shape: Option<Shape>,
+    /// Output dtype for allocated outputs.
+    pub out_dtype: Option<DType>,
+}
+
+/// A full execution plan for realizing one or more lazy roots.
+pub struct SchedulePlan {
+    /// Kernels to execute in dependency order.
+    pub items: Vec<ScheduleItem>,
+    /// Replacements to apply to live tensor graphs after execution.
+    pub replacements: HashMap<UOp, UOp>,
 }
 
 /// Analyze a lazy `UOp` graph and produce kernels in dependency order.
 #[must_use]
 pub fn schedule(expr: &UOp) -> Vec<ScheduleItem> {
-    let order = expr.toposort();
+    schedule_many(std::slice::from_ref(expr)).items
+}
+
+/// Analyze several lazy roots together and produce one shared execution plan.
+///
+/// # Panics
+///
+/// Panics if `exprs` is empty.
+#[must_use]
+pub fn schedule_many(exprs: &[UOp]) -> SchedulePlan {
+    assert!(
+        !exprs.is_empty(),
+        "schedule_many requires at least one root"
+    );
+
+    let union = UOp::sink(exprs.to_vec());
+    let order = union.toposort();
     let consumer_map = build_consumer_map(&order);
     let nested_reduce_inputs = nested_reduce_inputs(&order);
+    let roots: HashSet<UOp> = exprs.iter().cloned().collect();
 
     let mut replacements: HashMap<UOp, UOp> = HashMap::new();
     let mut items = Vec::new();
 
     for node in &order {
-        if !should_materialize(node, expr, &consumer_map, &nested_reduce_inputs) {
+        if !should_materialize(node, &roots, &consumer_map, &nested_reduce_inputs) {
             continue;
         }
 
@@ -63,86 +88,28 @@ pub fn schedule(expr: &UOp) -> Vec<ScheduleItem> {
         items.push(item);
     }
 
-    let final_expr = substitute_materialized(expr, &replacements);
-    items.push(parameterize(&final_expr));
-    items
+    for expr in exprs {
+        let final_expr = substitute_materialized(expr, &replacements);
+        if let Some((store, replacement)) = assignment_effect(&final_expr) {
+            items.push(parameterize_store(&store));
+            replacements.insert(expr.clone(), replacement);
+        } else {
+            let item = parameterize(&final_expr);
+            let replacement = buffer_replacement(&item);
+            replacements.insert(expr.clone(), replacement);
+            items.push(item);
+        }
+    }
+
+    SchedulePlan {
+        items,
+        replacements,
+    }
 }
 
 fn parameterize(expr: &UOp) -> ScheduleItem {
-    use std::cell::RefCell;
-
     let state = runtime::state(expr.device());
-    let inputs: RefCell<Vec<KernelInput>> = RefCell::new(Vec::new());
-    let params: RefCell<HashMap<BufferId, UOp>> = RefCell::new(HashMap::new());
-    let scalar_params: RefCell<HashMap<UOp, UOp>> = RefCell::new(HashMap::new());
-
-    let rewrite_inputs = |node: &UOp| -> Option<UOp> {
-        match node.op() {
-            Op::Buffer => {
-                let Arg::Buffer(id, numel) = node.arg() else {
-                    return None;
-                };
-                let dtype = node.dtype();
-                let mut params = params.borrow_mut();
-                Some(
-                    params
-                        .entry(*id)
-                        .or_insert_with(|| {
-                            let mut inputs = inputs.borrow_mut();
-                            let slot = inputs.len() + 1;
-                            inputs.push(KernelInput::Buffer(*id));
-                            UOp::param_buffer(slot, dtype, *numel, expr.device())
-                        })
-                        .clone(),
-                )
-            }
-            Op::Bind => {
-                let variable = node.srcs()[0].clone();
-                let literal = scalar_input(node.srcs()[1].arg());
-                let mut scalar_params = scalar_params.borrow_mut();
-                let param = scalar_params
-                    .entry(variable)
-                    .or_insert_with(|| {
-                        let mut inputs = inputs.borrow_mut();
-                        let slot = inputs.len() + 1;
-                        inputs.push(literal.clone());
-                        UOp::param_scalar(slot, node.dtype(), expr.device())
-                    })
-                    .clone();
-                Some(param)
-            }
-            Op::Shrink => {
-                let Arg::Bounds(lengths) = node.arg() else {
-                    return None;
-                };
-                let src_shape = node.srcs()[0].shape()?;
-
-                let mut changed = false;
-                let mut new_srcs = vec![node.srcs()[0].clone()];
-                for ((axis, start), &len) in node.srcs()[1..].iter().enumerate().zip(lengths.iter())
-                {
-                    if len != src_shape[axis] && start.op() == Op::Const {
-                        let slot = {
-                            let mut inputs = inputs.borrow_mut();
-                            let slot = inputs.len() + 1;
-                            inputs.push(scalar_input(start.arg()));
-                            slot
-                        };
-                        let param = UOp::param_scalar(slot, start.dtype(), expr.device());
-                        new_srcs.push(param);
-                        changed = true;
-                        continue;
-                    }
-                    new_srcs.push(start.clone());
-                }
-
-                changed.then(|| UOp::new(Op::Shrink, node.dtype(), new_srcs, node.arg().clone()))
-            }
-            _ => None,
-        }
-    };
-
-    let parameterized = graph_rewrite(expr, &rewrite_inputs, "schedule");
+    let (parameterized, inputs) = parameterize_inputs(expr, 1, "schedule");
     let out_shape = parameterized.shape().unwrap_or_else(|| Shape::flat(1));
     let output_id = state.reserve_buffer(expr.dtype(), out_shape.numel());
     let out_param = UOp::param_buffer(0, expr.dtype(), out_shape.numel(), expr.device());
@@ -156,11 +123,105 @@ fn parameterize(expr: &UOp) -> ScheduleItem {
 
     ScheduleItem {
         sink,
-        inputs: inputs.into_inner(),
-        output_id,
-        out_shape,
-        out_dtype: expr.dtype(),
+        inputs,
+        output_id: Some(output_id),
+        out_shape: Some(out_shape),
+        out_dtype: Some(expr.dtype()),
     }
+}
+
+fn parameterize_store(store: &UOp) -> ScheduleItem {
+    assert_eq!(
+        store.op(),
+        Op::Store,
+        "parameterize_store requires a Store root"
+    );
+    let (parameterized_store, inputs) = parameterize_inputs(store, 0, "schedule_store");
+    ScheduleItem {
+        sink: UOp::sink(vec![parameterized_store]),
+        inputs,
+        output_id: None,
+        out_shape: None,
+        out_dtype: None,
+    }
+}
+
+fn parameterize_inputs(root: &UOp, slot_offset: usize, pass_name: &str) -> (UOp, Vec<KernelInput>) {
+    use std::cell::RefCell;
+
+    let device = root.device();
+    let inputs: RefCell<Vec<KernelInput>> = RefCell::new(Vec::new());
+    let params: RefCell<HashMap<BufferId, UOp>> = RefCell::new(HashMap::new());
+    let scalar_params: RefCell<HashMap<UOp, UOp>> = RefCell::new(HashMap::new());
+
+    // Allocating kernels reserve slot 0 for their output buffer; in-place store
+    // kernels start their inputs at slot 0 because the destination is already in
+    // the graph as a regular buffer input.
+    let rewrite_inputs = |node: &UOp| -> Option<UOp> {
+        match node.op() {
+            Op::Buffer => {
+                let Arg::Buffer(id, numel) = node.arg() else {
+                    return None;
+                };
+                let dtype = node.dtype();
+                let mut params = params.borrow_mut();
+                Some(
+                    params
+                        .entry(*id)
+                        .or_insert_with(|| {
+                            let slot = inputs.borrow().len() + slot_offset;
+                            inputs.borrow_mut().push(KernelInput::Buffer(*id));
+                            UOp::param_buffer(slot, dtype, *numel, device)
+                        })
+                        .clone(),
+                )
+            }
+            Op::Bind => {
+                let variable = node.srcs()[0].clone();
+                let literal = scalar_input(node.srcs()[1].arg());
+                let mut scalar_params = scalar_params.borrow_mut();
+                Some(
+                    scalar_params
+                        .entry(variable)
+                        .or_insert_with(|| {
+                            let slot = inputs.borrow().len() + slot_offset;
+                            inputs.borrow_mut().push(literal.clone());
+                            UOp::param_scalar(slot, node.dtype(), device)
+                        })
+                        .clone(),
+                )
+            }
+            Op::Shrink => {
+                let Arg::Bounds(lengths) = node.arg() else {
+                    return None;
+                };
+                let src_shape = node.srcs()[0].shape()?;
+
+                let mut changed = false;
+                let mut new_srcs = vec![node.srcs()[0].clone()];
+                for ((axis, start), &len) in node.srcs()[1..].iter().enumerate().zip(lengths.iter())
+                {
+                    if len != src_shape[axis] && start.op() == Op::Const {
+                        let slot = inputs.borrow().len() + slot_offset;
+                        inputs.borrow_mut().push(scalar_input(start.arg()));
+                        let param = UOp::param_scalar(slot, start.dtype(), device);
+                        new_srcs.push(param);
+                        changed = true;
+                        continue;
+                    }
+                    new_srcs.push(start.clone());
+                }
+
+                changed.then(|| UOp::new(Op::Shrink, node.dtype(), new_srcs, node.arg().clone()))
+            }
+            _ => None,
+        }
+    };
+
+    (
+        graph_rewrite(root, &rewrite_inputs, pass_name),
+        inputs.into_inner(),
+    )
 }
 
 fn scalar_input(literal: &Arg) -> KernelInput {
@@ -199,14 +260,28 @@ fn nested_reduce_inputs(order: &[UOp]) -> HashSet<UOp> {
 
 fn should_materialize(
     node: &UOp,
-    root: &UOp,
+    roots: &HashSet<UOp>,
     consumer_map: &HashMap<UOp, Vec<UOp>>,
     nested_reduce_inputs: &HashSet<UOp>,
 ) -> bool {
-    if node == root || node.shape().is_none() {
+    if roots.contains(node) || node.shape().is_none() {
         return false;
     }
-    if matches!(node.op(), Op::Buffer | Op::Const | Op::DefineVar | Op::Bind) {
+    if matches!(
+        node.op(),
+        Op::Sink
+            | Op::Store
+            | Op::After
+            | Op::Assign
+            | Op::DefineAcc
+            | Op::Buffer
+            | Op::Const
+            | Op::DefineVar
+            | Op::Bind
+    ) {
+        return false;
+    }
+    if node.has_buffer_identity() {
         return false;
     }
     if consumer_map
@@ -226,13 +301,26 @@ fn should_materialize(
 }
 
 fn buffer_replacement(item: &ScheduleItem) -> UOp {
-    let buffer = UOp::buffer(
-        item.output_id,
-        item.out_dtype,
-        item.out_shape.numel(),
-        item.sink.device(),
-    );
-    UOp::reshape(buffer, item.out_shape.clone())
+    let output_id = item
+        .output_id
+        .expect("buffer_replacement requires an allocated output");
+    let out_dtype = item
+        .out_dtype
+        .expect("buffer_replacement requires an allocated output dtype");
+    let out_shape = item
+        .out_shape
+        .clone()
+        .expect("buffer_replacement requires an allocated output shape");
+    let buffer = UOp::buffer(output_id, out_dtype, out_shape.numel(), item.sink.device());
+    UOp::reshape(buffer, out_shape)
+}
+
+fn assignment_effect(root: &UOp) -> Option<(UOp, UOp)> {
+    if root.op() != Op::After || root.srcs().len() != 2 {
+        return None;
+    }
+    let store = root.srcs()[1].clone();
+    (store.op() == Op::Store).then(|| (store, root.srcs()[0].clone()))
 }
 
 fn substitute_materialized(root: &UOp, replacements: &HashMap<UOp, UOp>) -> UOp {
@@ -294,7 +382,10 @@ mod tests {
 
         let items = schedule(&outer);
         assert_eq!(items.len(), 2);
-        assert!(matches!(items[1].inputs[0], KernelInput::Buffer(id) if id == items[0].output_id));
+        assert!(matches!(
+            items[1].inputs[0],
+            KernelInput::Buffer(id) if Some(id) == items[0].output_id
+        ));
     }
 
     #[test]
@@ -309,10 +400,22 @@ mod tests {
 
         let items = schedule(&root);
         assert_eq!(items.len(), 4);
-        assert!(matches!(items[1].inputs[0], KernelInput::Buffer(id) if id == items[0].output_id));
-        assert!(matches!(items[2].inputs[0], KernelInput::Buffer(id) if id == items[0].output_id));
-        assert!(matches!(items[3].inputs[0], KernelInput::Buffer(id) if id == items[1].output_id));
-        assert!(matches!(items[3].inputs[1], KernelInput::Buffer(id) if id == items[2].output_id));
+        assert!(matches!(
+            items[1].inputs[0],
+            KernelInput::Buffer(id) if Some(id) == items[0].output_id
+        ));
+        assert!(matches!(
+            items[2].inputs[0],
+            KernelInput::Buffer(id) if Some(id) == items[0].output_id
+        ));
+        assert!(matches!(
+            items[3].inputs[0],
+            KernelInput::Buffer(id) if Some(id) == items[1].output_id
+        ));
+        assert!(matches!(
+            items[3].inputs[1],
+            KernelInput::Buffer(id) if Some(id) == items[2].output_id
+        ));
     }
 
     #[test]
@@ -339,5 +442,21 @@ mod tests {
             .count();
 
         assert_eq!(scalar_count, 2);
+    }
+
+    #[test]
+    fn test_parameterize_store_turns_shrink_start_into_scalar_input() {
+        runtime::clear_for_tests(DeviceId::Cpu);
+        let src = buffer_uop(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]);
+        let dst = buffer_uop(&[0.0, 0.0, 0.0, 0.0], &[2, 2]);
+        let one = UOp::const_int(1, DType::I32, DeviceId::Cpu);
+        let zero = UOp::const_int(0, DType::I32, DeviceId::Cpu);
+        let narrowed = UOp::shrink(src, &[one, zero], &[2, 2]);
+
+        let item = parameterize_store(&UOp::store(dst, narrowed));
+
+        assert!(matches!(item.inputs[0], KernelInput::Buffer(_)));
+        assert!(matches!(item.inputs[1], KernelInput::Buffer(_)));
+        assert!(matches!(item.inputs[2], KernelInput::I32(1)));
     }
 }

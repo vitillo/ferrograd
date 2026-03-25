@@ -39,6 +39,42 @@ fn chain_ends(ranges: &[UOp], body: &UOp) -> UOp {
     current
 }
 
+fn store_output_index(dest: &UOp, idxs: &[UOp]) -> Option<UOp> {
+    match dest.op() {
+        Op::ParamBuffer => {
+            assert_eq!(
+                idxs.len(),
+                1,
+                "store destination must be flattened before reaching ParamBuffer"
+            );
+            Some(UOp::new(
+                Op::Index,
+                dest.dtype(),
+                vec![dest.clone(), idxs[0].clone()],
+                Arg::Index(0),
+            ))
+        }
+        Op::Buffer => {
+            assert_eq!(
+                idxs.len(),
+                1,
+                "store destination must be flattened before reaching Buffer"
+            );
+            Some(UOp::new(
+                Op::Index,
+                dest.dtype(),
+                vec![dest.clone(), idxs[0].clone()],
+                Arg::Index(0),
+            ))
+        }
+        op if op.is_movement() => {
+            let moved = rewrite_index_movement(dest, idxs)?;
+            store_output_index(&moved.srcs()[0], &moved.srcs()[1..])
+        }
+        _ => None,
+    }
+}
+
 // ── Rewrite rules ─────────────────────────────────────────────────────────
 
 /// **Store rule**: `Store(Param, expr)` → ranged Store with loops.
@@ -102,12 +138,16 @@ fn rewrite_store_add_ranges(store: &UOp) -> Option<UOp> {
     } else {
         flat_index(&out_ranges, &contiguous_strides(&squeezed))
     };
-    let out_idx = UOp::new(
-        Op::Index,
-        out_param.dtype(),
-        vec![out_param.clone(), out_flat],
-        Arg::Index(0),
-    );
+    let out_idx = if out_param.op() == Op::ParamBuffer {
+        UOp::new(
+            Op::Index,
+            out_param.dtype(),
+            vec![out_param.clone(), out_flat],
+            Arg::Index(0),
+        )
+    } else {
+        store_output_index(out_param, &axis_indices)?
+    };
     let new_store = UOp::new(Op::Store, DType::Void, vec![out_idx, indexed_expr], Arg::None);
 
     Some(chain_ends(&out_ranges, &new_store))
