@@ -558,6 +558,52 @@ impl Tensor {
         self.log2().mul(&ln2)
     }
 
+    /// Log-softmax over one axis, computed in a numerically stable way.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `axis` is out of range.
+    #[must_use]
+    pub fn log_softmax(&self, axis: usize) -> Self {
+        assert!(axis < self.ndim(), "log_softmax: axis {axis} out of range");
+        let max_x = self.max(&[axis]);
+        let shifted = self.sub(&max_x);
+        let sum_exp = shifted.exp().sum(&[axis]);
+        shifted.sub(&sum_exp.log())
+    }
+
+    /// Cross-entropy loss between logits and dense target probabilities.
+    ///
+    /// This follows tinygrad's choice to keep losses on `Tensor` instead of in
+    /// a separate `nn::loss` module. The current Rust version keeps the first
+    /// implementation simple and expects `targets` to already have the same
+    /// shape as `self`, for example one-hot labels.
+    ///
+    /// The class axis matches tinygrad's default: axis `0` for rank-1 logits
+    /// and axis `1` otherwise. The returned loss is the mean over the
+    /// non-class dimensions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the target shape does not match the logits.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn cross_entropy(&self, targets: &Self) -> Self {
+        assert_eq!(
+            self.shape(),
+            targets.shape(),
+            "cross_entropy: target shape {:?} must match logits shape {:?}",
+            targets.shape(),
+            self.shape()
+        );
+        let classes_axis = usize::from(self.ndim() != 1);
+        let log_probs = self.log_softmax(classes_axis);
+        let per_sample = targets.mul(&log_probs).sum(&[classes_axis]).neg();
+        let reduction_axes: Vec<usize> = (0..per_sample.ndim()).collect();
+        let scale = Self::scalar(1.0 / per_sample.numel() as f32);
+        per_sample.sum(&reduction_axes).mul(&scale)
+    }
+
     /// Matrix multiply `[M,K] @ [K,N] -> [M,N]`.
     ///
     /// # Panics
@@ -996,6 +1042,26 @@ mod tests {
     fn test_relu() {
         let a = Tensor::from_slice(&[1.0, -2.0, 3.0, -4.0], &[4]);
         assert_eq!(a.relu().to_vec(), vec![1.0, 0.0, 3.0, 0.0]);
+    }
+
+    #[test]
+    fn test_log_softmax_matches_known_values() {
+        let logits = Tensor::from_slice(&[0.0, 1.0], &[1, 2]);
+        let result = logits.log_softmax(1).realize().to_vec();
+        let expected = [-1.313_261_6_f32, -0.313_261_66_f32];
+        for (actual, target) in result.iter().zip(expected) {
+            assert!((actual - target).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_cross_entropy_matches_one_hot_mean_loss() {
+        let logits = Tensor::from_slice(&[2.0, 0.0, 0.0, 2.0], &[2, 2]);
+        let targets = Tensor::from_slice(&[1.0, 0.0, 0.0, 1.0], &[2, 2]);
+
+        let loss = logits.cross_entropy(&targets).realize().to_vec()[0];
+
+        assert!((loss - 0.126_928_05).abs() < 1e-5);
     }
 
     #[test]
