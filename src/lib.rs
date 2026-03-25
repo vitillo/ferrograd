@@ -34,6 +34,8 @@
 //! - [`codegen`] renders kernel-level `UOp` graphs to C for the CPU backend.
 //! - [`gradient`] builds reverse-mode graphs on top of the same lazy IR.
 //! - [`shape`] centralizes shape metadata and shape-only transformations.
+//! - [`dataset`] provides pre-packaged datasets (MNIST) with automatic
+//!   download and caching.
 //! - [`dtype`] and [`device`] bridge Rust values, IR types, buffers, and
 //!   backend execution.
 //!
@@ -42,6 +44,7 @@
 //! of the educational surface area.
 
 pub mod codegen;
+pub mod dataset;
 pub mod device;
 pub mod dtype;
 pub mod gradient;

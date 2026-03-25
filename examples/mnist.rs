@@ -8,47 +8,10 @@
 //! cargo run --example mnist --release
 //! ```
 
-use std::io::Read;
-
+use ferrograd::dataset::MNISTDataset;
 use ferrograd::tensor::Tensor;
 
-// ── MNIST data loading ──────────────────────────────────────────────────
-
-const MNIST_BASE: &str = "https://storage.googleapis.com/cvdf-datasets/mnist/";
-
-fn download(url: &str) -> Vec<u8> {
-    let resp = ureq::get(url).call().expect("failed to download");
-    let mut buf = Vec::new();
-    resp.into_body()
-        .as_reader()
-        .read_to_end(&mut buf)
-        .expect("failed to read response");
-    buf
-}
-
-fn gunzip(data: &[u8]) -> Vec<u8> {
-    use std::io::Read;
-    let mut decoder = flate2::read::GzDecoder::new(data);
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out).expect("failed to gunzip");
-    out
-}
-
-fn load_images(file: &str) -> (Tensor, usize) {
-    let raw = gunzip(&download(&format!("{MNIST_BASE}{file}")));
-    // IDX format: magic(4) + count(4) + rows(4) + cols(4) + pixels...
-    let count = u32::from_be_bytes(raw[4..8].try_into().unwrap()) as usize;
-    let pixels = &raw[16..];
-    assert_eq!(pixels.len(), count * 784);
-    let f32_data: Vec<f32> = pixels.iter().map(|&b| f32::from(b) / 255.0).collect();
-    (Tensor::from_slice(&f32_data, &[count, 784]), count)
-}
-
-fn load_labels(file: &str) -> Vec<u8> {
-    let raw = gunzip(&download(&format!("{MNIST_BASE}{file}")));
-    // IDX format: magic(4) + count(4) + labels...
-    raw[8..].to_vec()
-}
+// ── Helpers ──────────────────────────────────────────────────────────────
 
 fn one_hot(labels: &[u8], num_classes: usize) -> Tensor {
     let n = labels.len();
@@ -58,8 +21,6 @@ fn one_hot(labels: &[u8], num_classes: usize) -> Tensor {
     }
     Tensor::from_slice(&data, &[n, num_classes])
 }
-
-// ── Model ───────────────────────────────────────────────────────────────
 
 #[allow(clippy::cast_precision_loss)]
 fn rand_tensor(shape: &[usize], scale: f32) -> Tensor {
@@ -86,6 +47,8 @@ fn rand_tensor(shape: &[usize], scale: f32) -> Tensor {
     Tensor::from_slice(&data, shape)
 }
 
+// ── Model ────────────────────────────────────────────────────────────────
+
 fn log_softmax(x: &Tensor) -> Tensor {
     // log_softmax(x) = x - log(sum(exp(x - max(x))))
     // Numerically stable: subtract max before exp.
@@ -110,17 +73,14 @@ fn main() {
     let batch_size = 64;
     let epochs = 5;
 
-    println!("Downloading MNIST...");
-    let (train_images, train_count) = load_images("train-images-idx3-ubyte.gz");
-    let train_labels_raw = load_labels("train-labels-idx1-ubyte.gz");
-    let train_targets = one_hot(&train_labels_raw, 10);
-
-    let (test_images, _) = load_images("t10k-images-idx3-ubyte.gz");
-    let test_labels_raw = load_labels("t10k-labels-idx1-ubyte.gz");
+    println!("Loading MNIST...");
+    let dataset = MNISTDataset::load().unwrap();
+    let train_targets = one_hot(&dataset.train_labels, dataset.num_classes);
 
     println!(
-        "Train: {train_count} images, Test: {} images",
-        test_labels_raw.len()
+        "Train: {} images, Test: {} images",
+        dataset.train_len(),
+        dataset.test_len(),
     );
 
     let mut w1 = rand_tensor(&[784, 128], (2.0 / 784.0_f32).sqrt()).with_requires_grad(true);
@@ -128,7 +88,7 @@ fn main() {
     let mut w2 = rand_tensor(&[128, 10], (1.0 / 128.0_f32).sqrt()).with_requires_grad(true);
     let mut b2 = Tensor::zeros(&[1, 10], ferrograd::dtype::DType::F32).with_requires_grad(true);
 
-    let num_batches = train_count / batch_size;
+    let num_batches = dataset.train_len() / batch_size;
     let batch_scale = Tensor::scalar(1.0 / batch_size as f32);
 
     let max_batches = std::env::var("MAX_BATCHES")
@@ -140,7 +100,7 @@ fn main() {
 
         for batch_idx in 0..max_batches.min(num_batches) {
             let start = batch_idx * batch_size;
-            let batch_x = train_images.narrow(0, start, batch_size);
+            let batch_x = dataset.train_images.narrow(0, start, batch_size);
             let batch_t = train_targets.narrow(0, start, batch_size);
 
             let hidden = batch_x.matmul(&w1).add(&b1).relu();
@@ -164,10 +124,16 @@ fn main() {
         let batches_run = max_batches.min(num_batches);
         let avg_loss = epoch_loss / batches_run as f32;
 
-        let test_logits = test_images.matmul(&w1).add(&b1).relu().matmul(&w2).add(&b2);
+        let test_logits = dataset
+            .test_images
+            .matmul(&w1)
+            .add(&b1)
+            .relu()
+            .matmul(&w2)
+            .add(&b2);
         let test_preds = test_logits.to_vec();
         let mut correct = 0;
-        for (i, label) in test_labels_raw.iter().enumerate() {
+        for (i, label) in dataset.test_labels.iter().enumerate() {
             let logits_i = &test_preds[i * 10..(i + 1) * 10];
             let pred = logits_i
                 .iter()
@@ -179,7 +145,7 @@ fn main() {
                 correct += 1;
             }
         }
-        let accuracy = correct as f32 / test_labels_raw.len() as f32 * 100.0;
+        let accuracy = correct as f32 / dataset.test_len() as f32 * 100.0;
         println!("Epoch {epoch}: avg_loss={avg_loss:.4}, test_accuracy={accuracy:.1}%");
     }
 }
