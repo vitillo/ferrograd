@@ -70,7 +70,7 @@ fn cross_entropy(logits: &Tensor, targets: &Tensor) -> Tensor {
 #[allow(clippy::cast_precision_loss)]
 fn main() {
     let lr = 0.01_f32;
-    let batch_size = 64;
+    let batch_size = 256;
     let epochs = 5;
 
     println!("Loading MNIST...");
@@ -99,6 +99,7 @@ fn main() {
         let mut epoch_loss = 0.0_f32;
 
         for batch_idx in 0..max_batches.min(num_batches) {
+            let batch_start = std::time::Instant::now();
             let start = batch_idx * batch_size;
             let batch_x = dataset.train_images.narrow(0, start, batch_size);
             let batch_t = train_targets.narrow(0, start, batch_size);
@@ -117,8 +118,9 @@ fn main() {
 
             let loss_val = loss.to_vec()[0];
             epoch_loss += loss_val;
+            let batch_ms = batch_start.elapsed().as_secs_f64() * 1000.0;
 
-            println!("  epoch {epoch} batch {batch_idx:>4}/{num_batches}  loss={loss_val:.4}");
+            println!("  epoch {epoch} batch {batch_idx:>4}/{num_batches}  loss={loss_val:.4}  {batch_ms:.1}ms");
         }
 
         let batches_run = max_batches.min(num_batches);
