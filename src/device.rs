@@ -40,6 +40,14 @@ pub enum DeviceId {
     Cpu,
 }
 
+impl std::fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cpu => write!(f, "cpu"),
+        }
+    }
+}
+
 /// Errors that can occur during device operations.
 #[derive(Debug, thiserror::Error)]
 pub enum DeviceError {
