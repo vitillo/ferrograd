@@ -28,6 +28,7 @@ use crate::shape::Shape;
 use crate::uop::{self, Arg, Op, UOp};
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 /// A runtime input to a compiled kernel.
 pub enum KernelInput {
     /// A realized tensor buffer referenced by a shared slot handle.

@@ -19,6 +19,7 @@ use crate::shape::Shape;
 
 /// The operations our IR supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Op {
     /// A device identity leaf.
     Device,
@@ -123,6 +124,7 @@ impl fmt::Display for Op {
 
 /// Op-specific payload attached to a `UOp`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Arg {
     /// No argument.
     None,

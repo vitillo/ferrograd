@@ -56,6 +56,7 @@ use crate::uop::UOp;
 
 /// Errors that can occur during CPU JIT compilation and loading.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CpuError {
     /// Failed to create a temporary file for C source or compiled output.
     #[error("failed to create temp file: {0}")]

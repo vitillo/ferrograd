@@ -14,6 +14,7 @@ use crate::tensor::{cpu, Tensor};
 
 /// Errors that can occur while loading a dataset.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DatasetError {
     /// An I/O error (file read, directory creation, etc.).
     #[error("io: {0}")]

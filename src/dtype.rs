@@ -20,6 +20,7 @@
 /// buffers use it for allocation sizing, the codegen uses it for C type names,
 /// and the IR uses it for type checking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum DType {
     /// 32-bit IEEE 754 floating point. The workhorse type for neural networks.
     F32,

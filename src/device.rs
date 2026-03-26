@@ -35,6 +35,7 @@ pub use cpu::CpuDevice;
 /// runtime handle on each node. We mirror that split with a small value type
 /// that is cheap to copy and hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum DeviceId {
     /// The CPU backend.
     Cpu,
@@ -42,6 +43,7 @@ pub enum DeviceId {
 
 /// Errors that can occur during device operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DeviceError {
     /// CPU backend: clang compilation or dlopen/dlsym failed.
     #[error("cpu: {0}")]
@@ -55,6 +57,7 @@ pub enum DeviceError {
 /// it to the device which knows how to use it. This is what makes the same
 /// `Buffer` type work across CPU, CUDA, and future backends.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Storage {
     /// Host memory, owned as a flat byte array. Used by `CpuDevice`.
     Cpu(Vec<u8>),
@@ -227,6 +230,7 @@ fn next_buffer_id() -> BufferId {
 
 /// A runtime argument passed to a compiled kernel.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum KernelArg {
     /// Tensor storage passed by pointer.
     Buffer(Buffer),
@@ -244,6 +248,7 @@ pub enum KernelArg {
 /// [`CompiledKernel`](cpu::CompiledKernel) (clang + dlopen).
 /// A future `CudaDevice` would wrap a `CUmodule`/`CUfunction`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Program {
     /// CPU program: a compiled shared library loaded via dlopen.
     Cpu {
