@@ -217,8 +217,12 @@ mod tests {
     #[allow(clippy::cast_possible_truncation)]
     fn scalar_uop(val: f64) -> UOp {
         let device = DeviceId::Cpu;
-        let id = runtime::state(device).store_buffer(crate::device::Buffer::from_f32(&[val as f32]));
-        let buf = UOp::buffer(id, DType::F32, 1, device);
+        let state = runtime::state(device);
+        let buffer = state.device().allocate(DType::F32, 1);
+        state
+            .device()
+            .copy_from_host(&buffer, bytemuck::cast_slice(&[val as f32]));
+        let buf = UOp::buffer(buffer, DType::F32, device);
         UOp::reshape(buf, Shape::from([1]))
     }
 

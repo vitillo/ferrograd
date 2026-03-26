@@ -110,11 +110,7 @@ impl Renderer for ClangRenderer {
                 _ => {}
             }
 
-            let srcs: Vec<String> = node
-                .srcs()
-                .iter()
-                .map(|s| name_of(s, &names))
-                .collect();
+            let srcs: Vec<String> = node.srcs().iter().map(|s| name_of(s, &names)).collect();
 
             match node.op() {
                 Op::ParamBuffer => {
@@ -131,8 +127,11 @@ impl Renderer for ClangRenderer {
                     let expr = match node.arg() {
                         Arg::Float(v) => {
                             if v.is_infinite() {
-                                if v.is_sign_positive() { "INFINITY".to_string() }
-                                else { "(-INFINITY)".to_string() }
+                                if v.is_sign_positive() {
+                                    "INFINITY".to_string()
+                                } else {
+                                    "(-INFINITY)".to_string()
+                                }
                             } else if v.is_nan() {
                                 "NAN".to_string()
                             } else {
@@ -141,12 +140,20 @@ impl Renderer for ClangRenderer {
                                 } else {
                                     format!("{v}")
                                 };
-                                if node.dtype() == DType::F32 { format!("{s}f") } else { s }
+                                if node.dtype() == DType::F32 {
+                                    format!("{s}f")
+                                } else {
+                                    s
+                                }
                             }
                         }
                         Arg::Int(v) => format!("{v}"),
                         Arg::Bool(v) => {
-                            if *v { "1".to_string() } else { "0".to_string() }
+                            if *v {
+                                "1".to_string()
+                            } else {
+                                "0".to_string()
+                            }
                         }
                         _ => panic!("Const with unexpected arg: {:?}", node.arg()),
                     };
@@ -185,21 +192,29 @@ impl Renderer for ClangRenderer {
                 }
                 // ALU ops and DefineAcc all follow the same pattern: declare a
                 // typed local variable and assign an expression to it.
-                Op::Neg | Op::Exp2 | Op::Log2 | Op::Sqrt | Op::Reciprocal
-                | Op::Add | Op::Mul | Op::Max | Op::CmpLt | Op::Where
+                Op::Neg
+                | Op::Exp2
+                | Op::Log2
+                | Op::Sqrt
+                | Op::Reciprocal
+                | Op::Add
+                | Op::Mul
+                | Op::Max
+                | Op::CmpLt
+                | Op::Where
                 | Op::DefineAcc => {
                     let (prefix, expr) = match node.op() {
-                        Op::Neg        => ("alu", format!("(-{})", srcs[0])),
-                        Op::Exp2       => ("alu", format!("exp2({})", srcs[0])),
-                        Op::Log2       => ("alu", format!("log2({})", srcs[0])),
-                        Op::Sqrt       => ("alu", format!("__builtin_sqrtf({})", srcs[0])),
+                        Op::Neg => ("alu", format!("(-{})", srcs[0])),
+                        Op::Exp2 => ("alu", format!("exp2({})", srcs[0])),
+                        Op::Log2 => ("alu", format!("log2({})", srcs[0])),
+                        Op::Sqrt => ("alu", format!("__builtin_sqrtf({})", srcs[0])),
                         Op::Reciprocal => ("alu", format!("(1/{})", srcs[0])),
-                        Op::Add        => ("alu", format!("({}+{})", srcs[0], srcs[1])),
-                        Op::Mul        => ("alu", format!("({}*{})", srcs[0], srcs[1])),
-                        Op::Max        => ("alu", format!("(({}>{1})?{0}:{1})", srcs[0], srcs[1])),
-                        Op::CmpLt      => ("alu", format!("({}<{})", srcs[0], srcs[1])),
-                        Op::Where      => ("alu", format!("({}?{}:{})", srcs[0], srcs[1], srcs[2])),
-                        Op::DefineAcc  => ("acc", srcs[0].clone()),
+                        Op::Add => ("alu", format!("({}+{})", srcs[0], srcs[1])),
+                        Op::Mul => ("alu", format!("({}*{})", srcs[0], srcs[1])),
+                        Op::Max => ("alu", format!("(({}>{1})?{0}:{1})", srcs[0], srcs[1])),
+                        Op::CmpLt => ("alu", format!("({}<{})", srcs[0], srcs[1])),
+                        Op::Where => ("alu", format!("({}?{}:{})", srcs[0], srcs[1], srcs[2])),
+                        Op::DefineAcc => ("acc", srcs[0].clone()),
                         _ => unreachable!(),
                     };
                     let var = format!("{prefix}{alu_count}");
@@ -251,6 +266,16 @@ mod tests {
     use super::*;
     use crate::device::{CpuDevice, Device, DeviceId, KernelArg};
 
+    fn f32_buffer(dev: &CpuDevice, data: &[f32]) -> crate::device::Buffer {
+        let buffer = dev.allocate(DType::F32, data.len());
+        dev.copy_from_host(&buffer, bytemuck::cast_slice(data));
+        buffer
+    }
+
+    fn read_f32(dev: &CpuDevice, buffer: &crate::device::Buffer) -> Vec<f32> {
+        bytemuck::cast_slice::<u8, f32>(&dev.copy_to_host(buffer)).to_vec()
+    }
+
     fn build_add_graph(n: i64) -> UOp {
         let device = DeviceId::Cpu;
         let out_ptr = UOp::param_buffer(0, DType::F32, 3, device);
@@ -258,12 +283,27 @@ mod tests {
         let b_ptr = UOp::param_buffer(2, DType::F32, 3, device);
         let bound = UOp::const_int(n, DType::I32, device);
         let idx = UOp::new(Op::Range, DType::I32, vec![bound], Arg::Index(0));
-        let a_idx = UOp::new(Op::Index, a_ptr.dtype(), vec![a_ptr, idx.clone()], Arg::None);
+        let a_idx = UOp::new(
+            Op::Index,
+            a_ptr.dtype(),
+            vec![a_ptr, idx.clone()],
+            Arg::None,
+        );
         let a_val = UOp::new(Op::Load, DType::F32, vec![a_idx], Arg::None);
-        let b_idx = UOp::new(Op::Index, b_ptr.dtype(), vec![b_ptr, idx.clone()], Arg::None);
+        let b_idx = UOp::new(
+            Op::Index,
+            b_ptr.dtype(),
+            vec![b_ptr, idx.clone()],
+            Arg::None,
+        );
         let b_val = UOp::new(Op::Load, DType::F32, vec![b_idx], Arg::None);
         let sum = UOp::add(a_val, b_val);
-        let out_idx = UOp::new(Op::Index, out_ptr.dtype(), vec![out_ptr, idx.clone()], Arg::None);
+        let out_idx = UOp::new(
+            Op::Index,
+            out_ptr.dtype(),
+            vec![out_ptr, idx.clone()],
+            Arg::None,
+        );
         let store = UOp::new(Op::Store, DType::Void, vec![out_idx, sum], Arg::None);
         let end = UOp::new(Op::End, DType::Void, vec![idx, store.clone()], Arg::None);
         UOp::sink(vec![store, end])
@@ -291,15 +331,15 @@ mod tests {
         let program = dev.compile(&code, "add", 3).expect("compile failed");
         let mut args = [
             KernelArg::Buffer(dev.allocate(DType::F32, 3)),
-            KernelArg::Buffer(crate::device::Buffer::from_f32(&[1.0, 2.0, 3.0])),
-            KernelArg::Buffer(crate::device::Buffer::from_f32(&[4.0, 5.0, 6.0])),
+            KernelArg::Buffer(f32_buffer(&dev, &[1.0, 2.0, 3.0])),
+            KernelArg::Buffer(f32_buffer(&dev, &[4.0, 5.0, 6.0])),
         ];
 
         dev.execute(&program, &mut args).unwrap();
         let KernelArg::Buffer(out) = &args[0] else {
             panic!("output arg should stay a buffer");
         };
-        assert_eq!(out.to_f32(), vec![5.0, 7.0, 9.0]);
+        assert_eq!(read_f32(&dev, out), vec![5.0, 7.0, 9.0]);
     }
 
     #[test]
@@ -309,10 +349,20 @@ mod tests {
         let a_ptr = UOp::param_buffer(1, DType::F32, 3, device);
         let n = UOp::const_int(3, DType::I32, device);
         let idx = UOp::new(Op::Range, DType::I32, vec![n], Arg::Index(0));
-        let a_idx = UOp::new(Op::Index, a_ptr.dtype(), vec![a_ptr, idx.clone()], Arg::None);
+        let a_idx = UOp::new(
+            Op::Index,
+            a_ptr.dtype(),
+            vec![a_ptr, idx.clone()],
+            Arg::None,
+        );
         let a_val = UOp::new(Op::Load, DType::F32, vec![a_idx], Arg::None);
         let neg = UOp::neg(a_val);
-        let out_idx = UOp::new(Op::Index, out_ptr.dtype(), vec![out_ptr, idx.clone()], Arg::None);
+        let out_idx = UOp::new(
+            Op::Index,
+            out_ptr.dtype(),
+            vec![out_ptr, idx.clone()],
+            Arg::None,
+        );
         let store = UOp::new(Op::Store, DType::Void, vec![out_idx, neg], Arg::None);
         let end = UOp::new(Op::End, DType::Void, vec![idx, store.clone()], Arg::None);
         let sink = UOp::sink(vec![store, end]);
@@ -322,14 +372,14 @@ mod tests {
         let program = dev.compile(&code, "negate", 2).expect("compile failed");
         let mut args = [
             KernelArg::Buffer(dev.allocate(DType::F32, 3)),
-            KernelArg::Buffer(crate::device::Buffer::from_f32(&[1.0, -2.0, 3.0])),
+            KernelArg::Buffer(f32_buffer(&dev, &[1.0, -2.0, 3.0])),
         ];
 
         dev.execute(&program, &mut args).unwrap();
         let KernelArg::Buffer(out) = &args[0] else {
             panic!("output arg should stay a buffer");
         };
-        assert_eq!(out.to_f32(), vec![-1.0, 2.0, -3.0]);
+        assert_eq!(read_f32(&dev, out), vec![-1.0, 2.0, -3.0]);
     }
 
     #[test]
@@ -340,11 +390,21 @@ mod tests {
         let n = UOp::const_int(4, DType::I32, device);
         let zero = UOp::const_float(0.0, DType::F32, device);
         let idx = UOp::new(Op::Range, DType::I32, vec![n], Arg::Index(0));
-        let a_idx = UOp::new(Op::Index, a_ptr.dtype(), vec![a_ptr, idx.clone()], Arg::None);
+        let a_idx = UOp::new(
+            Op::Index,
+            a_ptr.dtype(),
+            vec![a_ptr, idx.clone()],
+            Arg::None,
+        );
         let a_val = UOp::new(Op::Load, DType::F32, vec![a_idx], Arg::None);
         let cond = UOp::cmplt(zero.clone(), a_val.clone());
         let relu = UOp::where_(cond, a_val, zero);
-        let out_idx = UOp::new(Op::Index, out_ptr.dtype(), vec![out_ptr, idx.clone()], Arg::None);
+        let out_idx = UOp::new(
+            Op::Index,
+            out_ptr.dtype(),
+            vec![out_ptr, idx.clone()],
+            Arg::None,
+        );
         let store = UOp::new(Op::Store, DType::Void, vec![out_idx, relu], Arg::None);
         let end = UOp::new(Op::End, DType::Void, vec![idx, store.clone()], Arg::None);
         let sink = UOp::sink(vec![store, end]);
@@ -354,13 +414,13 @@ mod tests {
         let program = dev.compile(&code, "relu", 2).expect("compile failed");
         let mut args = [
             KernelArg::Buffer(dev.allocate(DType::F32, 4)),
-            KernelArg::Buffer(crate::device::Buffer::from_f32(&[1.0, -2.0, 3.0, -4.0])),
+            KernelArg::Buffer(f32_buffer(&dev, &[1.0, -2.0, 3.0, -4.0])),
         ];
 
         dev.execute(&program, &mut args).unwrap();
         let KernelArg::Buffer(out) = &args[0] else {
             panic!("output arg should stay a buffer");
         };
-        assert_eq!(out.to_f32(), vec![1.0, 0.0, 3.0, 0.0]);
+        assert_eq!(read_f32(&dev, out), vec![1.0, 0.0, 3.0, 0.0]);
     }
 }

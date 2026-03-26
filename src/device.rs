@@ -14,7 +14,13 @@
 
 pub mod cpu;
 
+use std::cell::RefCell;
+use std::fmt;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::dtype::DType;
+use crate::runtime;
 
 // Re-export CpuDevice for convenience.
 pub use cpu::CpuDevice;
@@ -51,139 +57,170 @@ pub enum Storage {
     // Future: Cuda { device_ptr: u64, len: usize }
 }
 
-/// A typed memory buffer for kernel data.
+/// Opaque identifier for debug output tied to a concrete buffer slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BufferId(usize);
+
+impl BufferId {
+    /// Return the raw numeric id, useful in debug output.
+    #[must_use]
+    pub fn raw(self) -> usize {
+        self.0
+    }
+}
+
+impl fmt::Display for BufferId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Shared device buffer object.
 ///
-/// Buffers are created by a [`Device`] and carry the device's opaque
-/// [`Storage`]. The `dtype` and `numel` give the raw bytes meaning.
-///
-/// A device-allocated memory region holding tensor data.
-#[derive(Debug, Clone)]
-pub struct Buffer {
-    /// What type each element is.
+/// A `Buffer` carries stable identity, metadata, and optional concrete storage.
+/// This lets one value represent both reserved outputs (no storage yet) and
+/// realized device memory.
+#[derive(Clone, Debug)]
+pub struct Buffer(Rc<BufferInner>);
+
+#[derive(Debug)]
+struct BufferInner {
+    id: BufferId,
+    device: DeviceId,
     dtype: DType,
-    /// How many elements (not bytes).
     numel: usize,
-    /// Device-managed memory.
-    storage: Storage,
+    storage: RefCell<Option<Storage>>,
 }
 
 impl Buffer {
+    fn with_id(
+        id: BufferId,
+        device: DeviceId,
+        dtype: DType,
+        numel: usize,
+        storage: Option<Storage>,
+    ) -> Self {
+        if let Some(Storage::Cpu(ref data)) = storage {
+            debug_assert_eq!(
+                data.len(),
+                dtype.size_bytes() * numel,
+                "storage size {} doesn't match dtype {:?} * numel {}",
+                data.len(),
+                dtype,
+                numel
+            );
+        }
+        Self(Rc::new(BufferInner {
+            id,
+            device,
+            dtype,
+            numel,
+            storage: RefCell::new(storage),
+        }))
+    }
+
     /// Create a buffer wrapping device-provided storage.
     ///
     /// Called by [`Device::allocate`], not by user code directly.
     #[must_use]
-    pub fn new(dtype: DType, numel: usize, storage: Storage) -> Self {
-        let Storage::Cpu(ref data) = storage;
-        debug_assert_eq!(
-            data.len(),
-            dtype.size_bytes() * numel,
-            "storage size {} doesn't match dtype {:?} * numel {}",
-            data.len(),
-            dtype,
-            numel
-        );
-        Self {
-            dtype,
-            numel,
-            storage,
-        }
+    pub fn new(device: DeviceId, dtype: DType, numel: usize, storage: Storage) -> Self {
+        Self::with_id(next_buffer_id(), device, dtype, numel, Some(storage))
+    }
+
+    /// Create an uninitialized output slot that will be filled after execution.
+    #[must_use]
+    pub fn reserved(device: DeviceId, dtype: DType, numel: usize) -> Self {
+        Self::with_id(next_buffer_id(), device, dtype, numel, None)
+    }
+
+    /// Return whether this buffer already owns concrete device storage.
+    #[must_use]
+    pub fn is_realized(&self) -> bool {
+        self.0.storage.borrow().is_some()
+    }
+
+    /// Return the stable debug id for this buffer slot.
+    #[must_use]
+    pub fn id(&self) -> BufferId {
+        self.0.id
+    }
+
+    /// Return the owning device.
+    #[must_use]
+    pub fn device(&self) -> DeviceId {
+        self.0.device
+    }
+
+    /// Return the element type expected in this slot.
+    #[must_use]
+    pub fn dtype(&self) -> DType {
+        self.0.dtype
+    }
+
+    /// Return the element count expected in this slot.
+    #[must_use]
+    pub fn numel(&self) -> usize {
+        self.0.numel
     }
 
     /// Total size in bytes.
     #[must_use]
     pub fn nbytes(&self) -> usize {
-        self.dtype.size_bytes() * self.numel
+        self.dtype().size_bytes() * self.numel()
     }
 
-    /// Number of elements.
-    #[must_use]
-    pub fn numel(&self) -> usize {
-        self.numel
-    }
-
-    /// The element type.
-    #[must_use]
-    pub fn dtype(&self) -> DType {
-        self.dtype
-    }
-
-    /// Borrow the underlying storage.
-    #[must_use]
-    pub fn storage(&self) -> &Storage {
-        &self.storage
-    }
-
-    /// Mutably borrow the underlying storage.
-    #[must_use]
-    pub fn storage_mut(&mut self) -> &mut Storage {
-        &mut self.storage
-    }
-
-    /// Get a mutable raw pointer to the buffer's CPU memory.
+    /// Ensure this buffer owns concrete storage, allocating it through the
+    /// owning device on first use.
     ///
     /// # Panics
     ///
-    /// Panics if the storage isn't `Storage::Cpu`.
-    #[must_use]
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        let Storage::Cpu(ref mut data) = self.storage;
-        data.as_mut_ptr()
-    }
-
-    /// Copy raw bytes from the host into this buffer.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `src` length doesn't match the buffer's byte size, or if
-    /// the storage isn't CPU-backed.
-    pub fn copyin(&mut self, src: &[u8]) {
-        let Storage::Cpu(ref mut data) = self.storage;
-        assert_eq!(
-            src.len(),
-            data.len(),
-            "copyin: expected {} bytes, got {}",
-            data.len(),
-            src.len()
-        );
-        data.copy_from_slice(src);
-    }
-
-    /// Copy the buffer's raw bytes back to the host.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the storage isn't CPU-backed.
-    #[must_use]
-    pub fn copyout(&self) -> Vec<u8> {
-        let Storage::Cpu(ref data) = self.storage;
-        data.clone()
-    }
-
-    /// Create a CPU buffer from a `&[f32]`, copying the data in.
-    ///
-    /// Convenience for tests and demos. In real usage, buffers are created
-    /// through a [`Device`].
-    #[must_use]
-    pub fn from_f32(data: &[f32]) -> Self {
-        let bytes = bytemuck::cast_slice(data).to_vec();
-        Self {
-            dtype: DType::F32,
-            numel: data.len(),
-            storage: Storage::Cpu(bytes),
+    /// Panics if the backend returns a buffer with metadata that does not
+    /// match this reservation.
+    pub fn ensure_allocated(&self) {
+        if self.is_realized() {
+            return;
         }
+        let allocated = runtime::state(self.device())
+            .device()
+            .allocate(self.dtype(), self.numel());
+        assert_eq!(
+            allocated.dtype(),
+            self.dtype(),
+            "allocated buffer dtype must match reservation"
+        );
+        assert_eq!(
+            allocated.numel(),
+            self.numel(),
+            "allocated buffer size must match reservation"
+        );
+        let storage = allocated
+            .0
+            .storage
+            .borrow_mut()
+            .take()
+            .expect("allocated buffer must contain storage");
+        *self.0.storage.borrow_mut() = Some(storage);
     }
+}
 
-    /// Read this buffer's contents as a `Vec<f32>`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the dtype is not `F32` or storage isn't CPU-backed.
-    #[must_use]
-    pub fn to_f32(&self) -> Vec<f32> {
-        assert_eq!(self.dtype, DType::F32, "to_f32 called on {}", self.dtype);
-        let Storage::Cpu(ref data) = self.storage;
-        bytemuck::cast_slice(data).to_vec()
+impl PartialEq for Buffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.id() == other.id()
     }
+}
+
+impl Eq for Buffer {}
+
+impl std::hash::Hash for Buffer {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id().hash(state);
+    }
+}
+
+static NEXT_BUFFER_ID: AtomicUsize = AtomicUsize::new(0);
+
+fn next_buffer_id() -> BufferId {
+    BufferId(NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed))
 }
 
 /// A runtime argument passed to a compiled kernel.
@@ -225,8 +262,30 @@ pub trait Device {
     /// Return this backend's stable identifier.
     fn id(&self) -> DeviceId;
 
+    /// Create an unrealized buffer identity on this device.
+    fn reserve_buffer(&self, dtype: DType, numel: usize) -> Buffer;
+
     /// Allocate a zero-initialized buffer on this device.
     fn allocate(&self, dtype: DType, numel: usize) -> Buffer;
+
+    /// Copy raw host bytes into a device buffer.
+    ///
+    /// Backends own host transfer semantics, so generic [`Buffer`] stays
+    /// device-agnostic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `buffer` belongs to a different device or `src` has the wrong
+    /// byte length.
+    fn copy_from_host(&self, buffer: &Buffer, src: &[u8]);
+
+    /// Copy raw device bytes back to host memory.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `buffer` belongs to a different device or cannot be copied
+    /// back to host memory.
+    fn copy_to_host(&self, buffer: &Buffer) -> Vec<u8>;
 
     /// Compile source code into a program that can be executed on this device.
     ///
@@ -255,23 +314,74 @@ mod tests {
     #[test]
     fn test_allocate_zeroed() {
         // Arrange / Act
-        let buf = Buffer::new(DType::F32, 4, Storage::Cpu(vec![0u8; 16]));
+        let buf = Buffer::new(DeviceId::Cpu, DType::F32, 4, Storage::Cpu(vec![0u8; 16]));
+        let dev = CpuDevice;
 
         // Assert
         assert_eq!(buf.numel(), 4);
         assert_eq!(buf.nbytes(), 16);
         assert_eq!(buf.dtype(), DType::F32);
-        assert!(buf.copyout().iter().all(|&b| b == 0));
+        assert!(dev.copy_to_host(&buf).iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_reserve_buffer_keeps_metadata_unrealized() {
+        // Arrange
+        let dev = CpuDevice;
+
+        // Act
+        let buf = dev.reserve_buffer(DType::I32, 6);
+
+        // Assert
+        assert_eq!(buf.device(), DeviceId::Cpu);
+        assert_eq!(buf.dtype(), DType::I32);
+        assert_eq!(buf.numel(), 6);
+        assert_eq!(buf.nbytes(), 24);
+        assert!(!buf.is_realized());
+    }
+
+    #[test]
+    fn test_ensure_allocated_realizes_reserved_buffer() {
+        // Arrange
+        let dev = CpuDevice;
+        let buf = dev.reserve_buffer(DType::F32, 4);
+
+        // Act
+        buf.ensure_allocated();
+
+        // Assert
+        assert!(buf.is_realized());
+        assert_eq!(buf.device(), DeviceId::Cpu);
+        assert_eq!(buf.dtype(), DType::F32);
+        assert_eq!(buf.numel(), 4);
+        assert!(dev.copy_to_host(&buf).iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_buffer_identity_is_stable_per_allocation() {
+        // Arrange
+        let dev = CpuDevice;
+        let left = dev.reserve_buffer(DType::F32, 2);
+        let left_clone = left.clone();
+        let right = dev.reserve_buffer(DType::F32, 2);
+
+        // Act / Assert
+        assert_eq!(left, left_clone);
+        assert_eq!(left.id(), left_clone.id());
+        assert_ne!(left, right);
+        assert_ne!(left.id(), right.id());
     }
 
     #[test]
     fn test_f32_roundtrip() {
         // Arrange
+        let dev = CpuDevice;
         let input = vec![1.0f32, 2.0, 3.0];
 
         // Act
-        let buf = Buffer::from_f32(&input);
-        let output = buf.to_f32();
+        let buf = dev.allocate(DType::F32, input.len());
+        dev.copy_from_host(&buf, bytemuck::cast_slice(&input));
+        let output: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&dev.copy_to_host(&buf)).to_vec();
 
         // Assert
         assert_eq!(output, input);
@@ -280,24 +390,37 @@ mod tests {
     #[test]
     fn test_copyin_copyout_raw() {
         // Arrange
-        let mut buf = Buffer::new(DType::I32, 2, Storage::Cpu(vec![0u8; 8]));
+        let dev = CpuDevice;
+        let buf = Buffer::new(DeviceId::Cpu, DType::I32, 2, Storage::Cpu(vec![0u8; 8]));
         let src: Vec<u8> = vec![1, 0, 0, 0, 2, 0, 0, 0]; // little-endian i32: 1, 2
 
         // Act
-        buf.copyin(&src);
-        let out = buf.copyout();
+        dev.copy_from_host(&buf, &src);
+        let out = dev.copy_to_host(&buf);
 
         // Assert
         assert_eq!(out, src);
     }
 
     #[test]
-    #[should_panic(expected = "copyin: expected 8 bytes, got 4")]
+    #[should_panic(expected = "copy_from_host: expected 8 bytes, got 4")]
     fn test_copyin_wrong_size_panics() {
         // Arrange
-        let mut buf = Buffer::new(DType::F32, 2, Storage::Cpu(vec![0u8; 8]));
+        let dev = CpuDevice;
+        let buf = Buffer::new(DeviceId::Cpu, DType::F32, 2, Storage::Cpu(vec![0u8; 8]));
 
         // Act -- should panic
-        buf.copyin(&[0u8; 4]);
+        dev.copy_from_host(&buf, &[0u8; 4]);
+    }
+
+    #[test]
+    #[should_panic(expected = "copy_to_host called on unrealized or non-CPU buffer")]
+    fn test_copyout_unrealized_reserved_buffer_panics() {
+        // Arrange
+        let dev = CpuDevice;
+        let buf = dev.reserve_buffer(DType::F32, 2);
+
+        // Act -- should panic
+        let _ = dev.copy_to_host(&buf);
     }
 }

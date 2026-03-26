@@ -76,8 +76,17 @@ fn same_squeezed_dims(src_shape: &Shape, dst_shape: &Shape) -> bool {
 /// Push `Index` through elementwise ops.
 #[must_use]
 pub fn rewrite_index_alu(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
-    let new_srcs: Vec<UOp> = inner.srcs().iter().map(|src| index_wrap(src, idxs)).collect();
-    Some(UOp::new(inner.op(), inner.dtype(), new_srcs, inner.arg().clone()))
+    let new_srcs: Vec<UOp> = inner
+        .srcs()
+        .iter()
+        .map(|src| index_wrap(src, idxs))
+        .collect();
+    Some(UOp::new(
+        inner.op(),
+        inner.dtype(),
+        new_srcs,
+        inner.arg().clone(),
+    ))
 }
 
 /// Push `Index` through movement ops.

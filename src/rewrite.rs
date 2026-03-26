@@ -64,7 +64,11 @@ pub fn graph_rewrite(root: &UOp, rewrite: &mut dyn FnMut(&UOp) -> Option<UOp>, n
                 .map(|s| replace.get(s).cloned().unwrap_or_else(|| s.clone()))
                 .collect();
 
-            let srcs_changed = node.srcs().iter().zip(&new_srcs).any(|(old, new)| old != new);
+            let srcs_changed = node
+                .srcs()
+                .iter()
+                .zip(&new_srcs)
+                .any(|(old, new)| old != new);
             let rebuilt = if srcs_changed {
                 UOp::new(node.op(), node.dtype(), new_srcs, node.arg().clone())
             } else {
@@ -138,13 +142,13 @@ fn const_from_arg(node: &UOp, arg: &Arg) -> UOp {
 pub fn symbolic_simple(node: &UOp) -> Option<UOp> {
     match (node.op(), node.srcs()) {
         // const + const → const
-        (Op::Add, [a, b]) if a.is_const() && b.is_const() => {
-            fold_binary(Op::Add, a.arg(), b.arg()).as_ref().map(|arg| const_from_arg(a, arg))
-        }
+        (Op::Add, [a, b]) if a.is_const() && b.is_const() => fold_binary(Op::Add, a.arg(), b.arg())
+            .as_ref()
+            .map(|arg| const_from_arg(a, arg)),
         // const * const → const
-        (Op::Mul, [a, b]) if a.is_const() && b.is_const() => {
-            fold_binary(Op::Mul, a.arg(), b.arg()).as_ref().map(|arg| const_from_arg(a, arg))
-        }
+        (Op::Mul, [a, b]) if a.is_const() && b.is_const() => fold_binary(Op::Mul, a.arg(), b.arg())
+            .as_ref()
+            .map(|arg| const_from_arg(a, arg)),
         // x + 0 → x
         (Op::Add, [x, y]) if y.is_zero() => Some(x.clone()),
         (Op::Add, [x, y]) if x.is_zero() => Some(y.clone()),

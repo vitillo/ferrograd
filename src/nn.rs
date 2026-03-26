@@ -74,17 +74,18 @@ impl Linear {
     /// Create a linear layer with bias enabled.
     #[must_use]
     pub fn new(in_features: usize, out_features: usize) -> Self {
-        let weight = kaiming_normal(&[out_features, in_features], in_features)
-            .with_requires_grad(true);
-        let bias = Some(Tensor::zeros(&[out_features], crate::dtype::DType::F32).with_requires_grad(true));
+        let weight =
+            kaiming_normal(&[out_features, in_features], in_features).with_requires_grad(true);
+        let bias =
+            Some(Tensor::zeros(&[out_features], crate::dtype::DType::F32).with_requires_grad(true));
         Self { weight, bias }
     }
 
     /// Create a linear layer without a bias term.
     #[must_use]
     pub fn without_bias(in_features: usize, out_features: usize) -> Self {
-        let weight = kaiming_normal(&[out_features, in_features], in_features)
-            .with_requires_grad(true);
+        let weight =
+            kaiming_normal(&[out_features, in_features], in_features).with_requires_grad(true);
         Self { weight, bias: None }
     }
 
