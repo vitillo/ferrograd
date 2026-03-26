@@ -44,7 +44,7 @@ static DEBUG: LazyLock<u8> = LazyLock::new(|| {
 /// The `name` parameter identifies the pass in debug output. When
 /// `DEBUG >= 3`, prints the graph before and after the rewrite.
 #[must_use]
-pub fn graph_rewrite(root: &UOp, rewrite: &dyn Fn(&UOp) -> Option<UOp>, name: &str) -> UOp {
+pub(crate) fn graph_rewrite(root: &UOp, rewrite: &dyn Fn(&UOp) -> Option<UOp>, name: &str) -> UOp {
     let debug = *DEBUG;
     if debug >= 3 {
         eprintln!("━━━ {name} [before] ━━━\n{}", root.dump());
@@ -135,7 +135,7 @@ fn const_from_arg(node: &UOp, arg: &Arg) -> UOp {
 ///
 /// Each commutative rule has two arms to handle both operand orderings.
 #[must_use]
-pub fn symbolic_simple(node: &UOp) -> Option<UOp> {
+pub(crate) fn symbolic_simple(node: &UOp) -> Option<UOp> {
     match (node.op(), node.srcs()) {
         // const + const → const
         (Op::Add, [a, b]) if a.is_const() && b.is_const() => {

@@ -219,13 +219,13 @@ fn rangeify_rule(node: &UOp) -> Option<UOp> {
             let inner = &node.srcs()[0];
             let idxs = &node.srcs()[1..];
             match inner.op() {
-                op if op.is_alu() => rewrite_index_alu(inner, idxs),
+                op if op.is_alu() => Some(rewrite_index_alu(inner, idxs)),
                 Op::Expand | Op::Permute | Op::Reshape | Op::Shrink => {
                     rewrite_index_movement(inner, idxs)
                 }
                 Op::ReduceAxis => rewrite_index_reduce(inner, idxs),
-                Op::Const | Op::ParamScalar => rewrite_index_const(inner, idxs),
-                Op::ParamBuffer => rewrite_index_param(inner, idxs),
+                Op::Const | Op::ParamScalar => Some(rewrite_index_const(inner, idxs)),
+                Op::ParamBuffer => Some(rewrite_index_param(inner, idxs)),
                 _ => None,
             }
         }
@@ -241,6 +241,6 @@ fn rangeify_rule(node: &UOp) -> Option<UOp> {
 /// Input: `Sink(Store(Param, expr))` where all Buffers are already Params.
 /// Output: kernel-level Sink with Ranges, Loads, Stores, and accumulator loops.
 #[must_use]
-pub fn rangeify(sink: &UOp) -> UOp {
+pub(crate) fn rangeify(sink: &UOp) -> UOp {
     graph_rewrite(sink, &rangeify_rule, "rangeify")
 }

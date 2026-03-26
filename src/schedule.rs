@@ -16,8 +16,8 @@
 //! order, materialize nodes that are multi-consumer or chained reductions, and
 //! parameterize each kernel subgraph so it's ready for lowering.
 
-pub mod indexing;
-pub mod rangeify;
+pub(crate) mod indexing;
+pub(crate) mod rangeify;
 
 use std::collections::{HashMap, HashSet};
 
@@ -29,7 +29,7 @@ use crate::uop::{self, Arg, Op, UOp};
 
 #[derive(Debug, Clone)]
 /// A runtime input to a compiled kernel.
-pub enum KernelInput {
+pub(crate) enum KernelInput {
     /// A realized tensor buffer identified in device state.
     Buffer(BufferId),
     /// A scalar `i32` input.
@@ -42,31 +42,31 @@ pub enum KernelInput {
 
 /// A single kernel to compile and execute.
 #[derive(Debug)]
-pub struct ScheduleItem {
+pub(crate) struct ScheduleItem {
     /// Kernel-ready `Sink(Store(Param(0), expr))`.
-    pub sink: UOp,
+    pub(crate) sink: UOp,
     /// Runtime inputs in parameter-slot order, excluding output slot 0.
-    pub inputs: Vec<KernelInput>,
+    pub(crate) inputs: Vec<KernelInput>,
     /// Output buffer id reserved for slot 0, or `None` for in-place stores.
-    pub output_id: Option<BufferId>,
+    pub(crate) output_id: Option<BufferId>,
     /// Output shape for allocated outputs.
-    pub out_shape: Option<Shape>,
+    pub(crate) out_shape: Option<Shape>,
     /// Output dtype for allocated outputs.
-    pub out_dtype: Option<DType>,
+    pub(crate) out_dtype: Option<DType>,
 }
 
 /// A full execution plan for realizing one or more lazy roots.
 #[derive(Debug)]
-pub struct SchedulePlan {
+pub(crate) struct SchedulePlan {
     /// Kernels to execute in dependency order.
-    pub items: Vec<ScheduleItem>,
+    pub(crate) items: Vec<ScheduleItem>,
     /// Replacements to apply to live tensor graphs after execution.
-    pub replacements: HashMap<UOp, UOp>,
+    pub(crate) replacements: HashMap<UOp, UOp>,
 }
 
 /// Analyze a lazy `UOp` graph and produce kernels in dependency order.
-#[must_use]
-pub fn schedule(expr: &UOp) -> Vec<ScheduleItem> {
+#[cfg(test)]
+fn schedule(expr: &UOp) -> Vec<ScheduleItem> {
     schedule_many(std::slice::from_ref(expr)).items
 }
 
@@ -76,7 +76,7 @@ pub fn schedule(expr: &UOp) -> Vec<ScheduleItem> {
 ///
 /// Panics if `exprs` is empty.
 #[must_use]
-pub fn schedule_many(exprs: &[UOp]) -> SchedulePlan {
+pub(crate) fn schedule_many(exprs: &[UOp]) -> SchedulePlan {
     assert!(
         !exprs.is_empty(),
         "schedule_many requires at least one root"

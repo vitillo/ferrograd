@@ -22,7 +22,7 @@ use crate::uop::{self, Arg, Op, UOp};
 
 /// Compute gradients of `root` with respect to `targets`.
 #[must_use]
-pub fn compute_gradient(root: &UOp, root_grad: &UOp, targets: &[UOp]) -> HashMap<UOp, UOp> {
+pub(crate) fn compute_gradient(root: &UOp, root_grad: &UOp, targets: &[UOp]) -> HashMap<UOp, UOp> {
     let order = root.toposort();
     let consumer_map = uop::build_consumer_map(&order);
     let needed = needed_nodes(root, targets, &consumer_map);
