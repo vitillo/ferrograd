@@ -125,6 +125,14 @@ impl fmt::Debug for Shape {
     }
 }
 
+impl fmt::Display for Shape {
+    /// Prints as `[d0, d1, ...]`, matching the intuitive notation used in
+    /// error messages and debug output throughout the codebase.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_slice(), f)
+    }
+}
+
 impl From<Vec<usize>> for Shape {
     fn from(value: Vec<usize>) -> Self {
         Self::new(value)
