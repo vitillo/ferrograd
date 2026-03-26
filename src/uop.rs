@@ -714,6 +714,22 @@ impl UOp {
     }
 }
 
+/// Build a map from each node to the nodes that consume it as a source.
+///
+/// This is a common graph analysis used by both scheduling (to detect
+/// multi-consumer nodes that need materialization) and autograd (to propagate
+/// gradients along consumer edges).
+#[must_use]
+pub fn build_consumer_map(order: &[UOp]) -> HashMap<UOp, Vec<UOp>> {
+    let mut consumers: HashMap<UOp, Vec<UOp>> = HashMap::new();
+    for node in order {
+        for src in node.srcs() {
+            consumers.entry(src.clone()).or_default().push(node.clone());
+        }
+    }
+    consumers
+}
+
 impl PartialEq for UOp {
     fn eq(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.0, &other.0)

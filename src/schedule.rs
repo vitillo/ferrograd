@@ -25,7 +25,7 @@ use crate::dtype::DType;
 use crate::rewrite::graph_rewrite;
 use crate::runtime::{self, BufferId};
 use crate::shape::Shape;
-use crate::uop::{Arg, Op, UOp};
+use crate::uop::{self, Arg, Op, UOp};
 
 #[derive(Debug, Clone)]
 /// A runtime input to a compiled kernel.
@@ -84,7 +84,7 @@ pub fn schedule_many(exprs: &[UOp]) -> SchedulePlan {
 
     let union = UOp::sink(exprs.to_vec());
     let order = union.toposort();
-    let consumer_map = build_consumer_map(&order);
+    let consumer_map = uop::build_consumer_map(&order);
     let nested_reduce_inputs = nested_reduce_inputs(&order);
     let roots: HashSet<UOp> = exprs.iter().cloned().collect();
 
@@ -279,18 +279,6 @@ fn scalar_input(literal: &Arg) -> KernelInput {
         Arg::Bool(value) => KernelInput::Bool(*value),
         _ => panic!("kernel scalar input must be a literal"),
     }
-}
-
-/// Build a map from each node to its consumers. Used by [`should_materialize`]
-/// to detect multi-consumer nodes that need their own kernel.
-fn build_consumer_map(order: &[UOp]) -> HashMap<UOp, Vec<UOp>> {
-    let mut consumers: HashMap<UOp, Vec<UOp>> = HashMap::new();
-    for node in order {
-        for src in node.srcs() {
-            consumers.entry(src.clone()).or_default().push(node.clone());
-        }
-    }
-    consumers
 }
 
 /// Identify nodes that feed into a reduction which itself feeds another
