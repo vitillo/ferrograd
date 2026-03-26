@@ -16,7 +16,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::dtype::DType;
 use crate::shape::Shape;
 use crate::uop::{self, Arg, Op, UOp};
 
@@ -89,20 +88,9 @@ fn const_float_like(node: &UOp, value: f64) -> UOp {
     UOp::const_float(value, node.dtype(), node.device())
 }
 
-/// Create a tensor `UOp` filled with `value`, matching the given shape and dtype.
-fn full(shape: &Shape, dtype: DType, device: crate::device::DeviceId, value: f64) -> UOp {
-    let base_shape = Shape::new(vec![1; shape.ndim()]);
-    let scalar = UOp::const_float(value, dtype, device);
-    let base = UOp::reshape(scalar, base_shape);
-    if shape.iter().all(|&dim| dim == 1) {
-        return base;
-    }
-    UOp::expand(base, shape.clone())
-}
-
 fn zero_like(node: &UOp) -> UOp {
     let shape = node.shape().unwrap_or_else(|| Shape::from([1]));
-    full(&shape, node.dtype(), node.device(), 0.0)
+    UOp::full(&shape, node.dtype(), node.device(), 0.0)
 }
 
 /// Return per-source gradients for a single op, given the upstream gradient.

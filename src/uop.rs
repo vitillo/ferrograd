@@ -397,6 +397,22 @@ impl UOp {
         )
     }
 
+    /// Build a constant-filled tensor expression (e.g. all-zeros or all-ones).
+    ///
+    /// Creates `Expand(Reshape(Const(value), [1,…,1]), shape)` — the same
+    /// pattern tinygrad uses for `full`. If every dimension is already 1, the
+    /// expand is elided.
+    #[must_use]
+    pub(crate) fn full(shape: &Shape, dtype: DType, device: DeviceId, value: f64) -> Self {
+        let base_shape = Shape::new(vec![1; shape.ndim()]);
+        let scalar = Self::const_float(value, dtype, device);
+        let base = Self::reshape(scalar, base_shape);
+        if shape.iter().all(|&dim| dim == 1) {
+            return base;
+        }
+        Self::expand(base, shape.clone())
+    }
+
     /// Return the device this node belongs to.
     ///
     /// # Panics

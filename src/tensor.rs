@@ -847,7 +847,7 @@ impl Tensor {
             "gradient targets must share the same device"
         );
 
-        let root_grad = full(self.shape(), DType::F32, self.device(), 1.0);
+        let root_grad = UOp::full(&self.shape(), DType::F32, self.device(), 1.0);
         let target_uops: Vec<UOp> = targets
             .iter()
             .filter(|target| target.requires_grad())
@@ -859,7 +859,7 @@ impl Tensor {
             .iter()
             .map(|target| match grad_map.get(&target.uop()) {
                 Some(grad) => Self::new(grad.clone(), false),
-                None => Self::new(full(target.shape(), DType::F32, target.device(), 0.0), false),
+                None => Self::new(UOp::full(&target.shape(), DType::F32, target.device(), 0.0), false),
             })
             .collect()
     }
@@ -881,14 +881,14 @@ impl Tensor {
         }
 
         let target_uops: Vec<UOp> = targets.iter().map(Self::uop).collect();
-        let root_grad = full(self.shape(), DType::F32, self.device(), 1.0);
+        let root_grad = UOp::full(&self.shape(), DType::F32, self.device(), 1.0);
         let grads = gradient::compute_gradient(&self.uop(), &root_grad, &target_uops);
 
         for target in targets {
             let grad = grads
                 .get(&target.uop())
                 .cloned()
-                .unwrap_or_else(|| full(target.shape(), DType::F32, target.device(), 0.0));
+                .unwrap_or_else(|| UOp::full(&target.shape(), DType::F32, target.device(), 0.0));
             let grad_tensor = Self::new(grad, false);
             let accumulated = match target.grad_inner() {
                 Some(existing) => existing.add(&grad_tensor),
@@ -936,18 +936,6 @@ fn run_kernel(
             elapsed.as_secs_f64() * 1000.0,
         );
     }
-}
-
-/// Build a `UOp` expression for a constant-filled tensor (e.g. all-ones for the
-/// initial backward gradient, or all-zeros for missing gradients).
-fn full(shape: Shape, dtype: DType, device: DeviceId, value: f64) -> UOp {
-    let base_shape = Shape::new(vec![1; shape.ndim()]);
-    let scalar = UOp::const_float(value, dtype, device);
-    let base = UOp::reshape(scalar, base_shape);
-    if shape.iter().all(|&dim| dim == 1) {
-        return base;
-    }
-    UOp::expand(base, shape)
 }
 
 /// Walk `root` in topological order and replace any node found in
