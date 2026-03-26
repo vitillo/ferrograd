@@ -182,92 +182,33 @@ impl Renderer for ClangRenderer {
                     );
                     names.insert(node, var);
                 }
-                // Unary
-                Op::Neg => {
-                    let x = srcs[0].clone();
-                    let var = format!("alu{alu_count}");
+                // ALU ops and DefineAcc all follow the same pattern: declare a
+                // typed local variable and assign an expression to it.
+                Op::Neg | Op::Exp2 | Op::Log2 | Op::Sqrt | Op::Reciprocal
+                | Op::Add | Op::Mul | Op::Max | Op::CmpLt | Op::Where
+                | Op::DefineAcc => {
+                    let (prefix, expr) = match node.op() {
+                        Op::Neg        => ("alu", format!("(-{})", srcs[0])),
+                        Op::Exp2       => ("alu", format!("exp2({})", srcs[0])),
+                        Op::Log2       => ("alu", format!("log2({})", srcs[0])),
+                        Op::Sqrt       => ("alu", format!("__builtin_sqrtf({})", srcs[0])),
+                        Op::Reciprocal => ("alu", format!("(1/{})", srcs[0])),
+                        Op::Add        => ("alu", format!("({}+{})", srcs[0], srcs[1])),
+                        Op::Mul        => ("alu", format!("({}*{})", srcs[0], srcs[1])),
+                        Op::Max        => ("alu", format!("(({}>{1})?{0}:{1})", srcs[0], srcs[1])),
+                        Op::CmpLt      => ("alu", format!("({}<{})", srcs[0], srcs[1])),
+                        Op::Where      => ("alu", format!("({}?{}:{})", srcs[0], srcs[1], srcs[2])),
+                        Op::DefineAcc  => ("acc", srcs[0].clone()),
+                        _ => unreachable!(),
+                    };
+                    let var = format!("{prefix}{alu_count}");
                     alu_count += 1;
-                    let _ = writeln!(out, "{ind}{ctype} {var} = (-{x});", ind = indent(depth), ctype = node.dtype().c_type());
-                    names.insert(node, var);
-                }
-                Op::Exp2 => {
-                    let x = srcs[0].clone();
-                    let var = format!("alu{alu_count}");
-                    alu_count += 1;
-                    let _ = writeln!(out, "{ind}{ctype} {var} = exp2({x});", ind = indent(depth), ctype = node.dtype().c_type());
-                    names.insert(node, var);
-                }
-                Op::Log2 => {
-                    let x = srcs[0].clone();
-                    let var = format!("alu{alu_count}");
-                    alu_count += 1;
-                    let _ = writeln!(out, "{ind}{ctype} {var} = log2({x});", ind = indent(depth), ctype = node.dtype().c_type());
-                    names.insert(node, var);
-                }
-                Op::Sqrt => {
-                    let x = srcs[0].clone();
-                    let var = format!("alu{alu_count}");
-                    alu_count += 1;
-                    let _ = writeln!(out, "{ind}{ctype} {var} = __builtin_sqrtf({x});", ind = indent(depth), ctype = node.dtype().c_type());
-                    names.insert(node, var);
-                }
-                Op::Reciprocal => {
-                    let x = srcs[0].clone();
-                    let var = format!("alu{alu_count}");
-                    alu_count += 1;
-                    let _ = writeln!(out, "{ind}{ctype} {var} = (1/{x});", ind = indent(depth), ctype = node.dtype().c_type());
-                    names.insert(node, var);
-                }
-
-                // Binary
-                Op::Add => {
-                    let a = srcs[0].clone();
-                    let b = srcs[1].clone();
-                    let var = format!("alu{alu_count}");
-                    alu_count += 1;
-                    let _ = writeln!(out, "{ind}{ctype} {var} = ({a}+{b});", ind = indent(depth), ctype = node.dtype().c_type());
-                    names.insert(node, var);
-                }
-                Op::Mul => {
-                    let a = srcs[0].clone();
-                    let b = srcs[1].clone();
-                    let var = format!("alu{alu_count}");
-                    alu_count += 1;
-                    let _ = writeln!(out, "{ind}{ctype} {var} = ({a}*{b});", ind = indent(depth), ctype = node.dtype().c_type());
-                    names.insert(node, var);
-                }
-                Op::Max => {
-                    let a = srcs[0].clone();
-                    let b = srcs[1].clone();
-                    let var = format!("alu{alu_count}");
-                    alu_count += 1;
-                    let _ = writeln!(out, "{ind}{ctype} {var} = (({a}>{b})?{a}:{b});", ind = indent(depth), ctype = node.dtype().c_type());
-                    names.insert(node, var);
-                }
-                Op::CmpLt => {
-                    let a = srcs[0].clone();
-                    let b = srcs[1].clone();
-                    let var = format!("alu{alu_count}");
-                    alu_count += 1;
-                    let _ = writeln!(out, "{ind}{ctype} {var} = ({a}<{b});", ind = indent(depth), ctype = node.dtype().c_type());
-                    names.insert(node, var);
-                }
-
-                // Ternary
-                Op::Where => {
-                    let cond = srcs[0].clone();
-                    let true_val = srcs[1].clone();
-                    let false_val = srcs[2].clone();
-                    let var = format!("alu{alu_count}");
-                    alu_count += 1;
-                    let _ = writeln!(out, "{ind}{ctype} {var} = ({cond}?{true_val}:{false_val});", ind = indent(depth), ctype = node.dtype().c_type());
-                    names.insert(node, var);
-                }
-                Op::DefineAcc => {
-                    let init = srcs[0].clone();
-                    let var = format!("acc{alu_count}");
-                    alu_count += 1;
-                    let _ = writeln!(out, "{ind}{ctype} {var} = {init};", ind = indent(depth), ctype = node.dtype().c_type());
+                    let _ = writeln!(
+                        out,
+                        "{ind}{ctype} {var} = {expr};",
+                        ind = indent(depth),
+                        ctype = node.dtype().c_type(),
+                    );
                     names.insert(node, var);
                 }
                 Op::Assign => {
