@@ -204,7 +204,7 @@ impl Tensor {
         assert_eq!(
             data.len(),
             shape.numel(),
-            "data length {} doesn't match shape {shape:?}",
+            "data length {} doesn't match shape {shape}",
             data.len()
         );
         let state = runtime::state(DeviceId::Cpu);
@@ -325,7 +325,7 @@ impl Tensor {
         assert_eq!(
             self.shape(),
             other.shape(),
-            "replace: shape mismatch {:?} != {:?}",
+            "replace: shape mismatch {} != {}",
             self.shape(),
             other.shape()
         );
@@ -347,7 +347,7 @@ impl Tensor {
         assert_eq!(
             self.shape(),
             other.shape(),
-            "assign: shape mismatch {:?} != {:?}",
+            "assign: shape mismatch {} != {}",
             self.shape(),
             other.shape()
         );
@@ -373,7 +373,7 @@ impl Tensor {
             self.device() == other.device(),
             "binary ops require tensors on the same device"
         );
-        assert_eq!(self.shape(), other.shape(), "shape mismatch for {op:?}");
+        assert_eq!(self.shape(), other.shape(), "shape mismatch for {op}");
         Self::new(
             UOp::new(op, out_dtype, vec![self.uop(), other.uop()], Arg::None),
             self.requires_grad() || other.requires_grad(),
@@ -466,7 +466,7 @@ impl Tensor {
         assert_eq!(
             self.numel(),
             new_shape.numel(),
-            "reshape: numel mismatch for {:?} -> {:?}",
+            "reshape: numel mismatch for {} -> {}",
             self.shape(),
             new_shape
         );
@@ -557,14 +557,14 @@ impl Tensor {
         assert_eq!(
             src_shape.ndim(),
             new_shape.ndim(),
-            "expand: rank mismatch for {src_shape:?} -> {new_shape:?}"
+            "expand: rank mismatch for {src_shape} -> {new_shape}"
         );
         assert!(
             src_shape
                 .iter()
                 .zip(new_shape.iter())
                 .all(|(&src_dim, &dst_dim)| src_dim == dst_dim || src_dim == 1),
-            "expand: incompatible source shape {src_shape:?} -> {new_shape:?}"
+            "expand: incompatible source shape {src_shape} -> {new_shape}"
         );
         Self::new(UOp::expand(self.uop(), new_shape), self.requires_grad())
     }
@@ -655,7 +655,7 @@ impl Tensor {
         assert_eq!(
             self.shape(),
             targets.shape(),
-            "cross_entropy: target shape {:?} must match logits shape {:?}",
+            "cross_entropy: target shape {} must match logits shape {}",
             targets.shape(),
             self.shape()
         );
@@ -1025,7 +1025,7 @@ fn broadcast_shapes(left: &Tensor, right: &Tensor) -> (Tensor, Tensor) {
         .broadcast_with(&right.shape())
         .unwrap_or_else(|| {
             panic!(
-                "broadcast: incompatible dims for {:?} vs {:?}",
+                "broadcast: incompatible dims for {} vs {}",
                 left.shape(),
                 right.shape()
             )
