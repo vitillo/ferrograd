@@ -43,7 +43,7 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 use crate::codegen::{ClangRenderer, Renderer};
-use crate::device::{Buffer, DeviceId, KernelArg, Program};
+use crate::device::{DeviceId, KernelArg, Program};
 use crate::dtype::DType;
 use crate::gradient;
 use crate::runtime;
@@ -222,8 +222,11 @@ impl Tensor {
             data.len()
         );
         let state = runtime::state(DeviceId::Cpu);
-        let buffer_id = state.store_buffer(Buffer::from_f32(data));
-        let buffer = UOp::buffer(buffer_id, DType::F32, shape.numel(), DeviceId::Cpu);
+        let buffer = state.device().allocate(DType::F32, data.len());
+        state
+            .device()
+            .copy_from_host(&buffer, bytemuck::cast_slice(data));
+        let buffer = UOp::buffer(buffer, DType::F32, DeviceId::Cpu);
         Self::new(UOp::reshape(buffer, shape), false)
     }
 
@@ -232,8 +235,8 @@ impl Tensor {
     pub fn zeros(shape: &[usize], dtype: DType) -> Self {
         let shape = Shape::from(shape);
         let state = runtime::state(DeviceId::Cpu);
-        let buffer_id = state.store_buffer(state.device().allocate(dtype, shape.numel()));
-        let buffer = UOp::buffer(buffer_id, dtype, shape.numel(), DeviceId::Cpu);
+        let buffer = state.device().allocate(dtype, shape.numel());
+        let buffer = UOp::buffer(buffer, dtype, DeviceId::Cpu);
         Self::new(UOp::reshape(buffer, shape), false)
     }
 
@@ -379,7 +382,10 @@ impl Tensor {
     }
 
     fn unary(&self, op: Op) -> Self {
-        Self::new(UOp::new(op, self.dtype(), vec![self.uop()], Arg::None), self.requires_grad())
+        Self::new(
+            UOp::new(op, self.dtype(), vec![self.uop()], Arg::None),
+            self.requires_grad(),
+        )
     }
 
     fn binary(&self, other: &Self, op: Op, out_dtype: DType) -> Self {
@@ -743,12 +749,16 @@ impl Tensor {
         let state = runtime::state(item.sink.device());
         let debug = *DEBUG;
         let lowered = rangeify(&item.sink);
-        let lowered =
-            crate::rewrite::graph_rewrite(&lowered, &mut crate::rewrite::symbolic_simple, "symbolic");
+        let lowered = crate::rewrite::graph_rewrite(
+            &lowered,
+            &mut crate::rewrite::symbolic_simple,
+            "symbolic",
+        );
         assert_codegen_ready(&lowered);
 
         let num_args = item
-            .output_id
+            .output_buffer
+            .as_ref()
             .map_or(item.inputs.len(), |_| item.inputs.len() + 1);
         let program = if let Some(program) = state.cached_program(&lowered) {
             if debug >= 1 {
@@ -786,51 +796,23 @@ impl Tensor {
         };
 
         let mut args: Vec<KernelArg> = Vec::with_capacity(num_args);
-        if let Some(output_id) = item.output_id {
-            let out = state.device().allocate(
-                item.out_dtype.expect("allocated item must have dtype"),
-                item.out_shape
-                    .as_ref()
-                    .expect("allocated item must have shape")
-                    .numel(),
-            );
-            args.push(KernelArg::Buffer(out));
+        if let Some(output_buffer) = item.output_buffer.clone() {
+            output_buffer.ensure_allocated();
+            args.push(KernelArg::Buffer(output_buffer));
             execute_inputs(&state, &item.inputs, &mut args);
             run_kernel(&state, &program, &mut args, debug);
-
-            let KernelArg::Buffer(out) = args.remove(0) else {
-                panic!("output kernel arg must remain a buffer");
-            };
-            state
-                .write_buffer(output_id, out)
-                .expect("failed to store kernel output");
             return;
         }
 
         execute_inputs(&state, &item.inputs, &mut args);
         run_kernel(&state, &program, &mut args, debug);
-
-        let dest_id = item.inputs.iter().find_map(|input| match input {
-            schedule::KernelInput::Buffer(id) => Some(*id),
-            _ => None,
-        });
-        let dest_buffer = args.iter().find_map(|arg| match arg {
-            KernelArg::Buffer(buffer) => Some(buffer.clone()),
-            _ => None,
-        });
-        if let (Some(dest_id), Some(dest_buffer)) = (dest_id, dest_buffer) {
-            state
-                .write_buffer(dest_id, dest_buffer)
-                .expect("failed to store in-place kernel output");
-        }
     }
 
     /// Realize and extract data as `Vec<f32>`.
     ///
     /// # Panics
     ///
-    /// Panics if realization fails or the device state no longer holds the
-    /// tensor's buffer.
+    /// Panics if realization fails or the realized buffer dtype is not `F32`.
     #[must_use]
     pub fn to_vec(&self) -> Vec<f32> {
         let _ = self.realize();
@@ -840,13 +822,17 @@ impl Tensor {
             Op::Reshape => uop.srcs()[0].clone(),
             _ => panic!("realized tensor must point at a buffer"),
         };
-        let Arg::Buffer(id, _) = buffer.arg() else {
+        let Arg::Buffer(buffer) = buffer.arg() else {
             panic!("realized tensor must point at Arg::Buffer");
         };
-        runtime::state(buffer.device())
-            .load_buffer(*id)
-            .expect("realized buffer missing")
-            .to_f32()
+        assert_eq!(
+            buffer.dtype(),
+            DType::F32,
+            "to_vec requires F32 tensor data"
+        );
+        let state = runtime::state(buffer.device());
+        let bytes = state.device().copy_to_host(buffer);
+        bytemuck::cast_slice(&bytes).to_vec()
     }
 
     /// Compute gradients of `self` with respect to `targets`.
@@ -857,7 +843,9 @@ impl Tensor {
     #[must_use]
     pub fn gradient(&self, targets: &[&Self]) -> Vec<Self> {
         assert!(
-            targets.iter().all(|target| self.device() == target.device()),
+            targets
+                .iter()
+                .all(|target| self.device() == target.device()),
             "gradient targets must share the same device"
         );
 
@@ -873,7 +861,10 @@ impl Tensor {
             .iter()
             .map(|target| match grad_map.get(&target.uop()) {
                 Some(grad) => Self::new(grad.clone(), false),
-                None => Self::new(UOp::full(&target.shape(), DType::F32, target.device(), 0.0), false),
+                None => Self::new(
+                    UOp::full(&target.shape(), DType::F32, target.device(), 0.0),
+                    false,
+                ),
             })
             .collect()
     }
@@ -913,16 +904,17 @@ impl Tensor {
     }
 }
 
-/// Convert scheduled kernel inputs (buffer ids and scalar constants) into
-/// concrete `KernelArg` values by loading buffers from device state.
+/// Convert scheduled kernel inputs (buffers and scalar constants) into
+/// concrete `KernelArg` values.
 fn execute_inputs(
-    state: &runtime::DeviceState,
+    _state: &runtime::DeviceState,
     inputs: &[schedule::KernelInput],
     args: &mut Vec<KernelArg>,
 ) {
     let input_args = inputs.iter().map(|input| match input {
-        schedule::KernelInput::Buffer(id) => {
-            KernelArg::Buffer(state.load_buffer(*id).expect("scheduled input buffer missing"))
+        schedule::KernelInput::Buffer(buffer) => {
+            assert!(buffer.is_realized(), "scheduled input buffer missing");
+            KernelArg::Buffer(buffer.clone())
         }
         schedule::KernelInput::I32(value) => KernelArg::I32(*value),
         schedule::KernelInput::F32(value) => KernelArg::F32(*value),
@@ -932,12 +924,7 @@ fn execute_inputs(
 }
 
 /// Execute a compiled kernel and optionally log timing when `debug >= 2`.
-fn run_kernel(
-    state: &runtime::DeviceState,
-    program: &Program,
-    args: &mut [KernelArg],
-    debug: u8,
-) {
+fn run_kernel(state: &runtime::DeviceState, program: &Program, args: &mut [KernelArg], debug: u8) {
     let t0 = Instant::now();
     state
         .device()
@@ -1046,8 +1033,12 @@ fn broadcast_shapes(left: &Tensor, right: &Tensor) -> (Tensor, Tensor) {
         });
     let left_shape = left.shape().pad_left(target.ndim());
     let right_shape = right.shape().pad_left(target.ndim());
-    let left = left.reshape(left_shape.as_slice()).expand(target.as_slice());
-    let right = right.reshape(right_shape.as_slice()).expand(target.as_slice());
+    let left = left
+        .reshape(left_shape.as_slice())
+        .expand(target.as_slice());
+    let right = right
+        .reshape(right_shape.as_slice())
+        .expand(target.as_slice());
     (left, right)
 }
 

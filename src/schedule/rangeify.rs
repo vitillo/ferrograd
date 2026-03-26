@@ -34,7 +34,12 @@ use super::indexing::{
 fn chain_ends(ranges: &[UOp], body: &UOp) -> UOp {
     let mut current = body.clone();
     for range in ranges.iter().rev() {
-        current = UOp::new(Op::End, DType::Void, vec![range.clone(), current], Arg::None);
+        current = UOp::new(
+            Op::End,
+            DType::Void,
+            vec![range.clone(), current],
+            Arg::None,
+        );
     }
     current
 }
@@ -153,7 +158,12 @@ fn rewrite_store_add_ranges(store: &UOp) -> Option<UOp> {
     } else {
         store_output_index(out_param, &axis_indices)?
     };
-    let new_store = UOp::new(Op::Store, DType::Void, vec![out_idx, indexed_expr], Arg::None);
+    let new_store = UOp::new(
+        Op::Store,
+        DType::Void,
+        vec![out_idx, indexed_expr],
+        Arg::None,
+    );
 
     Some(chain_ends(&out_ranges, &new_store))
 }
@@ -193,8 +203,18 @@ fn expand_reduce(reduce: &UOp) -> UOp {
     };
 
     let define_acc = UOp::new(Op::DefineAcc, dtype, vec![init_val], Arg::None);
-    let accumulated = UOp::new(*reduce_op, dtype, vec![define_acc.clone(), value.clone()], Arg::None);
-    let assign = UOp::new(Op::Assign, dtype, vec![define_acc.clone(), accumulated], Arg::None);
+    let accumulated = UOp::new(
+        *reduce_op,
+        dtype,
+        vec![define_acc.clone(), value.clone()],
+        Arg::None,
+    );
+    let assign = UOp::new(
+        Op::Assign,
+        dtype,
+        vec![define_acc.clone(), accumulated],
+        Arg::None,
+    );
 
     UOp::new(
         Op::After,

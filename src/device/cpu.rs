@@ -220,14 +220,68 @@ impl CompiledKernel {
 /// which uses `ClangJITCompiler` + `CPUProgram` in the same way.
 pub struct CpuDevice;
 
+fn buffer_mut_ptr(buffer: &Buffer) -> *mut u8 {
+    assert_eq!(
+        buffer.device(),
+        DeviceId::Cpu,
+        "CPU backend received non-CPU buffer {}",
+        buffer.id()
+    );
+    let mut storage = buffer.0.storage.borrow_mut();
+    let Some(Storage::Cpu(data)) = storage.as_mut() else {
+        panic!("CPU backend received unrealized or non-CPU buffer");
+    };
+    data.as_mut_ptr()
+}
+
 impl Device for CpuDevice {
     fn id(&self) -> DeviceId {
         DeviceId::Cpu
     }
 
+    fn reserve_buffer(&self, dtype: DType, numel: usize) -> Buffer {
+        Buffer::reserved(DeviceId::Cpu, dtype, numel)
+    }
+
     fn allocate(&self, dtype: DType, numel: usize) -> Buffer {
         let nbytes = dtype.size_bytes() * numel;
-        Buffer::new(dtype, numel, Storage::Cpu(vec![0u8; nbytes]))
+        Buffer::new(DeviceId::Cpu, dtype, numel, Storage::Cpu(vec![0u8; nbytes]))
+    }
+
+    fn copy_from_host(&self, buffer: &Buffer, src: &[u8]) {
+        assert_eq!(
+            buffer.device(),
+            DeviceId::Cpu,
+            "CPU backend received non-CPU buffer {}",
+            buffer.id()
+        );
+        buffer.ensure_allocated();
+        let mut storage = buffer.0.storage.borrow_mut();
+        let Some(Storage::Cpu(data)) = storage.as_mut() else {
+            panic!("copy_from_host called on non-CPU buffer");
+        };
+        assert_eq!(
+            src.len(),
+            data.len(),
+            "copy_from_host: expected {} bytes, got {}",
+            data.len(),
+            src.len()
+        );
+        data.copy_from_slice(src);
+    }
+
+    fn copy_to_host(&self, buffer: &Buffer) -> Vec<u8> {
+        assert_eq!(
+            buffer.device(),
+            DeviceId::Cpu,
+            "CPU backend received non-CPU buffer {}",
+            buffer.id()
+        );
+        let storage = buffer.0.storage.borrow();
+        let Some(Storage::Cpu(data)) = storage.as_ref() else {
+            panic!("copy_to_host called on unrealized or non-CPU buffer");
+        };
+        data.clone()
     }
 
     fn compile(
@@ -253,7 +307,7 @@ impl Device for CpuDevice {
         let call_args: Vec<CallArg> = args
             .iter_mut()
             .map(|arg| match arg {
-                KernelArg::Buffer(buffer) => CallArg::Ptr(buffer.as_mut_ptr()),
+                KernelArg::Buffer(buffer) => CallArg::Ptr(buffer_mut_ptr(buffer)),
                 KernelArg::I32(value) => CallArg::I32(*value),
                 KernelArg::F32(value) => CallArg::F32(*value),
                 KernelArg::Bool(value) => CallArg::Bool(u8::from(*value)),
@@ -298,6 +352,16 @@ impl Device for CpuDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn f32_buffer(dev: &CpuDevice, data: &[f32]) -> Buffer {
+        let buffer = dev.allocate(DType::F32, data.len());
+        dev.copy_from_host(&buffer, bytemuck::cast_slice(data));
+        buffer
+    }
+
+    fn read_f32(dev: &CpuDevice, buffer: &Buffer) -> Vec<f32> {
+        bytemuck::cast_slice::<u8, f32>(&dev.copy_to_host(buffer)).to_vec()
+    }
 
     // ── CompiledKernel tests ────────────────────────────────────────────
 
@@ -434,8 +498,8 @@ mod tests {
         let program = dev.compile(source, "add", 3).expect("compile failed");
         let mut args = [
             KernelArg::Buffer(dev.allocate(DType::F32, 3)),
-            KernelArg::Buffer(Buffer::from_f32(&[1.0, 2.0, 3.0])),
-            KernelArg::Buffer(Buffer::from_f32(&[4.0, 5.0, 6.0])),
+            KernelArg::Buffer(f32_buffer(&dev, &[1.0, 2.0, 3.0])),
+            KernelArg::Buffer(f32_buffer(&dev, &[4.0, 5.0, 6.0])),
         ];
 
         // Act
@@ -445,7 +509,7 @@ mod tests {
         let KernelArg::Buffer(out) = &args[0] else {
             panic!("output arg should stay a buffer");
         };
-        assert_eq!(out.to_f32(), vec![5.0, 7.0, 9.0]);
+        assert_eq!(read_f32(&dev, out), vec![5.0, 7.0, 9.0]);
     }
 
     #[test]
@@ -460,8 +524,8 @@ mod tests {
         let program = dev.compile(source, "mul", 3).expect("compile failed");
         let mut args = [
             KernelArg::Buffer(dev.allocate(DType::F32, 3)),
-            KernelArg::Buffer(Buffer::from_f32(&[2.0, 3.0, 4.0])),
-            KernelArg::Buffer(Buffer::from_f32(&[5.0, 6.0, 7.0])),
+            KernelArg::Buffer(f32_buffer(&dev, &[2.0, 3.0, 4.0])),
+            KernelArg::Buffer(f32_buffer(&dev, &[5.0, 6.0, 7.0])),
         ];
 
         // Act
@@ -471,7 +535,7 @@ mod tests {
         let KernelArg::Buffer(out) = &args[0] else {
             panic!("output arg should stay a buffer");
         };
-        assert_eq!(out.to_f32(), vec![10.0, 18.0, 28.0]);
+        assert_eq!(read_f32(&dev, out), vec![10.0, 18.0, 28.0]);
     }
 
     #[test]
@@ -486,7 +550,7 @@ mod tests {
         let program = dev.compile(source, "negate", 2).expect("compile failed");
         let mut args = [
             KernelArg::Buffer(dev.allocate(DType::F32, 3)),
-            KernelArg::Buffer(Buffer::from_f32(&[1.0, -2.0, 3.0])),
+            KernelArg::Buffer(f32_buffer(&dev, &[1.0, -2.0, 3.0])),
         ];
 
         // Act
@@ -496,7 +560,7 @@ mod tests {
         let KernelArg::Buffer(output) = &args[0] else {
             panic!("output arg should stay a buffer");
         };
-        assert_eq!(output.to_f32(), vec![-1.0, 2.0, -3.0]);
+        assert_eq!(read_f32(&dev, output), vec![-1.0, 2.0, -3.0]);
     }
 
     #[test]
@@ -513,7 +577,7 @@ mod tests {
             .expect("compile failed");
         let mut args = [
             KernelArg::Buffer(dev.allocate(DType::F32, 2)),
-            KernelArg::Buffer(Buffer::from_f32(&[1.0, 2.0, 3.0, 4.0])),
+            KernelArg::Buffer(f32_buffer(&dev, &[1.0, 2.0, 3.0, 4.0])),
             KernelArg::I32(1),
             KernelArg::F32(10.0),
         ];
@@ -525,7 +589,7 @@ mod tests {
         let KernelArg::Buffer(output) = &args[0] else {
             panic!("output arg should stay a buffer");
         };
-        assert_eq!(output.to_f32(), vec![20.0, 30.0]);
+        assert_eq!(read_f32(&dev, output), vec![20.0, 30.0]);
     }
 
     #[test]

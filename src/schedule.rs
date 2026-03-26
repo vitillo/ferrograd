@@ -21,17 +21,18 @@ pub mod rangeify;
 
 use std::collections::{HashMap, HashSet};
 
+use crate::device::Buffer;
 use crate::dtype::DType;
 use crate::rewrite::graph_rewrite;
-use crate::runtime::{self, BufferId};
+use crate::runtime;
 use crate::shape::Shape;
 use crate::uop::{self, Arg, Op, UOp};
 
 #[derive(Debug, Clone)]
 /// A runtime input to a compiled kernel.
 pub enum KernelInput {
-    /// A realized tensor buffer identified in device state.
-    Buffer(BufferId),
+    /// A realized tensor buffer referenced by a shared slot handle.
+    Buffer(Buffer),
     /// A scalar `i32` input.
     I32(i32),
     /// A scalar `f32` input.
@@ -47,12 +48,10 @@ pub struct ScheduleItem {
     pub sink: UOp,
     /// Runtime inputs in parameter-slot order, excluding output slot 0.
     pub inputs: Vec<KernelInput>,
-    /// Output buffer id reserved for slot 0, or `None` for in-place stores.
-    pub output_id: Option<BufferId>,
+    /// Output buffer slot reserved for slot 0, or `None` for in-place stores.
+    pub output_buffer: Option<Buffer>,
     /// Output shape for allocated outputs.
     pub out_shape: Option<Shape>,
-    /// Output dtype for allocated outputs.
-    pub out_dtype: Option<DType>,
 }
 
 /// A full execution plan for realizing one or more lazy roots.
@@ -148,7 +147,9 @@ fn parameterize(expr: &UOp) -> ScheduleItem {
     let state = runtime::state(expr.device());
     let (parameterized, inputs) = parameterize_inputs(expr, 1, "schedule");
     let out_shape = parameterized.shape().unwrap_or_else(|| Shape::flat(1));
-    let output_id = state.reserve_buffer(expr.dtype(), out_shape.numel());
+    let output_buffer = state
+        .device()
+        .reserve_buffer(expr.dtype(), out_shape.numel());
     let out_param = UOp::param_buffer(0, expr.dtype(), out_shape.numel(), expr.device());
     let store = UOp::new(
         Op::Store,
@@ -161,9 +162,8 @@ fn parameterize(expr: &UOp) -> ScheduleItem {
     ScheduleItem {
         sink,
         inputs,
-        output_id: Some(output_id),
+        output_buffer: Some(output_buffer),
         out_shape: Some(out_shape),
-        out_dtype: Some(expr.dtype()),
     }
 }
 
@@ -180,9 +180,8 @@ fn parameterize_store(store: &UOp) -> ScheduleItem {
     ScheduleItem {
         sink: UOp::sink(vec![parameterized_store]),
         inputs,
-        output_id: None,
+        output_buffer: None,
         out_shape: None,
-        out_dtype: None,
     }
 }
 
@@ -193,7 +192,7 @@ fn parameterize_store(store: &UOp) -> ScheduleItem {
 fn parameterize_inputs(root: &UOp, slot_offset: usize, pass_name: &str) -> (UOp, Vec<KernelInput>) {
     let device = root.device();
     let mut inputs: Vec<KernelInput> = Vec::new();
-    let mut params: HashMap<BufferId, UOp> = HashMap::new();
+    let mut params: HashMap<Buffer, UOp> = HashMap::new();
     let mut scalar_params: HashMap<UOp, UOp> = HashMap::new();
 
     // Allocating kernels reserve slot 0 for their output buffer; in-place store
@@ -202,17 +201,17 @@ fn parameterize_inputs(root: &UOp, slot_offset: usize, pass_name: &str) -> (UOp,
     let mut rewrite_inputs = |node: &UOp| -> Option<UOp> {
         match node.op() {
             Op::Buffer => {
-                let Arg::Buffer(id, numel) = node.arg() else {
+                let Arg::Buffer(handle) = node.arg() else {
                     return None;
                 };
                 let dtype = node.dtype();
                 Some(
                     params
-                        .entry(*id)
+                        .entry(handle.clone())
                         .or_insert_with(|| {
                             let slot = inputs.len() + slot_offset;
-                            inputs.push(KernelInput::Buffer(*id));
-                            UOp::param_buffer(slot, dtype, *numel, device)
+                            inputs.push(KernelInput::Buffer(handle.clone()));
+                            UOp::param_buffer(slot, dtype, handle.numel(), device)
                         })
                         .clone(),
                 )
@@ -258,10 +257,7 @@ fn parameterize_inputs(root: &UOp, slot_offset: usize, pass_name: &str) -> (UOp,
         }
     };
 
-    (
-        graph_rewrite(root, &mut rewrite_inputs, pass_name),
-        inputs,
-    )
+    (graph_rewrite(root, &mut rewrite_inputs, pass_name), inputs)
 }
 
 /// Convert a `Const` literal arg into the corresponding [`KernelInput`] scalar variant.
@@ -358,17 +354,19 @@ fn should_materialize(
 /// lazy graph. Downstream consumers will see this buffer instead of the
 /// original computation, creating the kernel boundary.
 fn buffer_replacement(item: &ScheduleItem) -> UOp {
-    let output_id = item
-        .output_id
+    let output_buffer = item
+        .output_buffer
+        .clone()
         .expect("buffer_replacement requires an allocated output");
-    let out_dtype = item
-        .out_dtype
-        .expect("buffer_replacement requires an allocated output dtype");
     let out_shape = item
         .out_shape
         .clone()
         .expect("buffer_replacement requires an allocated output shape");
-    let buffer = UOp::buffer(output_id, out_dtype, out_shape.numel(), item.sink.device());
+    let buffer = UOp::buffer(
+        output_buffer.clone(),
+        output_buffer.dtype(),
+        item.sink.device(),
+    );
     UOp::reshape(buffer, out_shape)
 }
 
@@ -427,19 +425,22 @@ fn substitute_materialized(root: &UOp, replacements: &HashMap<UOp, UOp>) -> UOp 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::Buffer;
     use crate::device::DeviceId;
     use crate::runtime;
 
     fn buffer_uop(data: &[f32], shape: &[usize]) -> UOp {
         let device = DeviceId::Cpu;
-        let id = runtime::state(device).store_buffer(Buffer::from_f32(data));
-        let buffer = UOp::buffer(id, DType::F32, data.len(), device);
+        let state = runtime::state(device);
+        let buffer = state.device().allocate(DType::F32, data.len());
+        state
+            .device()
+            .copy_from_host(&buffer, bytemuck::cast_slice(data));
+        let buffer = UOp::buffer(buffer, DType::F32, device);
         UOp::reshape(buffer, Shape::from(shape))
     }
 
     #[test]
-    fn test_nested_reductions_materialize_via_buffer_ids() {
+    fn test_nested_reductions_materialize_via_shared_buffer_handles() {
         runtime::clear_for_tests(DeviceId::Cpu);
         let input = buffer_uop(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let inner = UOp::reduce_axis(input, Op::Add, &[1]);
@@ -449,7 +450,7 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert!(matches!(
             items[1].inputs[0],
-            KernelInput::Buffer(id) if Some(id) == items[0].output_id
+            KernelInput::Buffer(ref handle) if Some(handle.clone()) == items[0].output_buffer
         ));
     }
 
@@ -467,19 +468,19 @@ mod tests {
         assert_eq!(items.len(), 4);
         assert!(matches!(
             items[1].inputs[0],
-            KernelInput::Buffer(id) if Some(id) == items[0].output_id
+            KernelInput::Buffer(ref handle) if Some(handle.clone()) == items[0].output_buffer
         ));
         assert!(matches!(
             items[2].inputs[0],
-            KernelInput::Buffer(id) if Some(id) == items[0].output_id
+            KernelInput::Buffer(ref handle) if Some(handle.clone()) == items[0].output_buffer
         ));
         assert!(matches!(
             items[3].inputs[0],
-            KernelInput::Buffer(id) if Some(id) == items[1].output_id
+            KernelInput::Buffer(ref handle) if Some(handle.clone()) == items[1].output_buffer
         ));
         assert!(matches!(
             items[3].inputs[1],
-            KernelInput::Buffer(id) if Some(id) == items[2].output_id
+            KernelInput::Buffer(ref handle) if Some(handle.clone()) == items[2].output_buffer
         ));
     }
 
@@ -548,11 +549,11 @@ mod tests {
         assert!(matches!(items[1].inputs[1], KernelInput::Buffer(_)));
         assert!(matches!(
             items[2].inputs[0],
-            KernelInput::Buffer(id) if Some(id) == items[0].output_id
+            KernelInput::Buffer(ref handle) if Some(handle.clone()) == items[0].output_buffer
         ));
         assert!(matches!(
             items[2].inputs[1],
-            KernelInput::Buffer(id) if Some(id) == items[1].output_id
+            KernelInput::Buffer(ref handle) if Some(handle.clone()) == items[1].output_buffer
         ));
     }
 
@@ -574,7 +575,7 @@ mod tests {
 
         // Assert
         assert_eq!(plan.items.len(), 2);
-        assert!(plan.items.iter().all(|item| item.output_id.is_none()));
+        assert!(plan.items.iter().all(|item| item.output_buffer.is_none()));
         assert!(plan
             .items
             .iter()

@@ -46,6 +46,10 @@
 //! Internal device state is kept private on purpose. It stores concrete
 //! buffers, compiled-kernel caches, and the `UOp` interner, but it is not part
 //! of the educational surface area.
+#![allow(clippy::mutable_key_type)]
+// `UOp` keys intentionally contain buffers with interior mutability.
+// Hash/Eq use stable identity (`UOp` pointer identity, `Buffer` id), so
+// mutating buffer contents does not invalidate map/set keys.
 
 pub mod codegen;
 pub mod dataset;
@@ -54,8 +58,8 @@ pub mod dtype;
 pub mod gradient;
 pub mod nn;
 pub mod optim;
-mod runtime;
 pub mod rewrite;
+mod runtime;
 pub mod schedule;
 pub mod shape;
 pub mod tensor;

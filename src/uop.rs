@@ -9,11 +9,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::Hash;
 use std::rc::Rc;
 
-use crate::device::DeviceId;
+use crate::device::{Buffer, DeviceId};
 use crate::dtype::DType;
-use crate::runtime::{self, BufferId};
+use crate::runtime;
 use crate::shape::Shape;
 
 /// The operations our IR supports.
@@ -107,7 +108,10 @@ impl Op {
     /// Whether this op is a zero-copy movement/view operation.
     #[must_use]
     pub fn is_movement(self) -> bool {
-        matches!(self, Self::Shrink | Self::Reshape | Self::Permute | Self::Expand)
+        matches!(
+            self,
+            Self::Shrink | Self::Reshape | Self::Permute | Self::Expand
+        )
     }
 }
 
@@ -138,8 +142,8 @@ pub enum Arg {
     Int(i64),
     /// Boolean literal.
     Bool(bool),
-    /// Device buffer id and flat element count.
-    Buffer(BufferId, usize),
+    /// Realized device buffer.
+    Buffer(Buffer),
     /// Per-dimension concrete lengths for `Shrink`.
     Bounds(Box<[usize]>),
     /// Shape payload for `Reshape` and `Expand`.
@@ -165,9 +169,7 @@ impl PartialEq for Arg {
             (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
             (Self::Int(a), Self::Int(b)) => a == b,
             (Self::Bool(a), Self::Bool(b)) => a == b,
-            (Self::Buffer(id_a, numel_a), Self::Buffer(id_b, numel_b)) => {
-                id_a == id_b && numel_a == numel_b
-            }
+            (Self::Buffer(handle_a), Self::Buffer(handle_b)) => handle_a == handle_b,
             (Self::Bounds(a), Self::Bounds(b)) => a == b,
             (Self::Shape(a), Self::Shape(b)) => a == b,
             (Self::Axes(a), Self::Axes(b)) => a == b,
@@ -199,9 +201,8 @@ impl std::hash::Hash for Arg {
             Self::Float(value) => value.to_bits().hash(state),
             Self::Int(value) => value.hash(state),
             Self::Bool(value) => value.hash(state),
-            Self::Buffer(id, numel) => {
-                id.hash(state);
-                numel.hash(state);
+            Self::Buffer(handle) => {
+                handle.hash(state);
             }
             Self::Bounds(lengths) => lengths.hash(state),
             Self::Shape(shape) => shape.hash(state),
@@ -226,7 +227,7 @@ impl fmt::Display for Arg {
             Self::Float(v) => write!(f, "{v}"),
             Self::Int(v) => write!(f, "{v}"),
             Self::Bool(v) => write!(f, "{v}"),
-            Self::Buffer(id, numel) => write!(f, "buf#{id}[{numel}]"),
+            Self::Buffer(handle) => write!(f, "buf#{}[{}]", handle.id(), handle.numel()),
             Self::Bounds(lengths) => write!(f, "{lengths:?}"),
             Self::Shape(shape) => write!(f, "{shape}"),
             Self::Axes(axes) => write!(f, "{axes:?}"),
@@ -349,13 +350,13 @@ impl UOp {
     /// Create a buffer leaf on `device`.
     #[must_use]
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn buffer(id: BufferId, dtype: DType, numel: usize, device: DeviceId) -> Self {
+    pub(crate) fn buffer(buffer: Buffer, dtype: DType, device: DeviceId) -> Self {
         Self::build(
             device,
             Op::Buffer,
             dtype,
             vec![Self::device_uop(device)],
-            Arg::Buffer(id, numel),
+            Arg::Buffer(buffer),
         )
     }
 
@@ -472,10 +473,10 @@ impl UOp {
     pub fn shape(&self) -> Option<Shape> {
         match self.op() {
             Op::Buffer => {
-                let Arg::Buffer(_, numel) = self.arg() else {
+                let Arg::Buffer(handle) = self.arg() else {
                     return None;
                 };
-                Some(Shape::flat(*numel))
+                Some(Shape::flat(handle.numel()))
             }
             Op::ParamBuffer => {
                 let Arg::ParamBuffer(_, numel) = self.arg() else {
@@ -770,7 +771,6 @@ impl fmt::Debug for UOp {
 mod tests {
     use super::*;
     use crate::device::DeviceId;
-    use crate::runtime;
 
     #[test]
     fn test_build_elementwise_add_kernel() {
@@ -859,9 +859,13 @@ mod tests {
     #[test]
     fn test_uop_new_interns_identical_nodes() {
         let device = DeviceId::Cpu;
-        let id = runtime::state(device).store_buffer(crate::device::Buffer::from_f32(&[1.0, 2.0]));
-        let left = UOp::buffer(id, DType::F32, 2, device);
-        let right = UOp::buffer(id, DType::F32, 2, device);
+        let state = crate::runtime::state(device);
+        let buffer = state.device().allocate(DType::F32, 2);
+        state
+            .device()
+            .copy_from_host(&buffer, bytemuck::cast_slice(&[1.0_f32, 2.0]));
+        let left = UOp::buffer(buffer.clone(), DType::F32, device);
+        let right = UOp::buffer(buffer, DType::F32, device);
 
         assert_eq!(left, right);
 

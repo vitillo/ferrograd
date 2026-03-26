@@ -26,7 +26,10 @@ impl Sgd {
     /// Panics if `params` is empty.
     #[must_use]
     pub fn new(params: Vec<Tensor>, lr: f32) -> Self {
-        assert!(!params.is_empty(), "optimizer must have at least one parameter");
+        assert!(
+            !params.is_empty(),
+            "optimizer must have at least one parameter"
+        );
         let mut deduped: Vec<Tensor> = Vec::new();
         for param in params {
             // Optimizers own stable parameter handles, so dedup by handle identity
@@ -36,7 +39,10 @@ impl Sgd {
             }
             deduped.push(param);
         }
-        Self { params: deduped, lr }
+        Self {
+            params: deduped,
+            lr,
+        }
     }
 
     /// Clear all stored parameter gradients.
@@ -54,7 +60,9 @@ impl Sgd {
     pub fn step(&self) {
         let lr = Tensor::scalar(self.lr);
         for param in &self.params {
-            let grad = param.grad().expect("optimizer step requires parameter gradients");
+            let grad = param
+                .grad()
+                .expect("optimizer step requires parameter gradients");
             let update = param.detach().sub(&grad.mul(&lr));
             param.assign(&update);
         }
