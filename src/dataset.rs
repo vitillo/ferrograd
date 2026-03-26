@@ -32,6 +32,7 @@ pub type Result<T> = std::result::Result<T, DatasetError>;
 /// Labels are plain `Vec<u8>` with class indices `0..=9` — ferrograd doesn't
 /// have an integer tensor type yet, so we keep them on the Rust side and let
 /// examples decide how to encode them (one-hot, sparse index, etc.).
+#[derive(Debug)]
 pub struct MNISTDataset {
     /// Training images shaped `(60000, 784)`, values in `[0, 1]`.
     pub train_images: Tensor,

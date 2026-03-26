@@ -12,6 +12,7 @@
 use crate::tensor::Tensor;
 
 /// Stochastic gradient descent with explicit parameter lists.
+#[derive(Debug)]
 pub struct Sgd {
     params: Vec<Tensor>,
     lr: f32,
