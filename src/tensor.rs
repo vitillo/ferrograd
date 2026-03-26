@@ -744,7 +744,7 @@ impl Tensor {
         let debug = *DEBUG;
         let lowered = rangeify(&item.sink);
         let lowered =
-            crate::rewrite::graph_rewrite(&lowered, &crate::rewrite::symbolic_simple, "symbolic");
+            crate::rewrite::graph_rewrite(&lowered, &mut crate::rewrite::symbolic_simple, "symbolic");
         assert_codegen_ready(&lowered);
 
         let num_args = item
