@@ -9,13 +9,14 @@
 #![allow(clippy::many_single_char_names)]
 
 use ferrograd::optim::Sgd;
-use ferrograd::tensor::Tensor;
+use ferrograd::tensor::{cpu, Tensor};
 
 fn main() {
     println!("\n  --- Autograd: loss = sum(x @ w + b) ---");
-    let x = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
-    let w = Tensor::from_slice(&[0.1, 0.2, 0.3, 0.4], &[2, 2]).with_requires_grad(true);
-    let b = Tensor::from_slice(&[0.5, 0.6], &[1, 2]).with_requires_grad(true);
+    let dev = cpu();
+    let x = Tensor::new(&[1.0, 2.0, 3.0, 4.0], &[2, 2], dev);
+    let w = Tensor::new(&[0.1, 0.2, 0.3, 0.4], &[2, 2], dev).with_requires_grad(true);
+    let b = Tensor::new(&[0.5, 0.6], &[1, 2], dev).with_requires_grad(true);
 
     let loss = x.matmul(&w).add(&b).sum(&[0, 1]);
     println!("  loss    = {:?}", loss.to_vec());

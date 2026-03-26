@@ -30,11 +30,11 @@ use ferrograd::tensor::{Tensor, cpu};
 
 let dev = cpu();
 
-let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &dev);
-let b = Tensor::from_slice(&[10.0, 20.0, 30.0], &dev);
+let a = Tensor::new(&[1.0, 2.0, 3.0], &[3], dev);
+let b = Tensor::new(&[10.0, 20.0, 30.0], &[3], dev);
 
 // Nothing executes yet — just builds a lazy graph.
-let c = a.add(&b).mul(&Tensor::from_slice(&[2.0, 2.0, 2.0], &dev));
+let c = a.add(&b).mul(&Tensor::new(&[2.0, 2.0, 2.0], &[3], dev));
 
 // realize() lowers to a single fused kernel, compiles, and runs.
 let result = c.to_vec(); // [22.0, 44.0, 66.0]

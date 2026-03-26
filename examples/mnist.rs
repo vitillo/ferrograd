@@ -11,7 +11,7 @@
 use ferrograd::dataset::MNISTDataset;
 use ferrograd::nn::{Linear, Parameters};
 use ferrograd::optim::Sgd;
-use ferrograd::tensor::Tensor;
+use ferrograd::tensor::{cpu, Tensor};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -21,7 +21,7 @@ fn one_hot(labels: &[u8], num_classes: usize) -> Tensor {
     for (i, &label) in labels.iter().enumerate() {
         data[i * num_classes + label as usize] = 1.0;
     }
-    Tensor::from_slice(&data, &[n, num_classes])
+    Tensor::new(&data, &[n, num_classes], cpu())
 }
 
 // ── Model ────────────────────────────────────────────────────────────────

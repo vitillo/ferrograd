@@ -58,8 +58,8 @@ impl Sgd {
     ///
     /// Panics if any parameter is missing a gradient.
     pub fn step(&self) {
-        let lr = Tensor::scalar(self.lr);
         for param in &self.params {
+            let lr = Tensor::scalar(self.lr, param.device());
             let grad = param
                 .grad()
                 .expect("optimizer step requires parameter gradients");
@@ -79,8 +79,8 @@ mod tests {
 
     #[test]
     fn test_sgd_step_updates_parameter() {
-        let param = Tensor::from_slice(&[3.0], &[1]).with_requires_grad(true);
-        let target = Tensor::from_slice(&[2.0], &[1]);
+        let param = Tensor::new(&[3.0], &[1], crate::tensor::cpu()).with_requires_grad(true);
+        let target = Tensor::new(&[2.0], &[1], crate::tensor::cpu());
         let loss = param.sub(&target).mul(&param.sub(&target)).sum(&[0]);
 
         let optim = Sgd::new(vec![param.clone()], 0.1);

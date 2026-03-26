@@ -13,8 +13,9 @@
 //!
 //! - tensor semantics live in the lazy [`uop`] graph
 //! - device identity is part of that graph
-//! - concrete buffers, compiled kernels, and interning live in internal
-//!   device-scoped state
+//! - concrete buffers and compiled kernels live in internal device-scoped
+//!   state
+//! - `UOp` interning lives with the graph itself
 //!
 //! That keeps [`tensor`] intentionally thin. Methods like reshape, expand,
 //! narrow, reduction, and matmul mostly build `UOp`s; [`schedule`] and
@@ -44,8 +45,8 @@
 //!   backend execution.
 //!
 //! Internal device state is kept private on purpose. It stores concrete
-//! buffers, compiled-kernel caches, and the `UOp` interner, but it is not part
-//! of the educational surface area.
+//! buffers and compiled-kernel caches, but it is not part of the educational
+//! surface area.
 #![allow(clippy::mutable_key_type)]
 // `UOp` keys intentionally contain buffers with interior mutability.
 // Hash/Eq use stable identity (`UOp` pointer identity, `Buffer` id), so
@@ -59,7 +60,6 @@ pub mod gradient;
 pub mod nn;
 pub mod optim;
 pub mod rewrite;
-mod runtime;
 pub mod schedule;
 pub mod shape;
 pub mod tensor;

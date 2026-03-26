@@ -8,9 +8,13 @@
 //! - [`Buffer`] -- typed memory that lives on some device
 //! - [`Storage`] -- opaque, device-specific memory (CPU = `Vec<u8>`, CUDA = device ptr)
 //! - [`Program`] -- a compiled kernel, ready to execute on its device
+//! - a device registry for resolving [`DeviceId`] to backend objects
 //!
 //! Backend implementations live in submodules:
 //! - [`cpu`] -- compiles C with clang, runs via dlopen
+//!
+//! This module also owns the per-device backend registry, similar to
+//! tinygrad's global `Device[...]` lookup in `device.py`.
 
 pub mod cpu;
 
@@ -20,7 +24,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::dtype::DType;
-use crate::runtime;
+use crate::uop::UOp;
 
 // Re-export CpuDevice for convenience.
 pub use cpu::CpuDevice;
@@ -180,9 +184,7 @@ impl Buffer {
         if self.is_realized() {
             return;
         }
-        let allocated = runtime::state(self.device())
-            .device()
-            .allocate(self.dtype(), self.numel());
+        let allocated = get(self.device()).allocate(self.dtype(), self.numel());
         assert_eq!(
             allocated.dtype(),
             self.dtype(),
@@ -305,6 +307,44 @@ pub trait Device {
     ///
     /// Returns [`DeviceError`] if execution fails (e.g. symbol lookup).
     fn execute(&self, program: &Program, args: &mut [KernelArg]) -> Result<(), DeviceError>;
+
+    /// Return a cached compiled program for `sink`, if any.
+    fn cached_program(&self, sink: &UOp) -> Option<Rc<Program>>;
+
+    /// Insert a compiled program into the backend cache.
+    fn insert_program(&self, sink: UOp, program: Rc<Program>);
+
+    #[cfg(test)]
+    /// Clear backend-owned caches so tests start from a clean slate.
+    fn clear_for_tests(&self);
+}
+
+thread_local! {
+    static DEVICES: RefCell<std::collections::HashMap<DeviceId, Rc<dyn Device>>> = RefCell::new(std::collections::HashMap::new());
+}
+
+fn new_device(device: DeviceId) -> Rc<dyn Device> {
+    match device {
+        DeviceId::Cpu => Rc::new(CpuDevice::new()),
+    }
+}
+
+/// Return the backend object for `device`.
+#[must_use]
+pub(crate) fn get(device: DeviceId) -> Rc<dyn Device> {
+    DEVICES.with(|devices| {
+        let mut devices = devices.borrow_mut();
+        devices
+            .entry(device)
+            .or_insert_with(|| new_device(device))
+            .clone()
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn clear_for_tests(device: DeviceId) {
+    get(device).clear_for_tests();
+    crate::uop::clear_for_tests();
 }
 
 #[cfg(test)]
@@ -315,7 +355,7 @@ mod tests {
     fn test_allocate_zeroed() {
         // Arrange / Act
         let buf = Buffer::new(DeviceId::Cpu, DType::F32, 4, Storage::Cpu(vec![0u8; 16]));
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
 
         // Assert
         assert_eq!(buf.numel(), 4);
@@ -327,7 +367,7 @@ mod tests {
     #[test]
     fn test_reserve_buffer_keeps_metadata_unrealized() {
         // Arrange
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
 
         // Act
         let buf = dev.reserve_buffer(DType::I32, 6);
@@ -343,7 +383,7 @@ mod tests {
     #[test]
     fn test_ensure_allocated_realizes_reserved_buffer() {
         // Arrange
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
         let buf = dev.reserve_buffer(DType::F32, 4);
 
         // Act
@@ -360,7 +400,7 @@ mod tests {
     #[test]
     fn test_buffer_identity_is_stable_per_allocation() {
         // Arrange
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
         let left = dev.reserve_buffer(DType::F32, 2);
         let left_clone = left.clone();
         let right = dev.reserve_buffer(DType::F32, 2);
@@ -375,7 +415,7 @@ mod tests {
     #[test]
     fn test_f32_roundtrip() {
         // Arrange
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
         let input = vec![1.0f32, 2.0, 3.0];
 
         // Act
@@ -390,7 +430,7 @@ mod tests {
     #[test]
     fn test_copyin_copyout_raw() {
         // Arrange
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
         let buf = Buffer::new(DeviceId::Cpu, DType::I32, 2, Storage::Cpu(vec![0u8; 8]));
         let src: Vec<u8> = vec![1, 0, 0, 0, 2, 0, 0, 0]; // little-endian i32: 1, 2
 
@@ -406,7 +446,7 @@ mod tests {
     #[should_panic(expected = "copy_from_host: expected 8 bytes, got 4")]
     fn test_copyin_wrong_size_panics() {
         // Arrange
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
         let buf = Buffer::new(DeviceId::Cpu, DType::F32, 2, Storage::Cpu(vec![0u8; 8]));
 
         // Act -- should panic
@@ -417,7 +457,7 @@ mod tests {
     #[should_panic(expected = "copy_to_host called on unrealized or non-CPU buffer")]
     fn test_copyout_unrealized_reserved_buffer_panics() {
         // Arrange
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
         let buf = dev.reserve_buffer(DType::F32, 2);
 
         // Act -- should panic

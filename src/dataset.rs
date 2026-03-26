@@ -10,7 +10,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
 
-use crate::tensor::Tensor;
+use crate::tensor::{cpu, Tensor};
 
 /// Errors that can occur while loading a dataset.
 #[derive(Debug, thiserror::Error)]
@@ -121,7 +121,7 @@ fn parse_images(path: &Path) -> Result<(Tensor, usize)> {
     file.read_exact(&mut pixels)?;
 
     let f32_data: Vec<f32> = pixels.iter().map(|&b| f32::from(b) / 255.0).collect();
-    Ok((Tensor::from_slice(&f32_data, &[count, 784]), count))
+    Ok((Tensor::new(&f32_data, &[count, 784], cpu()), count))
 }
 
 /// Parses an IDX label file into a `Vec<u8>`.
