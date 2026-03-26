@@ -13,13 +13,16 @@ const REDUCE_RANGE_OFFSET: usize = 100;
 /// Row-major contiguous strides for a shape.
 #[must_use]
 pub fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
-    let mut strides = vec![0usize; shape.len()];
-    if !shape.is_empty() {
-        strides[shape.len() - 1] = 1;
-        for i in (0..shape.len() - 1).rev() {
-            strides[i] = strides[i + 1] * shape[i + 1];
-        }
-    }
+    let mut strides: Vec<usize> = shape
+        .iter()
+        .rev()
+        .scan(1, |acc, &dim| {
+            let stride = *acc;
+            *acc *= dim;
+            Some(stride)
+        })
+        .collect();
+    strides.reverse();
     strides
 }
 
@@ -36,30 +39,20 @@ pub fn flat_index(idxs: &[UOp], strides: &[usize]) -> UOp {
         .map(UOp::device)
         .expect("flat_index requires at least one index");
 
-    let mut terms = Vec::new();
-    for (idx, &stride) in idxs.iter().zip(strides) {
-        if stride == 0 {
-            continue;
-        }
-        let term = if stride == 1 {
-            idx.clone()
-        } else {
-            #[allow(clippy::cast_possible_wrap)]
-            let stride = UOp::const_int(stride as i64, DType::I32, idx.device());
-            UOp::mul(idx.clone(), stride)
-        };
-        terms.push(term);
-    }
-
-    if terms.is_empty() {
-        return UOp::const_int(0, DType::I32, device);
-    }
-
-    let mut result = terms.remove(0);
-    for term in terms {
-        result = UOp::add(result, term);
-    }
-    result
+    idxs.iter()
+        .zip(strides)
+        .filter(|(_, &stride)| stride != 0)
+        .map(|(idx, &stride)| {
+            if stride == 1 {
+                idx.clone()
+            } else {
+                #[allow(clippy::cast_possible_wrap)]
+                let s = UOp::const_int(stride as i64, DType::I32, idx.device());
+                UOp::mul(idx.clone(), s)
+            }
+        })
+        .reduce(UOp::add)
+        .unwrap_or_else(|| UOp::const_int(0, DType::I32, device))
 }
 
 /// Wrap a source in a tensor-level `Index` with per-dimension indices.
