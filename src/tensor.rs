@@ -36,6 +36,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
@@ -86,6 +87,19 @@ struct TensorInner {
 /// A lazily-evaluated tensor bound to a specific device.
 #[derive(Clone)]
 pub struct Tensor(Rc<RefCell<TensorInner>>);
+
+impl fmt::Debug for Tensor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = self.0.borrow();
+        let shape = inner.uop.shape();
+        f.debug_struct("Tensor")
+            .field("shape", &shape)
+            .field("dtype", &inner.uop.dtype())
+            .field("device", &inner.uop.device())
+            .field("requires_grad", &inner.requires_grad)
+            .finish()
+    }
+}
 
 impl Tensor {
     /// Create a tensor handle and register it in `LIVE_TENSORS` so

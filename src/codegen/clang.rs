@@ -25,6 +25,7 @@ use crate::dtype::DType;
 use crate::uop::{Arg, Op, UOp};
 
 /// Renders `UOp` graphs to C, compiled by clang.
+#[derive(Debug)]
 pub struct ClangRenderer;
 
 impl Renderer for ClangRenderer {
