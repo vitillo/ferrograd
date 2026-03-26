@@ -21,10 +21,9 @@ pub mod rangeify;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::device::Buffer;
+use crate::device::{self, Buffer};
 use crate::dtype::DType;
 use crate::rewrite::graph_rewrite;
-use crate::runtime;
 use crate::shape::Shape;
 use crate::uop::{self, Arg, Op, UOp};
 
@@ -144,12 +143,10 @@ pub fn schedule_many(exprs: &[UOp]) -> SchedulePlan {
 /// Wraps the expression in `Sink(Store(Param(0), expr))` and assigns numbered
 /// parameter slots to every buffer and scalar input.
 fn parameterize(expr: &UOp) -> ScheduleItem {
-    let state = runtime::state(expr.device());
+    let backend = device::get(expr.device());
     let (parameterized, inputs) = parameterize_inputs(expr, 1, "schedule");
     let out_shape = parameterized.shape().unwrap_or_else(|| Shape::flat(1));
-    let output_buffer = state
-        .device()
-        .reserve_buffer(expr.dtype(), out_shape.numel());
+    let output_buffer = backend.reserve_buffer(expr.dtype(), out_shape.numel());
     let out_param = UOp::param_buffer(0, expr.dtype(), out_shape.numel(), expr.device());
     let store = UOp::new(
         Op::Store,
@@ -425,23 +422,20 @@ fn substitute_materialized(root: &UOp, replacements: &HashMap<UOp, UOp>) -> UOp 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::DeviceId;
-    use crate::runtime;
+    use crate::device::{self, DeviceId};
 
     fn buffer_uop(data: &[f32], shape: &[usize]) -> UOp {
         let device = DeviceId::Cpu;
-        let state = runtime::state(device);
-        let buffer = state.device().allocate(DType::F32, data.len());
-        state
-            .device()
-            .copy_from_host(&buffer, bytemuck::cast_slice(data));
+        let backend = device::get(device);
+        let buffer = backend.allocate(DType::F32, data.len());
+        backend.copy_from_host(&buffer, bytemuck::cast_slice(data));
         let buffer = UOp::buffer(buffer, DType::F32, device);
         UOp::reshape(buffer, Shape::from(shape))
     }
 
     #[test]
     fn test_nested_reductions_materialize_via_shared_buffer_handles() {
-        runtime::clear_for_tests(DeviceId::Cpu);
+        device::clear_for_tests(DeviceId::Cpu);
         let input = buffer_uop(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let inner = UOp::reduce_axis(input, Op::Add, &[1]);
         let outer = UOp::reduce_axis(inner, Op::Add, &[0]);
@@ -456,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_shared_subexpression_materializes_once() {
-        runtime::clear_for_tests(DeviceId::Cpu);
+        device::clear_for_tests(DeviceId::Cpu);
         let left = buffer_uop(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let right = buffer_uop(&[10.0, 20.0, 30.0, 40.0], &[2, 2]);
         let shared = UOp::add(left, right);
@@ -486,7 +480,7 @@ mod tests {
 
     #[test]
     fn test_parameterize_gives_each_shrink_occurrence_its_own_scalar_input() {
-        runtime::clear_for_tests(DeviceId::Cpu);
+        device::clear_for_tests(DeviceId::Cpu);
         let input = buffer_uop(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]);
         let zero = UOp::const_int(0, DType::I32, DeviceId::Cpu);
 
@@ -512,7 +506,7 @@ mod tests {
 
     #[test]
     fn test_parameterize_store_turns_shrink_start_into_scalar_input() {
-        runtime::clear_for_tests(DeviceId::Cpu);
+        device::clear_for_tests(DeviceId::Cpu);
         let src = buffer_uop(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]);
         let dst = buffer_uop(&[0.0, 0.0, 0.0, 0.0], &[2, 2]);
         let one = UOp::const_int(1, DType::I32, DeviceId::Cpu);
@@ -529,7 +523,7 @@ mod tests {
     #[test]
     fn test_shared_movement_view_does_not_materialize() {
         // Arrange
-        runtime::clear_for_tests(DeviceId::Cpu);
+        device::clear_for_tests(DeviceId::Cpu);
         let left = buffer_uop(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let right = buffer_uop(&[10.0, 20.0, 30.0, 40.0], &[2, 2]);
         let base = UOp::add(left, right);
@@ -560,7 +554,7 @@ mod tests {
     #[test]
     fn test_shared_movement_view_stays_inlined_for_assignments() {
         // Arrange
-        runtime::clear_for_tests(DeviceId::Cpu);
+        device::clear_for_tests(DeviceId::Cpu);
         let left = buffer_uop(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let right = buffer_uop(&[10.0, 20.0, 30.0, 40.0], &[2, 2]);
         let dst_a = buffer_uop(&[0.0, 0.0, 0.0, 0.0], &[2, 2]);

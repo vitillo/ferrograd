@@ -34,6 +34,7 @@
 //! matches tinygrad, where `Tensor` objects are mutable Python references that
 //! get rewritten in-place by the scheduler.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -43,10 +44,9 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 use crate::codegen::{ClangRenderer, Renderer};
-use crate::device::{DeviceId, KernelArg, Program};
+use crate::device::{self, DeviceId, KernelArg, Program};
 use crate::dtype::DType;
 use crate::gradient;
-use crate::runtime;
 use crate::schedule::{self, rangeify::rangeify, ScheduleItem};
 use crate::shape::Shape;
 use crate::uop::{Arg, Op, UOp};
@@ -88,6 +88,42 @@ struct TensorInner {
 #[derive(Clone)]
 pub struct Tensor(Rc<RefCell<TensorInner>>);
 
+/// Host element types that can initialize tensor storage.
+///
+/// This keeps the public tensor constructor device- and dtype-agnostic while
+/// still reusing the backend's raw byte copy path.
+pub trait TensorElement: Copy {
+    /// The tensor dtype corresponding to this Rust element type.
+    const DTYPE: DType;
+
+    /// View `data` as raw bytes for copying into device storage.
+    fn as_bytes(data: &[Self]) -> Cow<'_, [u8]>;
+}
+
+impl TensorElement for f32 {
+    const DTYPE: DType = DType::F32;
+
+    fn as_bytes(data: &[Self]) -> Cow<'_, [u8]> {
+        Cow::Borrowed(bytemuck::cast_slice(data))
+    }
+}
+
+impl TensorElement for i32 {
+    const DTYPE: DType = DType::I32;
+
+    fn as_bytes(data: &[Self]) -> Cow<'_, [u8]> {
+        Cow::Borrowed(bytemuck::cast_slice(data))
+    }
+}
+
+impl TensorElement for bool {
+    const DTYPE: DType = DType::Bool;
+
+    fn as_bytes(data: &[Self]) -> Cow<'_, [u8]> {
+        Cow::Owned(data.iter().copied().map(u8::from).collect())
+    }
+}
+
 impl fmt::Debug for Tensor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = self.0.borrow();
@@ -104,7 +140,7 @@ impl fmt::Debug for Tensor {
 impl Tensor {
     /// Create a tensor handle and register it in `LIVE_TENSORS` so
     /// post-realization graph rewrites can reach it.
-    fn new(uop: UOp, requires_grad: bool) -> Self {
+    fn from_uop(uop: UOp, requires_grad: bool) -> Self {
         let tensor = Self(Rc::new(RefCell::new(TensorInner {
             uop,
             requires_grad,
@@ -207,13 +243,13 @@ impl Tensor {
         }
     }
 
-    /// Create a tensor from a float slice on the default CPU device.
+    /// Create a tensor from flat host data on a specific device.
     ///
     /// # Panics
     ///
     /// Panics if `data.len()` does not match `shape`.
     #[must_use]
-    pub fn from_slice(data: &[f32], shape: &[usize]) -> Self {
+    pub fn new<T: TensorElement>(data: &[T], shape: &[usize], device: DeviceId) -> Self {
         let shape = Shape::from(shape);
         assert_eq!(
             data.len(),
@@ -221,36 +257,50 @@ impl Tensor {
             "data length {} doesn't match shape {shape}",
             data.len()
         );
-        let state = runtime::state(DeviceId::Cpu);
-        let buffer = state.device().allocate(DType::F32, data.len());
-        state
-            .device()
-            .copy_from_host(&buffer, bytemuck::cast_slice(data));
-        let buffer = UOp::buffer(buffer, DType::F32, DeviceId::Cpu);
-        Self::new(UOp::reshape(buffer, shape), false)
+        let backend = device::get(device);
+        let buffer = backend.allocate(T::DTYPE, data.len());
+        let bytes = T::as_bytes(data);
+        backend.copy_from_host(&buffer, bytes.as_ref());
+        let buffer = UOp::buffer(buffer, T::DTYPE, device);
+        Self::from_uop(UOp::reshape(buffer, shape), false)
     }
 
-    /// Create a tensor filled with zeros on the default CPU device.
+    /// Create a tensor filled with zeros on a specific device.
     #[must_use]
-    pub fn zeros(shape: &[usize], dtype: DType) -> Self {
+    pub fn zeros(shape: &[usize], device: DeviceId, dtype: DType) -> Self {
         let shape = Shape::from(shape);
-        let state = runtime::state(DeviceId::Cpu);
-        let buffer = state.device().allocate(dtype, shape.numel());
-        let buffer = UOp::buffer(buffer, dtype, DeviceId::Cpu);
-        Self::new(UOp::reshape(buffer, shape), false)
+        let backend = device::get(device);
+        let buffer = backend.allocate(dtype, shape.numel());
+        let buffer = UOp::buffer(buffer, dtype, device);
+        Self::from_uop(UOp::reshape(buffer, shape), false)
     }
 
-    /// Create a tensor filled with ones on the default CPU device.
+    /// Create a tensor filled with ones on a specific device.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dtype` is [`DType::Void`].
     #[must_use]
-    pub fn ones(shape: &[usize]) -> Self {
+    pub fn ones(shape: &[usize], device: DeviceId, dtype: DType) -> Self {
+        match dtype {
+            DType::F32 => Self::full(shape, 1.0_f32, device),
+            DType::I32 => Self::full(shape, 1_i32, device),
+            DType::Bool => Self::full(shape, true, device),
+            DType::Void => panic!("ones requires a concrete dtype"),
+        }
+    }
+
+    /// Create a tensor filled with a single repeated value on a specific device.
+    #[must_use]
+    pub fn full<T: TensorElement>(shape: &[usize], value: T, device: DeviceId) -> Self {
         let numel = shape.iter().product();
-        Self::from_slice(&vec![1.0_f32; numel], shape)
+        Self::new(&vec![value; numel], shape, device)
     }
 
-    /// Create a scalar tensor of shape `[1]` on the default CPU device.
+    /// Create a scalar tensor of shape `[1]` on a specific device.
     #[must_use]
-    pub fn scalar(value: f32) -> Self {
-        Self::from_slice(&[value], &[1])
+    pub fn scalar<T: TensorElement>(value: T, device: DeviceId) -> Self {
+        Self::new(&[value], &[1], device)
     }
 
     /// Return the owning device.
@@ -327,7 +377,7 @@ impl Tensor {
     /// Return a detached tensor handle with the same graph value.
     #[must_use]
     pub fn detach(&self) -> Self {
-        Self::new(self.uop(), false)
+        Self::from_uop(self.uop(), false)
     }
 
     /// Replace this tensor's graph with another tensor's graph.
@@ -382,7 +432,7 @@ impl Tensor {
     }
 
     fn unary(&self, op: Op) -> Self {
-        Self::new(
+        Self::from_uop(
             UOp::new(op, self.dtype(), vec![self.uop()], Arg::None),
             self.requires_grad(),
         )
@@ -394,7 +444,7 @@ impl Tensor {
             "binary ops require tensors on the same device"
         );
         assert_eq!(self.shape(), other.shape(), "shape mismatch for {op}");
-        Self::new(
+        Self::from_uop(
             UOp::new(op, out_dtype, vec![self.uop(), other.uop()], Arg::None),
             self.requires_grad() || other.requires_grad(),
         )
@@ -459,9 +509,9 @@ impl Tensor {
     /// `max(0, x)` implemented with `Where`.
     #[must_use]
     pub fn relu(&self) -> Self {
-        let zero = Self::zeros(self.shape().as_slice(), self.dtype());
+        let zero = Self::zeros(self.shape().as_slice(), self.device(), self.dtype());
         let cond = zero.binary(self, Op::CmpLt, DType::Bool);
-        Self::new(
+        Self::from_uop(
             UOp::new(
                 Op::Where,
                 self.dtype(),
@@ -490,7 +540,7 @@ impl Tensor {
             self.shape(),
             new_shape
         );
-        Self::new(UOp::reshape(self.uop(), new_shape), self.requires_grad())
+        Self::from_uop(UOp::reshape(self.uop(), new_shape), self.requires_grad())
     }
 
     /// Slice a single dimension without copying.
@@ -538,7 +588,7 @@ impl Tensor {
             .map(|(axis, &size)| if axis == dim { len } else { size })
             .collect();
 
-        Self::new(
+        Self::from_uop(
             UOp::shrink(self.uop(), &starts, &lengths),
             self.requires_grad(),
         )
@@ -559,7 +609,7 @@ impl Tensor {
             assert!(!seen[axis], "permute: axis {axis} duplicated");
             seen[axis] = true;
         }
-        Self::new(UOp::permute(self.uop(), order), self.requires_grad())
+        Self::from_uop(UOp::permute(self.uop(), order), self.requires_grad())
     }
 
     /// Broadcast size-1 dimensions.
@@ -586,7 +636,7 @@ impl Tensor {
                 .all(|(&src_dim, &dst_dim)| src_dim == dst_dim || src_dim == 1),
             "expand: incompatible source shape {src_shape} -> {new_shape}"
         );
-        Self::new(UOp::expand(self.uop(), new_shape), self.requires_grad())
+        Self::from_uop(UOp::expand(self.uop(), new_shape), self.requires_grad())
     }
 
     /// Sum over the given axes.
@@ -601,7 +651,7 @@ impl Tensor {
             axes.iter().all(|&axis| axis < ndim),
             "sum: axes {axes:?} out of range for ndim {ndim}"
         );
-        Self::new(
+        Self::from_uop(
             UOp::reduce_axis(self.uop(), Op::Add, axes),
             self.requires_grad(),
         )
@@ -619,7 +669,7 @@ impl Tensor {
             axes.iter().all(|&axis| axis < ndim),
             "max: axes {axes:?} out of range for ndim {ndim}"
         );
-        Self::new(
+        Self::from_uop(
             UOp::reduce_axis(self.uop(), Op::Max, axes),
             self.requires_grad(),
         )
@@ -629,7 +679,7 @@ impl Tensor {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn exp(&self) -> Self {
-        let log2e = Self::scalar(std::f64::consts::LOG2_E as f32);
+        let log2e = Self::scalar(std::f64::consts::LOG2_E as f32, self.device());
         self.mul(&log2e).exp2()
     }
 
@@ -637,7 +687,7 @@ impl Tensor {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn log(&self) -> Self {
-        let ln2 = Self::scalar(std::f64::consts::LN_2 as f32);
+        let ln2 = Self::scalar(std::f64::consts::LN_2 as f32, self.device());
         self.log2().mul(&ln2)
     }
 
@@ -683,7 +733,7 @@ impl Tensor {
         let log_probs = self.log_softmax(classes_axis);
         let per_sample = targets.mul(&log_probs).sum(&[classes_axis]).neg();
         let reduction_axes: Vec<usize> = (0..per_sample.ndim()).collect();
-        let scale = Self::scalar(1.0 / per_sample.numel() as f32);
+        let scale = Self::scalar(1.0 / per_sample.numel() as f32, self.device());
         per_sample.sum(&reduction_axes).mul(&scale)
     }
 
@@ -746,7 +796,7 @@ impl Tensor {
     /// Run the full pipeline for a single scheduled kernel: rangeify → symbolic
     /// simplification → codegen → compile (or cache hit) → execute.
     fn execute_item(item: &ScheduleItem) {
-        let state = runtime::state(item.sink.device());
+        let backend = device::get(item.sink.device());
         let debug = *DEBUG;
         let lowered = rangeify(&item.sink);
         let lowered = crate::rewrite::graph_rewrite(
@@ -760,7 +810,7 @@ impl Tensor {
             .output_buffer
             .as_ref()
             .map_or(item.inputs.len(), |_| item.inputs.len() + 1);
-        let program = if let Some(program) = state.cached_program(&lowered) {
+        let program = if let Some(program) = backend.cached_program(&lowered) {
             if debug >= 1 {
                 let kid = KERNEL_COUNT.fetch_add(1, Ordering::Relaxed);
                 eprintln!("*** CPU {kid:>4}  (cached)         arg {num_args:>2}");
@@ -779,8 +829,7 @@ impl Tensor {
             }
 
             let program = Rc::new(
-                state
-                    .device()
+                backend
                     .compile(&code, &name, num_args)
                     .expect("compile failed"),
             );
@@ -791,7 +840,7 @@ impl Tensor {
                 eprintln!("*** CPU {kid:>4}  {name:<16} arg {num_args:>2}");
             }
 
-            state.insert_program(lowered.clone(), program.clone());
+            backend.insert_program(lowered.clone(), program.clone());
             program
         };
 
@@ -799,13 +848,13 @@ impl Tensor {
         if let Some(output_buffer) = item.output_buffer.clone() {
             output_buffer.ensure_allocated();
             args.push(KernelArg::Buffer(output_buffer));
-            execute_inputs(&state, &item.inputs, &mut args);
-            run_kernel(&state, &program, &mut args, debug);
+            execute_inputs(&item.inputs, &mut args);
+            run_kernel(backend.as_ref(), &program, &mut args, debug);
             return;
         }
 
-        execute_inputs(&state, &item.inputs, &mut args);
-        run_kernel(&state, &program, &mut args, debug);
+        execute_inputs(&item.inputs, &mut args);
+        run_kernel(backend.as_ref(), &program, &mut args, debug);
     }
 
     /// Realize and extract data as `Vec<f32>`.
@@ -830,8 +879,7 @@ impl Tensor {
             DType::F32,
             "to_vec requires F32 tensor data"
         );
-        let state = runtime::state(buffer.device());
-        let bytes = state.device().copy_to_host(buffer);
+        let bytes = device::get(buffer.device()).copy_to_host(buffer);
         bytemuck::cast_slice(&bytes).to_vec()
     }
 
@@ -860,8 +908,8 @@ impl Tensor {
         targets
             .iter()
             .map(|target| match grad_map.get(&target.uop()) {
-                Some(grad) => Self::new(grad.clone(), false),
-                None => Self::new(
+                Some(grad) => Self::from_uop(grad.clone(), false),
+                None => Self::from_uop(
                     UOp::full(&target.shape(), DType::F32, target.device(), 0.0),
                     false,
                 ),
@@ -894,7 +942,7 @@ impl Tensor {
                 .get(&target.uop())
                 .cloned()
                 .unwrap_or_else(|| UOp::full(&target.shape(), DType::F32, target.device(), 0.0));
-            let grad_tensor = Self::new(grad, false);
+            let grad_tensor = Self::from_uop(grad, false);
             let accumulated = match target.grad_inner() {
                 Some(existing) => existing.add(&grad_tensor),
                 None => grad_tensor,
@@ -906,11 +954,7 @@ impl Tensor {
 
 /// Convert scheduled kernel inputs (buffers and scalar constants) into
 /// concrete `KernelArg` values.
-fn execute_inputs(
-    _state: &runtime::DeviceState,
-    inputs: &[schedule::KernelInput],
-    args: &mut Vec<KernelArg>,
-) {
+fn execute_inputs(inputs: &[schedule::KernelInput], args: &mut Vec<KernelArg>) {
     let input_args = inputs.iter().map(|input| match input {
         schedule::KernelInput::Buffer(buffer) => {
             assert!(buffer.is_realized(), "scheduled input buffer missing");
@@ -924,12 +968,9 @@ fn execute_inputs(
 }
 
 /// Execute a compiled kernel and optionally log timing when `debug >= 2`.
-fn run_kernel(state: &runtime::DeviceState, program: &Program, args: &mut [KernelArg], debug: u8) {
+fn run_kernel(device: &dyn device::Device, program: &Program, args: &mut [KernelArg], debug: u8) {
     let t0 = Instant::now();
-    state
-        .device()
-        .execute(program, args)
-        .expect("execution failed");
+    device.execute(program, args).expect("execution failed");
     if debug >= 2 {
         let elapsed = t0.elapsed();
         eprintln!(
@@ -1078,8 +1119,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_from_slice_roundtrip() {
-        let t = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3]);
+    fn test_new_roundtrip() {
+        let t = Tensor::new(&[1.0, 2.0, 3.0], &[3], cpu());
         assert_eq!(t.shape(), [3]);
         assert_eq!(t.dtype(), DType::F32);
         assert!(t.is_realized());
@@ -1088,8 +1129,8 @@ mod tests {
 
     #[test]
     fn test_add_is_lazy() {
-        let a = Tensor::from_slice(&[1.0, 2.0], &[2]);
-        let b = Tensor::from_slice(&[3.0, 4.0], &[2]);
+        let a = Tensor::new(&[1.0, 2.0], &[2], cpu());
+        let b = Tensor::new(&[3.0, 4.0], &[2], cpu());
         let c = a.add(&b);
         assert!(!c.is_realized());
         assert_eq!(c.shape(), [2]);
@@ -1097,27 +1138,27 @@ mod tests {
 
     #[test]
     fn test_add_realize() {
-        let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3]);
-        let b = Tensor::from_slice(&[4.0, 5.0, 6.0], &[3]);
+        let a = Tensor::new(&[1.0, 2.0, 3.0], &[3], cpu());
+        let b = Tensor::new(&[4.0, 5.0, 6.0], &[3], cpu());
         assert_eq!(a.add(&b).to_vec(), vec![5.0, 7.0, 9.0]);
     }
 
     #[test]
     fn test_mul_realize() {
-        let a = Tensor::from_slice(&[2.0, 3.0, 4.0], &[3]);
-        let b = Tensor::from_slice(&[5.0, 6.0, 7.0], &[3]);
+        let a = Tensor::new(&[2.0, 3.0, 4.0], &[3], cpu());
+        let b = Tensor::new(&[5.0, 6.0, 7.0], &[3], cpu());
         assert_eq!(a.mul(&b).to_vec(), vec![10.0, 18.0, 28.0]);
     }
 
     #[test]
     fn test_relu() {
-        let a = Tensor::from_slice(&[1.0, -2.0, 3.0, -4.0], &[4]);
+        let a = Tensor::new(&[1.0, -2.0, 3.0, -4.0], &[4], cpu());
         assert_eq!(a.relu().to_vec(), vec![1.0, 0.0, 3.0, 0.0]);
     }
 
     #[test]
     fn test_log_softmax_matches_known_values() {
-        let logits = Tensor::from_slice(&[0.0, 1.0], &[1, 2]);
+        let logits = Tensor::new(&[0.0, 1.0], &[1, 2], cpu());
         let result = logits.log_softmax(1).realize().to_vec();
         let expected = [-1.313_261_6_f32, -0.313_261_66_f32];
         for (actual, target) in result.iter().zip(expected) {
@@ -1127,8 +1168,8 @@ mod tests {
 
     #[test]
     fn test_cross_entropy_matches_one_hot_mean_loss() {
-        let logits = Tensor::from_slice(&[2.0, 0.0, 0.0, 2.0], &[2, 2]);
-        let targets = Tensor::from_slice(&[1.0, 0.0, 0.0, 1.0], &[2, 2]);
+        let logits = Tensor::new(&[2.0, 0.0, 0.0, 2.0], &[2, 2], cpu());
+        let targets = Tensor::new(&[1.0, 0.0, 0.0, 1.0], &[2, 2], cpu());
 
         let loss = logits.cross_entropy(&targets).realize().to_vec()[0];
 
@@ -1137,7 +1178,7 @@ mod tests {
 
     #[test]
     fn test_narrow_rows() {
-        let x = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let x = Tensor::new(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], cpu());
         let narrowed = x.narrow(0, 1, 1);
         assert_eq!(narrowed.shape(), [1, 3]);
         assert_eq!(narrowed.to_vec(), vec![4.0, 5.0, 6.0]);
@@ -1145,8 +1186,8 @@ mod tests {
 
     #[test]
     fn test_gradients_skip_untracked_narrow_inputs() {
-        let x = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2]).narrow(0, 1, 1);
-        let w = Tensor::from_slice(&[10.0, 20.0], &[2, 1]).with_requires_grad(true);
+        let x = Tensor::new(&[1.0, 2.0, 3.0, 4.0], &[2, 2], cpu()).narrow(0, 1, 1);
+        let w = Tensor::new(&[10.0, 20.0], &[2, 1], cpu()).with_requires_grad(true);
         let loss = x.matmul(&w).sum(&[0, 1]);
         let grads = loss.gradient(&[&w]);
         assert_eq!(grads[0].to_vec(), vec![3.0, 4.0]);
@@ -1155,24 +1196,24 @@ mod tests {
 
     #[test]
     fn test_realize_idempotent() {
-        let a = Tensor::from_slice(&[1.0, 2.0], &[2]);
-        let b = a.add(&Tensor::from_slice(&[3.0, 4.0], &[2]));
+        let a = Tensor::new(&[1.0, 2.0], &[2], cpu());
+        let b = a.add(&Tensor::new(&[3.0, 4.0], &[2], cpu()));
         assert_eq!(b.realize().realize().to_vec(), vec![4.0, 6.0]);
     }
 
     #[test]
     fn test_clone_shares_updates() {
-        let left = Tensor::zeros(&[2], DType::F32);
+        let left = Tensor::zeros(&[2], cpu(), DType::F32);
         let alias = left.clone();
-        left.replace(&Tensor::from_slice(&[5.0, 7.0], &[2]));
+        left.replace(&Tensor::new(&[5.0, 7.0], &[2], cpu()));
         assert_eq!(alias.to_vec(), vec![5.0, 7.0]);
     }
 
     #[test]
     fn test_assign_realizes_in_place() {
-        let tensor = Tensor::from_slice(&[1.0, 2.0], &[2]);
+        let tensor = Tensor::new(&[1.0, 2.0], &[2], cpu());
         let alias = tensor.clone();
-        tensor.assign(&Tensor::from_slice(&[8.0, 9.0], &[2]));
+        tensor.assign(&Tensor::new(&[8.0, 9.0], &[2], cpu()));
         Tensor::realize_many(&[&tensor]);
         assert_eq!(tensor.to_vec(), vec![8.0, 9.0]);
         assert_eq!(alias.to_vec(), vec![8.0, 9.0]);
@@ -1180,11 +1221,48 @@ mod tests {
 
     #[test]
     fn test_backward_stores_gradients() {
-        let x = Tensor::from_slice(&[3.0], &[1]).with_requires_grad(true);
-        let y = Tensor::from_slice(&[5.0], &[1]).with_requires_grad(true);
+        let x = Tensor::new(&[3.0], &[1], cpu()).with_requires_grad(true);
+        let y = Tensor::new(&[5.0], &[1], cpu()).with_requires_grad(true);
         let loss = x.mul(&y).sum(&[0]);
         loss.backward();
         assert_eq!(x.grad().expect("x grad").to_vec(), vec![5.0]);
         assert_eq!(y.grad().expect("y grad").to_vec(), vec![3.0]);
+    }
+
+    #[test]
+    fn test_new_infers_i32_dtype() {
+        let tensor = Tensor::new(&[1_i32, 2, 3], &[3], cpu()).realize();
+        let uop = tensor.uop();
+        let buffer = match uop.op() {
+            Op::Buffer => uop,
+            Op::Reshape => uop.srcs()[0].clone(),
+            _ => panic!("realized tensor must point at a buffer"),
+        };
+        let Arg::Buffer(buffer) = buffer.arg() else {
+            panic!("realized tensor must point at Arg::Buffer");
+        };
+
+        assert_eq!(tensor.dtype(), DType::I32);
+        let bytes = device::get(buffer.device()).copy_to_host(buffer);
+        let values: &[i32] = bytemuck::cast_slice(&bytes);
+        assert_eq!(values, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_new_infers_bool_dtype() {
+        let tensor = Tensor::new(&[true, false, true], &[3], cpu()).realize();
+        let uop = tensor.uop();
+        let buffer = match uop.op() {
+            Op::Buffer => uop,
+            Op::Reshape => uop.srcs()[0].clone(),
+            _ => panic!("realized tensor must point at a buffer"),
+        };
+        let Arg::Buffer(buffer) = buffer.arg() else {
+            panic!("realized tensor must point at Arg::Buffer");
+        };
+
+        assert_eq!(tensor.dtype(), DType::Bool);
+        let bytes = device::get(buffer.device()).copy_to_host(buffer);
+        assert_eq!(bytes, vec![1, 0, 1]);
     }
 }

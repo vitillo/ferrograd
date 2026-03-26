@@ -46,9 +46,11 @@
 
 use std::io::Write;
 use std::process::Command;
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::device::{Buffer, Device, DeviceError, DeviceId, KernelArg, Program, Storage};
 use crate::dtype::DType;
+use crate::uop::UOp;
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -218,7 +220,25 @@ impl CompiledKernel {
 ///
 /// Tinygrad's equivalent is `CPUDevice` in `tinygrad/runtime/ops_cpu.py`,
 /// which uses `ClangJITCompiler` + `CPUProgram` in the same way.
-pub struct CpuDevice;
+pub struct CpuDevice {
+    kernels: RefCell<HashMap<UOp, Rc<Program>>>,
+}
+
+impl CpuDevice {
+    /// Create a fresh CPU backend with an empty program cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            kernels: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for CpuDevice {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 fn buffer_mut_ptr(buffer: &Buffer) -> *mut u8 {
     assert_eq!(
@@ -346,6 +366,19 @@ impl Device for CpuDevice {
         }
 
         Ok(())
+    }
+
+    fn cached_program(&self, sink: &UOp) -> Option<Rc<Program>> {
+        self.kernels.borrow().get(sink).cloned()
+    }
+
+    fn insert_program(&self, sink: UOp, program: Rc<Program>) {
+        self.kernels.borrow_mut().insert(sink, program);
+    }
+
+    #[cfg(test)]
+    fn clear_for_tests(&self) {
+        self.kernels.borrow_mut().clear();
     }
 }
 
@@ -476,7 +509,7 @@ mod tests {
     #[test]
     fn test_allocate_through_device() {
         // Arrange
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
 
         // Act
         let buf = dev.allocate(DType::F32, 4);
@@ -489,7 +522,7 @@ mod tests {
     #[test]
     fn test_device_add() {
         // Arrange
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
         let source = r"
             void add(float* out, float* a, float* b) {
                 for (int i = 0; i < 3; i++) out[i] = a[i] + b[i];
@@ -515,7 +548,7 @@ mod tests {
     #[test]
     fn test_device_mul() {
         // Arrange
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
         let source = r"
             void mul(float* out, float* a, float* b) {
                 for (int i = 0; i < 3; i++) out[i] = a[i] * b[i];
@@ -541,7 +574,7 @@ mod tests {
     #[test]
     fn test_device_unary() {
         // Arrange
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
         let source = r"
             void negate(float* output, float* input) {
                 for (int i = 0; i < 3; i++) output[i] = -input[i];
@@ -566,7 +599,7 @@ mod tests {
     #[test]
     fn test_device_mixed_scalar_args() {
         // Arrange
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
         let source = r"
             void add_offset(float* out, float* input, int offset, float scale) {
                 for (int i = 0; i < 2; i++) out[i] = (input[offset + i] * scale);
@@ -595,7 +628,7 @@ mod tests {
     #[test]
     fn test_device_compile_bad_source() {
         // Arrange
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
 
         // Act
         let result = dev.compile("not valid C!", "nope", 1);

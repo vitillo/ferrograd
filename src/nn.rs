@@ -7,7 +7,7 @@
 
 use std::cell::Cell;
 
-use crate::tensor::Tensor;
+use crate::tensor::{cpu, Tensor};
 
 thread_local! {
     static INIT_SEED: Cell<u64> = const { Cell::new(42) };
@@ -43,7 +43,7 @@ fn kaiming_normal(shape: &[usize], fan_in: usize) -> Tensor {
         }
     }
 
-    Tensor::from_slice(&data, shape)
+    Tensor::new(&data, shape, cpu())
 }
 
 /// Explicit parameter collection for Rust model structs.
@@ -76,8 +76,10 @@ impl Linear {
     pub fn new(in_features: usize, out_features: usize) -> Self {
         let weight =
             kaiming_normal(&[out_features, in_features], in_features).with_requires_grad(true);
-        let bias =
-            Some(Tensor::zeros(&[out_features], crate::dtype::DType::F32).with_requires_grad(true));
+        let bias = Some(
+            Tensor::zeros(&[out_features], cpu(), crate::dtype::DType::F32)
+                .with_requires_grad(true),
+        );
         Self { weight, bias }
     }
 
@@ -120,7 +122,7 @@ mod tests {
     fn test_linear_forward_matches_output_shape() {
         // Arrange
         let layer = Linear::new(3, 2);
-        let input = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let input = Tensor::new(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], cpu());
 
         // Act
         let output = layer.forward(&input);

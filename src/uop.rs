@@ -5,16 +5,16 @@
 //!
 //! Tinygrad interns `UOp`s so structurally identical nodes are shared. We keep
 //! the same idea, but move graph identity onto an explicit device node while
-//! buffers, compiled kernels, and the interner stay in device-scoped state.
+//! compiled kernels live in device-scoped state and the interner lives here.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use crate::device::{Buffer, DeviceId};
 use crate::dtype::DType;
-use crate::runtime;
 use crate::shape::Shape;
 
 /// The operations our IR supports.
@@ -270,21 +270,54 @@ pub(crate) struct UOpKey {
 #[derive(Clone)]
 pub struct UOp(pub(crate) Rc<UOpInner>);
 
+thread_local! {
+    static UOP_INTERNER: RefCell<HashMap<UOpKey, Weak<UOpInner>>> = RefCell::new(HashMap::new());
+}
+
+fn intern_uop(op: Op, dtype: DType, srcs: Vec<UOp>, arg: Arg) -> UOp {
+    let key = UOpKey {
+        op,
+        dtype,
+        srcs,
+        arg,
+    };
+    UOP_INTERNER.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(existing) = cache.get(&key).and_then(Weak::upgrade) {
+            return UOp::from_inner(existing);
+        }
+
+        let inner = Rc::new(UOpInner {
+            op: key.op,
+            dtype: key.dtype,
+            srcs: key.srcs.clone(),
+            arg: key.arg.clone(),
+        });
+        cache.insert(key, Rc::downgrade(&inner));
+        UOp::from_inner(inner)
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn clear_for_tests() {
+    UOP_INTERNER.with(|cache| cache.borrow_mut().clear());
+}
+
 impl UOp {
     pub(crate) fn from_inner(inner: Rc<UOpInner>) -> Self {
         Self(inner)
     }
 
-    /// Central constructor — interns the node through the device's runtime state.
+    /// Central constructor — interns the node through the global `UOp` interner.
     ///
-    /// All `UOp` creation funnels through here. The runtime's interner either
+    /// All `UOp` creation funnels through here. The interner either
     /// returns an existing `Rc<UOpInner>` if an identical node already exists,
     /// or allocates a new one and caches it. This is how tinygrad achieves
     /// graph deduplication: structurally identical sub-expressions become the
     /// same object in memory, which makes equality checks O(1) and naturally
     /// deduplicates common sub-expressions in the graph.
-    fn build(device: DeviceId, op: Op, dtype: DType, srcs: Vec<Self>, arg: Arg) -> Self {
-        runtime::state(device).intern_uop(op, dtype, srcs, arg)
+    fn build(op: Op, dtype: DType, srcs: Vec<Self>, arg: Arg) -> Self {
+        intern_uop(op, dtype, srcs, arg)
     }
 
     /// Derive the device for a non-leaf node from its sources.
@@ -311,14 +344,14 @@ impl UOp {
     /// directly and rely on later stages to reject malformed graphs.
     #[must_use]
     pub(crate) fn new(op: Op, dtype: DType, srcs: Vec<Self>, arg: Arg) -> Self {
-        let device = Self::device_from_srcs(&srcs);
-        Self::build(device, op, dtype, srcs, arg)
+        Self::device_from_srcs(&srcs);
+        Self::build(op, dtype, srcs, arg)
     }
 
     /// Create a device identity leaf.
     #[must_use]
     pub(crate) fn device_uop(device: DeviceId) -> Self {
-        Self::build(device, Op::Device, DType::Void, vec![], Arg::Device(device))
+        Self::build(Op::Device, DType::Void, vec![], Arg::Device(device))
     }
 
     /// Create a kernel buffer parameter leaf on `device`.
@@ -326,7 +359,6 @@ impl UOp {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn param_buffer(slot: usize, dtype: DType, numel: usize, device: DeviceId) -> Self {
         Self::build(
-            device,
             Op::ParamBuffer,
             dtype,
             vec![Self::device_uop(device)],
@@ -339,7 +371,6 @@ impl UOp {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn param_scalar(slot: usize, dtype: DType, device: DeviceId) -> Self {
         Self::build(
-            device,
             Op::ParamScalar,
             dtype,
             vec![Self::device_uop(device)],
@@ -352,7 +383,6 @@ impl UOp {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn buffer(buffer: Buffer, dtype: DType, device: DeviceId) -> Self {
         Self::build(
-            device,
             Op::Buffer,
             dtype,
             vec![Self::device_uop(device)],
@@ -365,7 +395,6 @@ impl UOp {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn const_float(value: f64, dtype: DType, device: DeviceId) -> Self {
         Self::build(
-            device,
             Op::Const,
             dtype,
             vec![Self::device_uop(device)],
@@ -378,7 +407,6 @@ impl UOp {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn const_int(value: i64, dtype: DType, device: DeviceId) -> Self {
         Self::build(
-            device,
             Op::Const,
             dtype,
             vec![Self::device_uop(device)],
@@ -390,7 +418,6 @@ impl UOp {
     #[must_use]
     pub(crate) fn const_bool(value: bool, dtype: DType, device: DeviceId) -> Self {
         Self::build(
-            device,
             Op::Const,
             dtype,
             vec![Self::device_uop(device)],
@@ -661,8 +688,7 @@ impl UOp {
 
     #[must_use]
     pub(crate) fn sink(stores: Vec<Self>) -> Self {
-        let device = Self::device_from_srcs(&stores);
-        Self::build(device, Op::Sink, DType::Void, stores, Arg::None)
+        Self::build(Op::Sink, DType::Void, stores, Arg::None)
     }
 
     /// Iterative post-order DFS. Returns nodes in dependency order.
@@ -859,11 +885,9 @@ mod tests {
     #[test]
     fn test_uop_new_interns_identical_nodes() {
         let device = DeviceId::Cpu;
-        let state = crate::runtime::state(device);
-        let buffer = state.device().allocate(DType::F32, 2);
-        state
-            .device()
-            .copy_from_host(&buffer, bytemuck::cast_slice(&[1.0_f32, 2.0]));
+        let backend = crate::device::get(device);
+        let buffer = backend.allocate(DType::F32, 2);
+        backend.copy_from_host(&buffer, bytemuck::cast_slice(&[1.0_f32, 2.0]));
         let left = UOp::buffer(buffer.clone(), DType::F32, device);
         let right = UOp::buffer(buffer, DType::F32, device);
 

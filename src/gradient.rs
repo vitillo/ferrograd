@@ -210,19 +210,17 @@ fn gradient_for_op(node: &UOp, grad: &UOp) -> Vec<Option<UOp>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device;
     use crate::device::DeviceId;
     use crate::dtype::DType;
-    use crate::runtime;
 
     #[allow(clippy::cast_possible_truncation)]
     fn scalar_uop(val: f64) -> UOp {
-        let device = DeviceId::Cpu;
-        let state = runtime::state(device);
-        let buffer = state.device().allocate(DType::F32, 1);
-        state
-            .device()
-            .copy_from_host(&buffer, bytemuck::cast_slice(&[val as f32]));
-        let buf = UOp::buffer(buffer, DType::F32, device);
+        let device_id = DeviceId::Cpu;
+        let backend = device::get(device_id);
+        let buffer = backend.allocate(DType::F32, 1);
+        backend.copy_from_host(&buffer, bytemuck::cast_slice(&[val as f32]));
+        let buf = UOp::buffer(buffer, DType::F32, device_id);
         UOp::reshape(buf, Shape::from([1]))
     }
 

@@ -327,7 +327,7 @@ mod tests {
         let sink = build_add_graph(3);
         let code = ClangRenderer.render(&sink, "add");
 
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
         let program = dev.compile(&code, "add", 3).expect("compile failed");
         let mut args = [
             KernelArg::Buffer(dev.allocate(DType::F32, 3)),
@@ -368,7 +368,7 @@ mod tests {
         let sink = UOp::sink(vec![store, end]);
 
         let code = ClangRenderer.render(&sink, "negate");
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
         let program = dev.compile(&code, "negate", 2).expect("compile failed");
         let mut args = [
             KernelArg::Buffer(dev.allocate(DType::F32, 3)),
@@ -410,7 +410,7 @@ mod tests {
         let sink = UOp::sink(vec![store, end]);
 
         let code = ClangRenderer.render(&sink, "relu");
-        let dev = CpuDevice;
+        let dev = CpuDevice::new();
         let program = dev.compile(&code, "relu", 2).expect("compile failed");
         let mut args = [
             KernelArg::Buffer(dev.allocate(DType::F32, 4)),
