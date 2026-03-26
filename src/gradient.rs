@@ -18,13 +18,13 @@ use std::collections::{HashMap, HashSet};
 
 use crate::dtype::DType;
 use crate::shape::Shape;
-use crate::uop::{Arg, Op, UOp};
+use crate::uop::{self, Arg, Op, UOp};
 
 /// Compute gradients of `root` with respect to `targets`.
 #[must_use]
 pub fn compute_gradient(root: &UOp, root_grad: &UOp, targets: &[UOp]) -> HashMap<UOp, UOp> {
     let order = root.toposort();
-    let consumer_map = build_consumer_map(&order);
+    let consumer_map = uop::build_consumer_map(&order);
     let needed = needed_nodes(root, targets, &consumer_map);
     let mut grads: HashMap<UOp, UOp> = HashMap::new();
     grads.insert(root.clone(), root_grad.clone());
@@ -60,17 +60,6 @@ pub fn compute_gradient(root: &UOp, root_grad: &UOp, targets: &[UOp]) -> HashMap
         result.insert(target.clone(), grad);
     }
     result
-}
-
-/// Build a map from each node to the nodes that consume it as a source.
-fn build_consumer_map(order: &[UOp]) -> HashMap<UOp, Vec<UOp>> {
-    let mut consumers: HashMap<UOp, Vec<UOp>> = HashMap::new();
-    for node in order {
-        for src in node.srcs() {
-            consumers.entry(src.clone()).or_default().push(node.clone());
-        }
-    }
-    consumers
 }
 
 /// Find all nodes on any path between `targets` and `root` via consumers.
