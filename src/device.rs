@@ -204,6 +204,7 @@ pub enum KernelArg {
 /// Each backend has its own program representation. `CpuDevice` wraps a
 /// [`CompiledKernel`](cpu::CompiledKernel) (clang + dlopen).
 /// A future `CudaDevice` would wrap a `CUmodule`/`CUfunction`.
+#[derive(Debug)]
 pub enum Program {
     /// CPU program: a compiled shared library loaded via dlopen.
     Cpu {

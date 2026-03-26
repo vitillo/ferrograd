@@ -27,7 +27,7 @@ use crate::runtime::{self, BufferId};
 use crate::shape::Shape;
 use crate::uop::{Arg, Op, UOp};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 /// A runtime input to a compiled kernel.
 pub enum KernelInput {
     /// A realized tensor buffer identified in device state.
@@ -41,6 +41,7 @@ pub enum KernelInput {
 }
 
 /// A single kernel to compile and execute.
+#[derive(Debug)]
 pub struct ScheduleItem {
     /// Kernel-ready `Sink(Store(Param(0), expr))`.
     pub sink: UOp,
@@ -55,6 +56,7 @@ pub struct ScheduleItem {
 }
 
 /// A full execution plan for realizing one or more lazy roots.
+#[derive(Debug)]
 pub struct SchedulePlan {
     /// Kernels to execute in dependency order.
     pub items: Vec<ScheduleItem>,
