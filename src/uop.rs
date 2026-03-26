@@ -228,7 +228,7 @@ impl fmt::Display for Arg {
             Self::Bool(v) => write!(f, "{v}"),
             Self::Buffer(id, numel) => write!(f, "buf#{id}[{numel}]"),
             Self::Bounds(lengths) => write!(f, "{lengths:?}"),
-            Self::Shape(shape) => write!(f, "{shape:?}"),
+            Self::Shape(shape) => write!(f, "{shape}"),
             Self::Axes(axes) => write!(f, "{axes:?}"),
             Self::Reduce(op, axes) => write!(f, "{op:?}({axes:?})"),
         }
