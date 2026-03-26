@@ -122,9 +122,10 @@ impl fmt::Display for Op {
 }
 
 /// Op-specific payload attached to a `UOp`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum Arg {
     /// No argument.
+    #[default]
     None,
     /// Device identity for `Device`.
     Device(DeviceId),
