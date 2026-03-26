@@ -191,30 +191,27 @@ fn parameterize_store(store: &UOp) -> ScheduleItem {
 /// `slot_offset` reserves slot 0 for the output in allocating kernels (1) or
 /// starts at 0 for in-place stores where the destination is a regular input.
 fn parameterize_inputs(root: &UOp, slot_offset: usize, pass_name: &str) -> (UOp, Vec<KernelInput>) {
-    use std::cell::RefCell;
-
     let device = root.device();
-    let inputs: RefCell<Vec<KernelInput>> = RefCell::new(Vec::new());
-    let params: RefCell<HashMap<BufferId, UOp>> = RefCell::new(HashMap::new());
-    let scalar_params: RefCell<HashMap<UOp, UOp>> = RefCell::new(HashMap::new());
+    let mut inputs: Vec<KernelInput> = Vec::new();
+    let mut params: HashMap<BufferId, UOp> = HashMap::new();
+    let mut scalar_params: HashMap<UOp, UOp> = HashMap::new();
 
     // Allocating kernels reserve slot 0 for their output buffer; in-place store
     // kernels start their inputs at slot 0 because the destination is already in
     // the graph as a regular buffer input.
-    let rewrite_inputs = |node: &UOp| -> Option<UOp> {
+    let mut rewrite_inputs = |node: &UOp| -> Option<UOp> {
         match node.op() {
             Op::Buffer => {
                 let Arg::Buffer(id, numel) = node.arg() else {
                     return None;
                 };
                 let dtype = node.dtype();
-                let mut params = params.borrow_mut();
                 Some(
                     params
                         .entry(*id)
                         .or_insert_with(|| {
-                            let slot = inputs.borrow().len() + slot_offset;
-                            inputs.borrow_mut().push(KernelInput::Buffer(*id));
+                            let slot = inputs.len() + slot_offset;
+                            inputs.push(KernelInput::Buffer(*id));
                             UOp::param_buffer(slot, dtype, *numel, device)
                         })
                         .clone(),
@@ -223,13 +220,12 @@ fn parameterize_inputs(root: &UOp, slot_offset: usize, pass_name: &str) -> (UOp,
             Op::Bind => {
                 let variable = node.srcs()[0].clone();
                 let literal = scalar_input(node.srcs()[1].arg());
-                let mut scalar_params = scalar_params.borrow_mut();
                 Some(
                     scalar_params
                         .entry(variable)
                         .or_insert_with(|| {
-                            let slot = inputs.borrow().len() + slot_offset;
-                            inputs.borrow_mut().push(literal.clone());
+                            let slot = inputs.len() + slot_offset;
+                            inputs.push(literal.clone());
                             UOp::param_scalar(slot, node.dtype(), device)
                         })
                         .clone(),
@@ -246,8 +242,8 @@ fn parameterize_inputs(root: &UOp, slot_offset: usize, pass_name: &str) -> (UOp,
                 for ((axis, start), &len) in node.srcs()[1..].iter().enumerate().zip(lengths.iter())
                 {
                     if len != src_shape[axis] && start.op() == Op::Const {
-                        let slot = inputs.borrow().len() + slot_offset;
-                        inputs.borrow_mut().push(scalar_input(start.arg()));
+                        let slot = inputs.len() + slot_offset;
+                        inputs.push(scalar_input(start.arg()));
                         let param = UOp::param_scalar(slot, start.dtype(), device);
                         new_srcs.push(param);
                         changed = true;
@@ -263,8 +259,8 @@ fn parameterize_inputs(root: &UOp, slot_offset: usize, pass_name: &str) -> (UOp,
     };
 
     (
-        graph_rewrite(root, &rewrite_inputs, pass_name),
-        inputs.into_inner(),
+        graph_rewrite(root, &mut rewrite_inputs, pass_name),
+        inputs,
     )
 }
 
