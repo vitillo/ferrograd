@@ -21,6 +21,12 @@ pub enum DatasetError {
     /// A network download failed.
     #[error("download failed: {0}")]
     Download(String),
+    /// The file is not a valid IDX-format file.
+    #[error("bad IDX format: {detail}")]
+    BadFormat {
+        /// Human-readable description of what went wrong.
+        detail: String,
+    },
 }
 
 /// Convenience alias used throughout this module.
@@ -110,12 +116,20 @@ impl MNISTDataset {
 fn parse_images(path: &Path) -> Result<(Tensor, usize)> {
     let mut file = File::open(path)?;
     let magic = read_u32(&mut file)?;
-    assert_eq!(magic, 2051, "bad IDX image magic");
+    if magic != 2051 {
+        return Err(DatasetError::BadFormat {
+            detail: format!("expected IDX image magic 2051, got {magic}"),
+        });
+    }
 
     let count = read_u32(&mut file)? as usize;
     let rows = read_u32(&mut file)? as usize;
     let cols = read_u32(&mut file)? as usize;
-    assert_eq!((rows, cols), (28, 28));
+    if (rows, cols) != (28, 28) {
+        return Err(DatasetError::BadFormat {
+            detail: format!("expected 28x28 images, got {rows}x{cols}"),
+        });
+    }
 
     let mut pixels = vec![0u8; count * rows * cols];
     file.read_exact(&mut pixels)?;
@@ -128,7 +142,11 @@ fn parse_images(path: &Path) -> Result<(Tensor, usize)> {
 fn parse_labels(path: &Path) -> Result<Vec<u8>> {
     let mut file = File::open(path)?;
     let magic = read_u32(&mut file)?;
-    assert_eq!(magic, 2049, "bad IDX label magic");
+    if magic != 2049 {
+        return Err(DatasetError::BadFormat {
+            detail: format!("expected IDX label magic 2049, got {magic}"),
+        });
+    }
 
     let count = read_u32(&mut file)? as usize;
     let mut labels = vec![0u8; count];
