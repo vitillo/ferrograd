@@ -42,7 +42,7 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 use crate::codegen::{ClangRenderer, Renderer};
-use crate::device::{Buffer, DeviceId, KernelArg};
+use crate::device::{Buffer, DeviceId, KernelArg, Program};
 use crate::dtype::DType;
 use crate::gradient;
 use crate::runtime;
@@ -782,19 +782,7 @@ impl Tensor {
             );
             args.push(KernelArg::Buffer(out));
             execute_inputs(&state, &item.inputs, &mut args);
-
-            let t0 = Instant::now();
-            state
-                .device()
-                .execute(&program, &mut args)
-                .expect("execution failed");
-            if debug >= 2 {
-                let elapsed = t0.elapsed();
-                eprintln!(
-                    "              exec time={:.3}ms",
-                    elapsed.as_secs_f64() * 1000.0,
-                );
-            }
+            run_kernel(&state, &program, &mut args, debug);
 
             let KernelArg::Buffer(out) = args.remove(0) else {
                 panic!("output kernel arg must remain a buffer");
@@ -806,28 +794,15 @@ impl Tensor {
         }
 
         execute_inputs(&state, &item.inputs, &mut args);
-        let t0 = Instant::now();
-        state
-            .device()
-            .execute(&program, &mut args)
-            .expect("execution failed");
-        if debug >= 2 {
-            let elapsed = t0.elapsed();
-            eprintln!(
-                "              exec time={:.3}ms",
-                elapsed.as_secs_f64() * 1000.0,
-            );
-        }
+        run_kernel(&state, &program, &mut args, debug);
 
         let dest_id = item.inputs.iter().find_map(|input| match input {
             schedule::KernelInput::Buffer(id) => Some(*id),
-            schedule::KernelInput::I32(_)
-            | schedule::KernelInput::F32(_)
-            | schedule::KernelInput::Bool(_) => None,
+            _ => None,
         });
         let dest_buffer = args.iter().find_map(|arg| match arg {
             KernelArg::Buffer(buffer) => Some(buffer.clone()),
-            KernelArg::I32(_) | KernelArg::F32(_) | KernelArg::Bool(_) => None,
+            _ => None,
         });
         if let (Some(dest_id), Some(dest_buffer)) = (dest_id, dest_buffer) {
             state
@@ -940,6 +915,27 @@ fn execute_inputs(
         schedule::KernelInput::Bool(value) => KernelArg::Bool(*value),
     });
     args.extend(input_args);
+}
+
+/// Execute a compiled kernel and optionally log timing when `debug >= 2`.
+fn run_kernel(
+    state: &runtime::DeviceState,
+    program: &Program,
+    args: &mut [KernelArg],
+    debug: u8,
+) {
+    let t0 = Instant::now();
+    state
+        .device()
+        .execute(program, args)
+        .expect("execution failed");
+    if debug >= 2 {
+        let elapsed = t0.elapsed();
+        eprintln!(
+            "              exec time={:.3}ms",
+            elapsed.as_secs_f64() * 1000.0,
+        );
+    }
 }
 
 /// Build a `UOp` expression for a constant-filled tensor (e.g. all-ones for the

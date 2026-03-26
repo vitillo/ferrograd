@@ -64,13 +64,10 @@ pub fn compute_gradient(root: &UOp, root_grad: &UOp, targets: &[UOp]) -> HashMap
 
 /// Build a map from each node to the nodes that consume it as a source.
 fn build_consumer_map(order: &[UOp]) -> HashMap<UOp, Vec<UOp>> {
-    let mut consumers = HashMap::new();
+    let mut consumers: HashMap<UOp, Vec<UOp>> = HashMap::new();
     for node in order {
         for src in node.srcs() {
-            consumers
-                .entry(src.clone())
-                .or_insert_with(Vec::new)
-                .push(node.clone());
+            consumers.entry(src.clone()).or_default().push(node.clone());
         }
     }
     consumers
