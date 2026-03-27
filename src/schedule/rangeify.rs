@@ -17,6 +17,7 @@
 //!    Index down through ALU/movement/reduce/param nodes
 //! 3. **Reduce expansion**: converts Reduce into an accumulator loop pattern
 
+use crate::device::DeviceId;
 use crate::dtype::DType;
 use crate::rewrite::graph_rewrite;
 use crate::uop::{Arg, Op, UOp};
@@ -27,6 +28,26 @@ use super::indexing::{
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────
+
+/// Create a loop index for one axis, mirroring tinygrad's `new_range()`.
+///
+/// Size-1 dimensions (from reductions like `sum(axis=0)` on shape `[3,4]` →
+/// `[1,4]`) always index at 0 — there's nothing to iterate. Rather than
+/// emitting a trivial `Range(0..1)` loop, we return `const(0)` directly.
+/// This avoids a useless loop and lets downstream code distinguish real
+/// loops (Range ops) from collapsed dims when building End nodes.
+#[allow(clippy::cast_possible_wrap)]
+fn new_range(axis: usize, size: usize, device: DeviceId) -> UOp {
+    if size == 1 {
+        return UOp::const_int(0, DType::I32, device);
+    }
+    UOp::new(
+        Op::Range,
+        DType::I32,
+        vec![UOp::const_int(size as i64, DType::I32, device)],
+        Arg::Index(axis),
+    )
+}
 
 /// Wrap `body` in nested End nodes, one per range (innermost range first).
 ///
@@ -51,24 +72,11 @@ fn chain_ends(ranges: &[UOp], body: &UOp) -> UOp {
 /// assignment into a sub-region of an existing buffer.
 fn store_output_index(dest: &UOp, idxs: &[UOp]) -> Option<UOp> {
     match dest.op() {
-        Op::ParamBuffer => {
+        Op::ParamBuffer | Op::Buffer => {
             assert_eq!(
                 idxs.len(),
                 1,
-                "store destination must be flattened before reaching ParamBuffer"
-            );
-            Some(UOp::new(
-                Op::Index,
-                dest.dtype(),
-                vec![dest.clone(), idxs[0].clone()],
-                Arg::Index(0),
-            ))
-        }
-        Op::Buffer => {
-            assert_eq!(
-                idxs.len(),
-                1,
-                "store destination must be flattened before reaching Buffer"
+                "store destination must be flattened before reaching ParamBuffer/Buffer"
             );
             Some(UOp::new(
                 Op::Index,
@@ -98,8 +106,8 @@ fn store_output_index(dest: &UOp, idxs: &[UOp]) -> Option<UOp> {
 ///    These become the `for` loops in the generated C code.
 /// 2. Wrap the expression in `Index(expr, ranges...)` to start the index
 ///    pushing process. Later rules will push this Index all the way down.
-/// 3. Compute a flat output offset from the ranges (skipping size-1 dims,
-///    which come from reductions and don't contribute to output size).
+/// 3. Compute a flat output offset from the full-rank indices.
+///    Singleton axes are already `0`, so stride math naturally drops them.
 /// 4. Wrap everything in End nodes to close each Range loop.
 ///
 /// The guard `expr.shape()?` ensures this rule only fires once: after the
@@ -117,37 +125,19 @@ fn rewrite_store_add_ranges(store: &UOp) -> Option<UOp> {
     let axis_indices: Vec<UOp> = shape
         .iter()
         .enumerate()
-        .map(|(axis, &size)| {
-            if size == 1 {
-                return UOp::const_int(0, DType::I32, device);
-            }
-            #[allow(clippy::cast_possible_wrap)]
-            UOp::new(
-                Op::Range,
-                DType::I32,
-                vec![UOp::const_int(size as i64, DType::I32, device)],
-                Arg::Index(axis),
-            )
-        })
+        .map(|(axis, &size)| new_range(axis, size, device))
         .collect();
 
     let indexed_expr = index_wrap(expr, &axis_indices);
 
-    // Size-1 dims come from reductions (e.g. sum(axis=0) on [3,4] → [1,4]).
-    // They don't contribute to the output buffer size, so skip them for the
-    // output flat index. The Range still exists to carry the full shape into
-    // Index pushing.
+    // Flatten the full-rank output coordinate. Singleton axes are constants,
+    // so symbolic cleanup will fold terms like `0 * stride` away.
+    let out_flat = flat_index(&axis_indices, &contiguous_strides(shape.as_slice()));
     let out_ranges: Vec<UOp> = axis_indices
         .iter()
         .filter(|idx| idx.op() == Op::Range)
         .cloned()
         .collect();
-    let squeezed: Vec<usize> = shape.iter().copied().filter(|&s| s != 1).collect();
-    let out_flat = if out_ranges.is_empty() {
-        UOp::const_int(0, DType::I32, device)
-    } else {
-        flat_index(&out_ranges, &contiguous_strides(&squeezed))
-    };
     let out_idx = if out_param.op() == Op::ParamBuffer {
         UOp::new(
             Op::Index,
@@ -263,4 +253,58 @@ fn rangeify_rule(node: &UOp) -> Option<UOp> {
 #[must_use]
 pub fn rangeify(sink: &UOp) -> UOp {
     graph_rewrite(sink, &mut rangeify_rule)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::DeviceId;
+    use crate::rewrite::symbolic_simple;
+    use crate::shape::Shape;
+
+    #[test]
+    fn test_singleton_output_axis_flattens_from_full_rank_indices() {
+        // Arrange
+        let device = DeviceId::Cpu;
+        let out = UOp::param_buffer(0, DType::F32, 3, device);
+        let input = UOp::param_buffer(1, DType::F32, 6, device);
+        let reshaped = UOp::reshape(input, Shape::from([2, 3]));
+        let narrowed = UOp::new(
+            Op::Shrink,
+            DType::F32,
+            vec![
+                reshaped,
+                UOp::const_int(1, DType::I32, device),
+                UOp::const_int(0, DType::I32, device),
+            ],
+            Arg::Bounds(Box::from([1, 3])),
+        );
+        let store = UOp::new(Op::Store, DType::Void, vec![out, narrowed], Arg::None);
+        let sink = UOp::sink(vec![store]);
+
+        // Act
+        let rangeified = rangeify(&sink);
+        let simplified = graph_rewrite(&rangeified, &mut symbolic_simple);
+        let order = simplified.toposort();
+
+        // Assert
+        let ranges: Vec<UOp> = order
+            .iter()
+            .filter(|node| node.op() == Op::Range)
+            .cloned()
+            .collect();
+        assert_eq!(ranges.len(), 1, "singleton output axis should not emit a loop");
+
+        let store = order
+            .iter()
+            .find(|node| node.op() == Op::Store)
+            .expect("rangeified graph should contain a store");
+        let out_idx = &store.srcs()[0];
+        assert_eq!(out_idx.op(), Op::Index);
+        assert_eq!(
+            out_idx.srcs()[1],
+            ranges[0],
+            "output address should simplify to the live loop index",
+        );
+    }
 }
