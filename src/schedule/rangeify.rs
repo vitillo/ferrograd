@@ -262,5 +262,5 @@ fn rangeify_rule(node: &UOp) -> Option<UOp> {
 /// Output: kernel-level Sink with Ranges, Loads, Stores, and accumulator loops.
 #[must_use]
 pub fn rangeify(sink: &UOp) -> UOp {
-    graph_rewrite(sink, &mut rangeify_rule, "rangeify")
+    graph_rewrite(sink, &mut rangeify_rule)
 }

@@ -16,7 +16,7 @@
 //!    identify buffer inputs/outputs.
 //! 2. **Rangeify** — lower high-level tensor ops (reshape, permute, reduce) into
 //!    explicit index arithmetic with range loops, producing the kernel IR.
-//! 3. **Symbolic simplification** — constant-fold and simplify the index math.
+//! 3. **Optimize** — run enabled kernel IR cleanup passes such as symbolic simplification.
 //! 4. **Codegen** — render the kernel IR into C source code.
 //! 5. **Compile** — invoke the platform C compiler (via the `Device` trait).
 //! 6. **Execute** — run the compiled kernel, writing results into device buffers.
@@ -47,7 +47,7 @@ use crate::codegen::{ClangRenderer, Renderer};
 use crate::device::{self, DeviceId, KernelArg, Program};
 use crate::dtype::DType;
 use crate::gradient;
-use crate::schedule::{self, rangeify::rangeify, ScheduleItem};
+use crate::schedule::{self, rangeify::rangeify};
 use crate::shape::Shape;
 use crate::uop::{Arg, Op, UOp};
 
@@ -57,6 +57,47 @@ static DEBUG: LazyLock<u8> = LazyLock::new(|| {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
 });
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OptimizeConfig {
+    symbolic: bool,
+}
+
+impl OptimizeConfig {
+    const fn all() -> Self {
+        Self { symbolic: true }
+    }
+
+    const fn none() -> Self {
+        Self { symbolic: false }
+    }
+}
+
+fn parse_optimize_config(raw: Option<&str>) -> OptimizeConfig {
+    let Some(raw) = raw.map(str::trim) else {
+        return OptimizeConfig::all();
+    };
+    if raw.is_empty() {
+        return OptimizeConfig::all();
+    }
+
+    match raw {
+        "0" | "off" | "none" => return OptimizeConfig::none(),
+        "1" | "on" | "all" => return OptimizeConfig::all(),
+        _ => {}
+    }
+
+    let mut config = OptimizeConfig::none();
+    for pass in raw.split(',').map(str::trim) {
+        if pass == "symbolic" {
+            config.symbolic = true;
+        }
+    }
+    config
+}
+
+static OPTIMIZE: LazyLock<OptimizeConfig> =
+    LazyLock::new(|| parse_optimize_config(std::env::var("OPT").ok().as_deref()));
 
 /// Global monotonic counter for naming compiled kernels (`kernel_0`, `kernel_1`, …).
 /// Also used in debug output to correlate log lines with specific kernel invocations.
@@ -779,11 +820,24 @@ impl Tensor {
             return;
         }
 
-        let plan = schedule::schedule_many(&roots);
-        for item in &plan.items {
-            Self::execute_item(item);
+        let schedule_root = UOp::sink(roots.clone());
+        Self::debug_root("schedule", "before", &schedule_root);
+        let schedule::SchedulePlan {
+            items,
+            replacements,
+        } = schedule::schedule_many(&roots);
+        for item in items {
+            Self::debug_root("rangeify", "before", &item.sink);
+            let rangeified = rangeify(&item.sink);
+
+            Self::debug_root("optimize", "before", &rangeified);
+            let lowered_sink = Self::optimize(&rangeified);
+
+            assert_codegen_ready(&lowered_sink);
+            Self::debug_root("codegen", "before", &lowered_sink);
+            Self::execute_item(&lowered_sink, &item.inputs, item.output_buffer.as_ref());
         }
-        Self::apply_map_to_tensors(&plan.replacements);
+        Self::apply_map_to_tensors(&replacements);
     }
 
     /// Lower the lazy graph to kernels, compile, and execute them.
@@ -793,24 +847,17 @@ impl Tensor {
         self.clone()
     }
 
-    /// Run the full pipeline for a single scheduled kernel: rangeify → symbolic
-    /// simplification → codegen → compile (or cache hit) → execute.
-    fn execute_item(item: &ScheduleItem) {
-        let backend = device::get(item.sink.device());
+    /// Codegen, compile (or hit cache), and execute one lowered kernel.
+    fn execute_item(
+        sink: &UOp,
+        inputs: &[schedule::KernelInput],
+        output_buffer: Option<&device::Buffer>,
+    ) {
+        let backend = device::get(sink.device());
         let debug = *DEBUG;
-        let lowered = rangeify(&item.sink);
-        let lowered = crate::rewrite::graph_rewrite(
-            &lowered,
-            &mut crate::rewrite::symbolic_simple,
-            "symbolic",
-        );
-        assert_codegen_ready(&lowered);
 
-        let num_args = item
-            .output_buffer
-            .as_ref()
-            .map_or(item.inputs.len(), |_| item.inputs.len() + 1);
-        let program = if let Some(program) = backend.cached_program(&lowered) {
+        let num_args = output_buffer.map_or(inputs.len(), |_| inputs.len() + 1);
+        let program = if let Some(program) = backend.cached_program(sink) {
             if debug >= 1 {
                 let kid = KERNEL_COUNT.fetch_add(1, Ordering::Relaxed);
                 eprintln!("*** CPU {kid:>4}  (cached)         arg {num_args:>2}");
@@ -819,13 +866,13 @@ impl Tensor {
         } else {
             let kid = KERNEL_COUNT.fetch_add(1, Ordering::Relaxed);
             let name = format!("kernel_{kid}");
-            let code = ClangRenderer.render(&lowered, &name);
+            let code = ClangRenderer.render(sink, &name);
 
             if debug >= 4 {
                 eprintln!("{code}");
             }
             if debug >= 3 {
-                eprintln!("{}", lowered.dump());
+                eprintln!("{}", sink.dump());
             }
 
             let program = Rc::new(
@@ -840,21 +887,43 @@ impl Tensor {
                 eprintln!("*** CPU {kid:>4}  {name:<16} arg {num_args:>2}");
             }
 
-            backend.insert_program(lowered.clone(), program.clone());
+            backend.insert_program(sink.clone(), program.clone());
             program
         };
 
         let mut args: Vec<KernelArg> = Vec::with_capacity(num_args);
-        if let Some(output_buffer) = item.output_buffer.clone() {
+        if let Some(output_buffer) = output_buffer.cloned() {
             output_buffer.ensure_allocated();
             args.push(KernelArg::Buffer(output_buffer));
-            execute_inputs(&item.inputs, &mut args);
+            execute_inputs(inputs, &mut args);
             run_kernel(backend.as_ref(), &program, &mut args, debug);
             return;
         }
 
-        execute_inputs(&item.inputs, &mut args);
+        execute_inputs(inputs, &mut args);
         run_kernel(backend.as_ref(), &program, &mut args, debug);
+    }
+
+    /// Run enabled kernel IR optimization passes in a fixed order.
+    ///
+    /// The `OPT` environment variable controls which passes run:
+    /// - unset / empty / `all` / `on` / `1`: enable all passes
+    /// - `none` / `off` / `0`: disable all passes
+    /// - comma-separated pass names, e.g. `symbolic`
+    fn optimize(kernel: &UOp) -> UOp {
+        let mut current = kernel.clone();
+
+        if OPTIMIZE.symbolic {
+            current = crate::rewrite::graph_rewrite(&current, &mut crate::rewrite::symbolic_simple);
+        }
+
+        current
+    }
+
+    fn debug_root(name: &str, stage: &str, root: &UOp) {
+        if *DEBUG >= 3 {
+            eprintln!("━━━ {name} [{stage}] ━━━\n{}", root.dump());
+        }
     }
 
     /// Realize and extract data as `Vec<f32>`.
@@ -1083,7 +1152,7 @@ fn broadcast_shapes(left: &Tensor, right: &Tensor) -> (Tensor, Tensor) {
     (left, right)
 }
 
-/// Validate that rangeify and symbolic passes have lowered all high-level ops.
+/// Validate that rangeify and optimize passes have lowered all high-level ops.
 /// Any surviving tensor-level op (`Reshape`, `Permute`, `ReduceAxis`, etc.) indicates
 /// a bug in the lowering pipeline and would produce nonsense in codegen.
 fn assert_codegen_ready(root: &UOp) {
@@ -1117,6 +1186,32 @@ pub fn cpu() -> DeviceId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_optimize_config_defaults_to_all_passes() {
+        assert_eq!(parse_optimize_config(None), OptimizeConfig::all());
+        assert_eq!(parse_optimize_config(Some("")), OptimizeConfig::all());
+        assert_eq!(parse_optimize_config(Some("all")), OptimizeConfig::all());
+    }
+
+    #[test]
+    fn test_parse_optimize_config_can_disable_all_passes() {
+        assert_eq!(parse_optimize_config(Some("0")), OptimizeConfig::none());
+        assert_eq!(parse_optimize_config(Some("off")), OptimizeConfig::none());
+        assert_eq!(parse_optimize_config(Some("none")), OptimizeConfig::none());
+    }
+
+    #[test]
+    fn test_parse_optimize_config_enables_named_passes() {
+        assert_eq!(
+            parse_optimize_config(Some("symbolic")),
+            OptimizeConfig { symbolic: true }
+        );
+        assert_eq!(
+            parse_optimize_config(Some("symbolic,unknown")),
+            OptimizeConfig { symbolic: true }
+        );
+    }
 
     #[test]
     fn test_new_roundtrip() {
