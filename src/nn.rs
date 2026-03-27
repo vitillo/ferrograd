@@ -53,6 +53,7 @@ fn kaiming_normal(shape: &[usize], fan_in: usize) -> Tensor {
 /// expose their trainable tensors directly through this trait instead.
 pub trait Parameters {
     /// Return all trainable parameter handles owned by this value.
+    #[must_use]
     fn parameters(&self) -> Vec<Tensor>;
 }
 
