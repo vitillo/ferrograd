@@ -54,11 +54,16 @@
 
 pub mod codegen;
 pub mod dataset;
+mod devectorize;
 pub mod device;
 pub mod dtype;
+mod expand;
 pub mod gradient;
+mod lane;
+mod linearize;
 pub mod nn;
 pub mod optim;
+mod optimize;
 pub mod rewrite;
 pub mod schedule;
 pub mod shape;

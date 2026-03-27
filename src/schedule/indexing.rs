@@ -1,14 +1,21 @@
-//! # Indexing — core index transformation logic
+//! # Indexing — pushing indices from output to leaves
 //!
-//! This module pushes tensor-level indexing down through movement and reduction
-//! ops until it reaches kernel parameters, where it becomes a flat load.
+//! In tinygrad's compilation pipeline, `rangeify` creates `Index` nodes at the
+//! kernel output and then rewrite rules push those indices *down* through the
+//! graph — through elementwise ops, movement ops (reshape, permute, expand,
+//! shrink), and reductions — until they reach leaf nodes (kernel parameters and
+//! constants). At each op the index is transformed to account for that op's
+//! semantics: a permute reorders index components, a reshape remaps them via
+//! stride arithmetic, an expand zeroes out broadcast dimensions, and a reduce
+//! replaces collapsed axes with new `Range` iterators.
+//!
+//! By the time every `Index` has been pushed to a leaf, the abstract tensor
+//! graph has been lowered into concrete loop-and-load kernel IR. This module
+//! contains the per-op rewrite functions that `rangeify` dispatches to.
 
 use crate::dtype::DType;
 use crate::shape::Shape;
-use crate::uop::{Arg, Op, UOp};
-
-/// Output loops use `0..ndim`; reduce loops use an offset to avoid collisions.
-const REDUCE_RANGE_OFFSET: usize = 100;
+use crate::uop::{Arg, AxisKind, Op, UOp};
 
 /// Row-major contiguous strides for a shape.
 #[must_use]
@@ -191,7 +198,7 @@ pub fn rewrite_index_reduce(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
                 Op::Range,
                 DType::I32,
                 vec![bound],
-                Arg::Index(REDUCE_RANGE_OFFSET + axis),
+                Arg::Range(axis, AxisKind::Reduce),
             );
             full_idxs.push(range.clone());
             reduce_ranges.push(range);

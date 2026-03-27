@@ -125,7 +125,7 @@ pub enum Op {
     /// with a corresponding `End` node that closes the loop body.
     ///
     /// - **srcs:** `[bound]` — a node producing the upper bound
-    /// - **arg:** `Arg::Index(axis)` — which loop axis this range represents
+    /// - **arg:** `Arg::Range(axis, kind)` — loop axis id plus scheduling kind
     Range,
 
     /// Close a `Range` loop, carrying the loop body as a dependency.
@@ -161,6 +161,36 @@ pub enum Op {
     /// - **srcs:** `[address, value]` — an `Index` node and the value to store
     /// - **arg:** `Arg::None`
     Store,
+
+    /// Pack several scalar lanes into one explicit vector value.
+    ///
+    /// This mirrors tinygrad's `Ops.VECTORIZE` and is introduced by the late
+    /// expansion phase after scheduling has decided to compute multiple lanes
+    /// together.
+    ///
+    /// - **srcs:** `[lane_0, lane_1, …]` — one scalar value per lane
+    /// - **arg:** `Arg::None`
+    Vectorize,
+
+    /// Carry an explicitly expanded multi-lane value through late lowering.
+    ///
+    /// This mirrors tinygrad's `Ops.UNROLL`: it is not a control-flow loop,
+    /// but a value wrapper that says "the child has been expanded across these
+    /// lanes".
+    ///
+    /// - **srcs:** `[value]` — the expanded scalar/vector payload
+    /// - **arg:** `Arg::Lanes([(axis, size), …])` — lane metadata
+    Unroll,
+
+    /// Remap or collapse expanded lane structure.
+    ///
+    /// This mirrors tinygrad's `Ops.CONTRACT` and is used when expanded lanes
+    /// need to be packed back down for stores, reductions, or backend-specific
+    /// lowering.
+    ///
+    /// - **srcs:** `[value]` — the expanded payload to contract
+    /// - **arg:** `Arg::Lanes([(axis, size), …])` — contracted lane metadata
+    Contract,
 
     /// A compile-time constant scalar.
     ///
@@ -251,8 +281,11 @@ pub enum Op {
 
     /// Declare a loop accumulator with an initial value.
     ///
-    /// - **srcs:** `[initial_value, range]` — the starting value and the
-    ///   `Range` node whose loop body updates this accumulator
+    /// - **srcs:** `[initial_value, outer_range…]` — the starting value,
+    ///   followed by any enclosing non-reduce `Range` nodes that scope
+    ///   the accumulator. These extra sources bake ordering into the graph
+    ///   so the linearizer places the declaration inside the right loop
+    ///   without needing accumulator-specific logic.
     /// - **arg:** `Arg::None`
     DefineAcc,
 
@@ -299,6 +332,48 @@ impl fmt::Display for Op {
     }
 }
 
+/// Classifies a loop axis after rangeify.
+///
+/// This mirrors tinygrad's `AxisType`: rangeify starts with plain `LOOP`
+/// and `REDUCE` axes, and later optimization passes can retag them as
+/// `GLOBAL`, `LOCAL`, `UPCAST`, `UNROLL`, or `THREAD` without changing the
+/// renderer interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AxisKind {
+    /// Ordinary loop axis with no scheduling decision applied yet.
+    Loop,
+    /// Global/output axis chosen for backend launch or outer tiling.
+    Global,
+    /// Per-block or per-thread local axis.
+    Local,
+    /// Reduction axis.
+    Reduce,
+    /// Grouped reduction axis.
+    GroupReduce,
+    /// Small fixed-width output lane computed together.
+    Upcast,
+    /// Fully unrolled loop axis.
+    Unroll,
+    /// Runtime thread-partitioned axis.
+    Thread,
+}
+
+impl fmt::Display for AxisKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Loop => "LOOP",
+            Self::Global => "GLOBAL",
+            Self::Local => "LOCAL",
+            Self::Reduce => "REDUCE",
+            Self::GroupReduce => "GROUP_REDUCE",
+            Self::Upcast => "UPCAST",
+            Self::Unroll => "UNROLL",
+            Self::Thread => "THREAD",
+        };
+        write!(f, "{name}")
+    }
+}
+
 /// Op-specific payload attached to a `UOp`.
 #[derive(Debug, Clone, Default)]
 pub enum Arg {
@@ -309,8 +384,10 @@ pub enum Arg {
     Device(DeviceId),
     /// Symbolic variable metadata: name, min, max.
     Variable(String, i64, i64),
-    /// Axis id for `Range`, or sentinel tag for kernel-level `Index`.
+    /// Sentinel tag for kernel-level `Index`.
     Index(usize),
+    /// Loop axis id and scheduling class for `Range`.
+    Range(usize, AxisKind),
     /// Kernel buffer parameter slot and flattened element count.
     ParamBuffer(usize, usize),
     /// Kernel scalar parameter slot.
@@ -329,6 +406,11 @@ pub enum Arg {
     Shape(Shape),
     /// Axis payload for `Permute`.
     Axes(Box<[usize]>),
+    /// Lane metadata for late `Unroll`/`Contract` lowering.
+    ///
+    /// Each pair stores `(axis_id, lane_count)`, matching tinygrad's habit of
+    /// carrying expanded axis ids alongside their widths.
+    Lanes(Box<[(usize, usize)]>),
     /// Reduction op and axes.
     Reduce(Op, Box<[usize]>),
 }
@@ -343,6 +425,9 @@ impl PartialEq for Arg {
                 name_a == name_b && min_a == min_b && max_a == max_b
             }
             (Self::Index(a), Self::Index(b)) => a == b,
+            (Self::Range(axis_a, kind_a), Self::Range(axis_b, kind_b)) => {
+                axis_a == axis_b && kind_a == kind_b
+            }
             (Self::ParamBuffer(sa, na), Self::ParamBuffer(sb, nb)) => sa == sb && na == nb,
             (Self::ParamScalar(a), Self::ParamScalar(b)) => a == b,
             (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
@@ -352,6 +437,7 @@ impl PartialEq for Arg {
             (Self::Bounds(a), Self::Bounds(b)) => a == b,
             (Self::Shape(a), Self::Shape(b)) => a == b,
             (Self::Axes(a), Self::Axes(b)) => a == b,
+            (Self::Lanes(a), Self::Lanes(b)) => a == b,
             (Self::Reduce(op_a, ax_a), Self::Reduce(op_b, ax_b)) => op_a == op_b && ax_a == ax_b,
             _ => false,
         }
@@ -372,6 +458,10 @@ impl std::hash::Hash for Arg {
                 max.hash(state);
             }
             Self::Index(i) => i.hash(state),
+            Self::Range(axis, kind) => {
+                axis.hash(state);
+                kind.hash(state);
+            }
             Self::ParamBuffer(slot, numel) => {
                 slot.hash(state);
                 numel.hash(state);
@@ -386,6 +476,7 @@ impl std::hash::Hash for Arg {
             Self::Bounds(lengths) => lengths.hash(state),
             Self::Shape(shape) => shape.hash(state),
             Self::Axes(axes) => axes.hash(state),
+            Self::Lanes(lanes) => lanes.hash(state),
             Self::Reduce(op, axes) => {
                 op.hash(state);
                 axes.hash(state);
@@ -401,6 +492,7 @@ impl fmt::Display for Arg {
             Self::Device(device) => write!(f, "{device:?}"),
             Self::Variable(name, min, max) => write!(f, "{name}[{min}, {max}]"),
             Self::Index(i) => write!(f, "{i}"),
+            Self::Range(axis, kind) => write!(f, "{axis}:{kind}"),
             Self::ParamBuffer(slot, numel) => write!(f, "buf_slot={slot},n={numel}"),
             Self::ParamScalar(slot) => write!(f, "scalar_slot={slot}"),
             Self::Float(v) => write!(f, "{v}"),
@@ -410,6 +502,7 @@ impl fmt::Display for Arg {
             Self::Bounds(lengths) => write!(f, "{lengths:?}"),
             Self::Shape(shape) => write!(f, "{shape}"),
             Self::Axes(axes) => write!(f, "{axes:?}"),
+            Self::Lanes(lanes) => write!(f, "{lanes:?}"),
             Self::Reduce(op, axes) => write!(f, "{op:?}({axes:?})"),
         }
     }
@@ -430,6 +523,12 @@ pub(crate) struct UOpInner {
     pub(crate) srcs: Vec<UOp>,
     /// Op-specific payload (shape, axis list, literal value, etc.).
     pub(crate) arg: Arg,
+    /// Optional disambiguating tag.
+    ///
+    /// Tinygrad carries a similar `tag` field on `UOp`s so late codegen passes
+    /// can force structurally identical control nodes to stay distinct when
+    /// that identity matters semantically.
+    pub(crate) tag: Option<u64>,
 }
 
 /// Value-based key used by the interner's `HashMap` to detect duplicate nodes.
@@ -443,6 +542,7 @@ pub(crate) struct UOpKey {
     pub(crate) dtype: DType,
     pub(crate) srcs: Vec<UOp>,
     pub(crate) arg: Arg,
+    pub(crate) tag: Option<u64>,
 }
 
 /// A node in the computation graph.
@@ -453,12 +553,13 @@ thread_local! {
     static UOP_INTERNER: RefCell<HashMap<UOpKey, Weak<UOpInner>>> = RefCell::new(HashMap::new());
 }
 
-fn intern_uop(op: Op, dtype: DType, srcs: Vec<UOp>, arg: Arg) -> UOp {
+fn intern_uop(op: Op, dtype: DType, srcs: Vec<UOp>, arg: Arg, tag: Option<u64>) -> UOp {
     let key = UOpKey {
         op,
         dtype,
         srcs,
         arg,
+        tag,
     };
     UOP_INTERNER.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -471,6 +572,7 @@ fn intern_uop(op: Op, dtype: DType, srcs: Vec<UOp>, arg: Arg) -> UOp {
             dtype: key.dtype,
             srcs: key.srcs.clone(),
             arg: key.arg.clone(),
+            tag: key.tag,
         });
         cache.insert(key, Rc::downgrade(&inner));
         UOp::from_inner(inner)
@@ -496,7 +598,11 @@ impl UOp {
     /// same object in memory, which makes equality checks O(1) and naturally
     /// deduplicates common sub-expressions in the graph.
     fn build(op: Op, dtype: DType, srcs: Vec<Self>, arg: Arg) -> Self {
-        intern_uop(op, dtype, srcs, arg)
+        intern_uop(op, dtype, srcs, arg, None)
+    }
+
+    fn build_tagged(op: Op, dtype: DType, srcs: Vec<Self>, arg: Arg, tag: Option<u64>) -> Self {
+        intern_uop(op, dtype, srcs, arg, tag)
     }
 
     /// Derive the device for a non-leaf node from its sources.
@@ -525,6 +631,16 @@ impl UOp {
     pub(crate) fn new(op: Op, dtype: DType, srcs: Vec<Self>, arg: Arg) -> Self {
         Self::device_from_srcs(&srcs);
         Self::build(op, dtype, srcs, arg)
+    }
+
+    /// Create a non-leaf node with an explicit disambiguating tag.
+    ///
+    /// This is primarily for late lowering passes that need structurally
+    /// identical control/effect nodes to remain distinct through interning.
+    #[must_use]
+    pub(crate) fn new_tagged(op: Op, dtype: DType, srcs: Vec<Self>, arg: Arg, tag: u64) -> Self {
+        Self::device_from_srcs(&srcs);
+        Self::build_tagged(op, dtype, srcs, arg, Some(tag))
     }
 
     /// Create a device identity leaf.
@@ -726,7 +842,13 @@ impl UOp {
             }
             Op::Const => Some(Shape::flat(1)),
             Op::Contiguous | Op::After => self.srcs()[0].shape(),
-            Op::ParamScalar | Op::Device | Op::DefineVar | Op::Bind => None,
+            Op::ParamScalar
+            | Op::Device
+            | Op::DefineVar
+            | Op::Bind
+            | Op::Vectorize
+            | Op::Unroll
+            | Op::Contract => None,
             op if op.is_alu() => self.srcs()[0].shape(),
             _ => None,
         }
@@ -892,7 +1014,16 @@ impl UOp {
                 result.push(node);
             } else {
                 stack.push((node.clone(), true));
-                for src in node.srcs().iter().rev() {
+                let srcs = node.srcs();
+                let iter: Box<dyn Iterator<Item = &UOp>> = if node.op() == Op::After {
+                    // `After(value, effect)` is a sequencing barrier. Walk the
+                    // effect first so later lowering can treat code that depends
+                    // on the `After` as occurring after the effect subtree.
+                    Box::new(srcs.iter())
+                } else {
+                    Box::new(srcs.iter().rev())
+                };
+                for src in iter {
                     if !visited.contains(src) {
                         stack.push((src.clone(), false));
                     }
@@ -931,9 +1062,12 @@ impl UOp {
                 Arg::None => String::new(),
                 arg => format!("  arg={arg}"),
             };
+            let tag_str = node
+                .tag()
+                .map_or_else(String::new, |tag| format!("  tag={tag}"));
             let _ = writeln!(
                 out,
-                "  %{idx} = {} {}{src_str}{arg_str}",
+                "  %{idx} = {} {}{src_str}{arg_str}{tag_str}",
                 node.op(),
                 node.dtype(),
             );
@@ -958,6 +1092,23 @@ pub fn build_consumer_map(order: &[UOp]) -> HashMap<UOp, Vec<UOp>> {
     consumers
 }
 
+fn ended_ranges_impl(node: &UOp, cache: &mut HashMap<UOp, Vec<UOp>>) -> Vec<UOp> {
+    if let Some(ranges) = cache.get(node) {
+        return ranges.clone();
+    }
+
+    let ended = match node.op() {
+        Op::End if !node.srcs().is_empty() => vec![node.srcs()[0].clone()],
+        Op::After => node.srcs()[1..]
+            .iter()
+            .flat_map(|src| ended_ranges_impl(src, cache))
+            .collect(),
+        _ => Vec::new(),
+    };
+    cache.insert(node.clone(), ended.clone());
+    ended
+}
+
 impl PartialEq for UOp {
     fn eq(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
@@ -966,9 +1117,22 @@ impl PartialEq for UOp {
 
 impl Eq for UOp {}
 
+impl UOp {
+    pub(crate) fn ended_ranges(&self) -> Vec<Self> {
+        ended_ranges_impl(self, &mut HashMap::new())
+    }
+}
+
 impl std::hash::Hash for UOp {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.ptr_id().hash(state);
+    }
+}
+
+impl UOp {
+    #[must_use]
+    pub(crate) fn tag(&self) -> Option<u64> {
+        self.0.tag
     }
 }
 
@@ -990,7 +1154,12 @@ mod tests {
         let a_ptr = UOp::param_buffer(1, DType::F32, 1024, device);
         let b_ptr = UOp::param_buffer(2, DType::F32, 1024, device);
         let n = UOp::const_int(1024, DType::I32, device);
-        let idx = UOp::new(Op::Range, DType::I32, vec![n], Arg::Index(0));
+        let idx = UOp::new(
+            Op::Range,
+            DType::I32,
+            vec![n],
+            Arg::Range(0, AxisKind::Loop),
+        );
         let a_idx = UOp::new(
             Op::Index,
             a_ptr.dtype(),
@@ -1081,5 +1250,28 @@ mod tests {
         let sum_a = UOp::add(left.clone(), left);
         let sum_b = UOp::add(right.clone(), right);
         assert_eq!(sum_a, sum_b);
+    }
+
+    #[test]
+    fn test_late_expansion_ops_carry_lane_metadata() {
+        let lane0 = UOp::const_float(1.0, DType::F32, DeviceId::Cpu);
+        let lane1 = UOp::const_float(2.0, DType::F32, DeviceId::Cpu);
+        let vector = UOp::new(Op::Vectorize, DType::F32, vec![lane0, lane1], Arg::None);
+        let unroll = UOp::new(
+            Op::Unroll,
+            DType::F32,
+            vec![vector.clone()],
+            Arg::Lanes(vec![(3, 4)].into_boxed_slice()),
+        );
+        let contract = UOp::new(
+            Op::Contract,
+            DType::F32,
+            vec![unroll],
+            Arg::Lanes(vec![(3, 4)].into_boxed_slice()),
+        );
+
+        assert_eq!(vector.op(), Op::Vectorize);
+        assert_eq!(contract.op(), Op::Contract);
+        assert_eq!(contract.arg(), &Arg::Lanes(vec![(3, 4)].into_boxed_slice()));
     }
 }

@@ -17,9 +17,12 @@
 //! 2. **Rangeify** — lower high-level tensor ops (reshape, permute, reduce) into
 //!    explicit index arithmetic with range loops, producing the kernel IR.
 //! 3. **Optimize** — run enabled kernel IR cleanup passes such as symbolic simplification.
-//! 4. **Codegen** — render the kernel IR into C source code.
-//! 5. **Compile** — invoke the platform C compiler (via the `Device` trait).
-//! 6. **Execute** — run the compiled kernel, writing results into device buffers.
+//! 4. **Late Expand** — materialize scheduled lane ops like `UPCAST` into explicit lane values.
+//! 5. **Devectorize** — lower lane-aware reductions and stores back to scalar control flow.
+//! 6. **Linearize** — order the lowered kernel DAG into a scoped program.
+//! 7. **Codegen** — render the ordered kernel IR into C source code.
+//! 8. **Compile** — invoke the platform C compiler (via the `Device` trait).
+//! 9. **Execute** — run the compiled kernel, writing results into device buffers.
 //!
 //! This mirrors tinygrad's `Tensor` class, where `.realize()` triggers the same
 //! lazy-graph → schedule → lower → codegen → run pipeline.
@@ -44,9 +47,13 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 use crate::codegen::{ClangRenderer, Renderer};
+use crate::devectorize::devectorize;
 use crate::device::{self, DeviceId, KernelArg, Program};
 use crate::dtype::DType;
+use crate::expand::late_expand;
 use crate::gradient;
+use crate::linearize::linearize;
+use crate::optimize;
 use crate::schedule::{self, rangeify::rangeify};
 use crate::shape::Shape;
 use crate::uop::{Arg, Op, UOp};
@@ -57,47 +64,6 @@ static DEBUG: LazyLock<u8> = LazyLock::new(|| {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
 });
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct OptimizeConfig {
-    symbolic: bool,
-}
-
-impl OptimizeConfig {
-    const fn all() -> Self {
-        Self { symbolic: true }
-    }
-
-    const fn none() -> Self {
-        Self { symbolic: false }
-    }
-}
-
-fn parse_optimize_config(raw: Option<&str>) -> OptimizeConfig {
-    let Some(raw) = raw.map(str::trim) else {
-        return OptimizeConfig::all();
-    };
-    if raw.is_empty() {
-        return OptimizeConfig::all();
-    }
-
-    match raw {
-        "0" | "off" | "none" => return OptimizeConfig::none(),
-        "1" | "on" | "all" => return OptimizeConfig::all(),
-        _ => {}
-    }
-
-    let mut config = OptimizeConfig::none();
-    for pass in raw.split(',').map(str::trim) {
-        if pass == "symbolic" {
-            config.symbolic = true;
-        }
-    }
-    config
-}
-
-static OPTIMIZE: LazyLock<OptimizeConfig> =
-    LazyLock::new(|| parse_optimize_config(std::env::var("OPT").ok().as_deref()));
 
 /// Global monotonic counter for naming compiled kernels (`kernel_0`, `kernel_1`, …).
 /// Also used in debug output to correlate log lines with specific kernel invocations.
@@ -841,7 +807,13 @@ impl Tensor {
             let rangeified = rangeify(&item.sink);
 
             Self::debug_root("optimize", "before", &rangeified);
-            let lowered_sink = Self::optimize(&rangeified);
+            let optimized = optimize::optimize(&rangeified);
+
+            Self::debug_root("expand", "before", &optimized);
+            let expanded = late_expand(&optimized);
+
+            Self::debug_root("devectorize", "before", &expanded);
+            let lowered_sink = devectorize(&expanded);
 
             assert_codegen_ready(&lowered_sink);
             Self::debug_root("codegen", "before", &lowered_sink);
@@ -876,13 +848,26 @@ impl Tensor {
         } else {
             let kid = KERNEL_COUNT.fetch_add(1, Ordering::Relaxed);
             let name = format!("kernel_{kid}");
-            let code = ClangRenderer.render(sink, &name);
+            let linear = linearize(sink);
+            let code = ClangRenderer.render(&linear, &name);
 
             if debug >= 4 {
                 eprintln!("{code}");
             }
             if debug >= 3 {
                 eprintln!("{}", sink.dump());
+                eprintln!("━━━ linearize [after] ━━━");
+                for (idx, node) in linear.iter().enumerate() {
+                    eprintln!(
+                        "  %{idx} = {} {}{}",
+                        node.op(),
+                        node.dtype(),
+                        match node.arg() {
+                            Arg::None => String::new(),
+                            arg => format!("  arg={arg}"),
+                        }
+                    );
+                }
             }
 
             let program = Rc::new(
@@ -912,22 +897,6 @@ impl Tensor {
 
         execute_inputs(inputs, &mut args);
         run_kernel(backend.as_ref(), &program, &mut args, debug);
-    }
-
-    /// Run enabled kernel IR optimization passes in a fixed order.
-    ///
-    /// The `OPT` environment variable controls which passes run:
-    /// - unset / empty / `all` / `on` / `1`: enable all passes
-    /// - `none` / `off` / `0`: disable all passes
-    /// - comma-separated pass names, e.g. `symbolic`
-    fn optimize(kernel: &UOp) -> UOp {
-        let mut current = kernel.clone();
-
-        if OPTIMIZE.symbolic {
-            current = crate::rewrite::graph_rewrite(&current, &mut crate::rewrite::symbolic_simple);
-        }
-
-        current
     }
 
     fn debug_root(name: &str, stage: &str, root: &UOp) {
@@ -1179,6 +1148,9 @@ fn assert_codegen_ready(root: &UOp) {
                     | Op::Permute
                     | Op::Expand
                     | Op::Contiguous
+                    | Op::Vectorize
+                    | Op::Unroll
+                    | Op::Contract
                     | Op::ReduceAxis
                     | Op::Reduce
             ),
@@ -1197,32 +1169,6 @@ pub fn cpu() -> DeviceId {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_optimize_config_defaults_to_all_passes() {
-        assert_eq!(parse_optimize_config(None), OptimizeConfig::all());
-        assert_eq!(parse_optimize_config(Some("")), OptimizeConfig::all());
-        assert_eq!(parse_optimize_config(Some("all")), OptimizeConfig::all());
-    }
-
-    #[test]
-    fn test_parse_optimize_config_can_disable_all_passes() {
-        assert_eq!(parse_optimize_config(Some("0")), OptimizeConfig::none());
-        assert_eq!(parse_optimize_config(Some("off")), OptimizeConfig::none());
-        assert_eq!(parse_optimize_config(Some("none")), OptimizeConfig::none());
-    }
-
-    #[test]
-    fn test_parse_optimize_config_enables_named_passes() {
-        assert_eq!(
-            parse_optimize_config(Some("symbolic")),
-            OptimizeConfig { symbolic: true }
-        );
-        assert_eq!(
-            parse_optimize_config(Some("symbolic,unknown")),
-            OptimizeConfig { symbolic: true }
-        );
-    }
 
     #[test]
     fn test_new_roundtrip() {
@@ -1283,6 +1229,13 @@ mod tests {
     }
 
     #[test]
+    fn test_sum_over_axis_zero_matches_known_values() {
+        let x = Tensor::new(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], cpu());
+        let reduced = x.sum(&[0]).realize().to_vec();
+        assert_eq!(reduced, vec![5.0, 7.0, 9.0]);
+    }
+
+    #[test]
     fn test_narrow_rows() {
         let x = Tensor::new(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], cpu());
         let narrowed = x.narrow(0, 1, 1);
@@ -1316,7 +1269,8 @@ mod tests {
     #[test]
     fn test_gradients_flow_through_contiguous() {
         // Arrange
-        let x = Tensor::new(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], cpu()).with_requires_grad(true);
+        let x =
+            Tensor::new(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], cpu()).with_requires_grad(true);
 
         // Act
         let loss = x.permute(&[1, 0]).contiguous().sum(&[0, 1]);
