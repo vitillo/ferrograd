@@ -13,16 +13,17 @@
 //!
 //! ## Tinygrad reference
 //!
-//! `tinygrad/renderer/cstyle.py` — `ClangRenderer`. Tinygrad's version
-//! shares this same structure but also handles vectorized types and
-//! local/group memory, which we don't need yet.
+//! `tinygrad/renderer/cstyle.py` — `ClangRenderer`. Tinygrad's renderer
+//! consumes a late-linearized program. This version now does the same:
+//! ordering and scope placement happen before rendering, so codegen stays a
+//! straightforward printer.
 
 use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::codegen::Renderer;
 use crate::dtype::DType;
-use crate::uop::{Arg, Op, UOp};
+use crate::uop::{Arg, AxisKind, Op, UOp};
 
 /// Renders `UOp` graphs to C, compiled by clang.
 #[derive(Debug)]
@@ -30,14 +31,10 @@ pub struct ClangRenderer;
 
 impl Renderer for ClangRenderer {
     #[allow(clippy::too_many_lines)]
-    fn render(&self, root: &UOp, name: &str) -> String {
-        assert_eq!(root.op(), Op::Sink, "render: root must be a Sink node");
-
-        let order = root.toposort();
-
+    fn render(&self, uops: &[UOp], name: &str) -> String {
         // Collect kernel parameter nodes for function signature.
         let mut params: Vec<(usize, DType, bool)> = Vec::new();
-        for node in &order {
+        for node in uops {
             match node.op() {
                 Op::ParamBuffer => {
                     if let Arg::ParamBuffer(slot, _) = node.arg() {
@@ -75,44 +72,19 @@ impl Renderer for ClangRenderer {
         let indent = |d: usize| "  ".repeat(d);
 
         let name_of = |u: &UOp, names: &HashMap<&UOp, String>| -> String {
-            names
-                .get(u)
-                .cloned()
-                .unwrap_or_else(|| panic!("node referenced before being rendered"))
+            names.get(u).cloned().unwrap_or_else(|| {
+                panic!(
+                    "node referenced before being rendered: op={:?} arg={:?}",
+                    u.op(),
+                    u.arg()
+                )
+            })
         };
-
-        for node in &order {
-            // Side-effect-only nodes — no C expression to name.
+        for node in uops {
             match node.op() {
-                Op::Sink => continue,
                 Op::Device | Op::DefineVar => {
                     names.insert(node, String::new());
-                    continue;
                 }
-                Op::End => {
-                    depth -= 1;
-                    let _ = writeln!(out, "{ind}}}", ind = indent(depth));
-                    continue;
-                }
-                Op::Store => {
-                    let idx_expr = name_of(&node.srcs()[0], &names);
-                    let value = name_of(&node.srcs()[1], &names);
-                    let _ = writeln!(out, "{ind}*{idx_expr} = {value};", ind = indent(depth));
-                    continue;
-                }
-                Op::After => {
-                    // Passthrough: use src[0]'s value, src[1] is ordering only.
-                    let val = name_of(&node.srcs()[0], &names);
-                    names.insert(node, val);
-                    continue;
-                }
-                Op::Buffer => unreachable!("Buffer is a tensor-level op"),
-                _ => {}
-            }
-
-            let srcs: Vec<String> = node.srcs().iter().map(|s| name_of(s, &names)).collect();
-
-            match node.op() {
                 Op::ParamBuffer => {
                     if let Arg::ParamBuffer(slot, _) = node.arg() {
                         names.insert(node, format!("data{slot}"));
@@ -159,12 +131,51 @@ impl Renderer for ClangRenderer {
                     };
                     names.insert(node, expr);
                 }
+                _ => {}
+            }
+        }
+
+        for node in uops {
+            // Leaf nodes already have names from the first pass.
+            match node.op() {
+                Op::Sink
+                | Op::Device
+                | Op::DefineVar
+                | Op::ParamBuffer
+                | Op::ParamScalar
+                | Op::Const => continue,
+                Op::End => {
+                    depth -= 1;
+                    let _ = writeln!(out, "{ind}}}", ind = indent(depth));
+                    continue;
+                }
+                Op::Store => {
+                    let idx_expr = name_of(&node.srcs()[0], &names);
+                    let value = name_of(&node.srcs()[1], &names);
+                    let _ = writeln!(out, "{ind}*{idx_expr} = {value};", ind = indent(depth));
+                    continue;
+                }
+                Op::After => {
+                    // Passthrough: use src[0]'s value, src[1] is ordering only.
+                    let val = name_of(&node.srcs()[0], &names);
+                    names.insert(node, val);
+                    continue;
+                }
+                // Range may carry extra CFG ordering sources beyond the bound;
+                // only srcs[0] (the bound) matters for rendering.
                 Op::Range => {
-                    let Arg::Index(axis) = node.arg() else {
+                    let Arg::Range(axis, kind) = node.arg() else {
                         panic!("Range without axis arg");
                     };
-                    let bound = srcs[0].clone();
-                    let var = format!("idx{axis}");
+                    let loop_prefix = match kind {
+                        AxisKind::Loop | AxisKind::Global => "idx",
+                        AxisKind::Local => "lidx",
+                        AxisKind::Reduce | AxisKind::GroupReduce => "ridx",
+                        AxisKind::Upcast | AxisKind::Unroll => "uidx",
+                        AxisKind::Thread => "tidx",
+                    };
+                    let bound = name_of(&node.srcs()[0], &names);
+                    let var = format!("{loop_prefix}{axis}");
                     let _ = writeln!(
                         out,
                         "{ind}for (int {var} = 0; {var} < {bound}; {var}++) {{",
@@ -172,7 +183,14 @@ impl Renderer for ClangRenderer {
                     );
                     names.insert(node, var);
                     depth += 1;
+                    continue;
                 }
+                Op::Buffer => unreachable!("Buffer is a tensor-level op"),
+                _ => {}
+            }
+            let srcs: Vec<String> = node.srcs().iter().map(|s| name_of(s, &names)).collect();
+
+            match node.op() {
                 Op::Index => {
                     let ptr = srcs[0].clone();
                     let offset = srcs[1].clone();
@@ -233,14 +251,18 @@ impl Renderer for ClangRenderer {
                     let _ = writeln!(out, "{ind}{acc_var} = {new_val};", ind = indent(depth));
                     names.insert(node, acc_var);
                 }
-                // Sink, End, Store, After, Buffer handled above.
+                // Leaf, side-effect, and control-flow nodes handled above.
                 Op::Sink
                 | Op::End
                 | Op::Store
                 | Op::After
+                | Op::Range
                 | Op::Buffer
                 | Op::Device
-                | Op::DefineVar => {
+                | Op::DefineVar
+                | Op::ParamBuffer
+                | Op::ParamScalar
+                | Op::Const => {
                     unreachable!()
                 }
                 // Tensor-level and unexpanded ops should be lowered before codegen.
@@ -250,6 +272,9 @@ impl Renderer for ClangRenderer {
                 | Op::Permute
                 | Op::Expand
                 | Op::Contiguous
+                | Op::Vectorize
+                | Op::Unroll
+                | Op::Contract
                 | Op::ReduceAxis
                 | Op::Reduce => {
                     unreachable!("{op:?} should be lowered before codegen", op = node.op())
@@ -266,6 +291,12 @@ impl Renderer for ClangRenderer {
 mod tests {
     use super::*;
     use crate::device::{CpuDevice, Device, DeviceId, KernelArg};
+    use crate::linearize::linearize;
+
+    fn render_sink(sink: &UOp, name: &str) -> String {
+        let linear = linearize(sink);
+        ClangRenderer.render(&linear, name)
+    }
 
     fn f32_buffer(dev: &CpuDevice, data: &[f32]) -> crate::device::Buffer {
         let buffer = dev.allocate(DType::F32, data.len());
@@ -283,7 +314,12 @@ mod tests {
         let a_ptr = UOp::param_buffer(1, DType::F32, 3, device);
         let b_ptr = UOp::param_buffer(2, DType::F32, 3, device);
         let bound = UOp::const_int(n, DType::I32, device);
-        let idx = UOp::new(Op::Range, DType::I32, vec![bound], Arg::Index(0));
+        let idx = UOp::new(
+            Op::Range,
+            DType::I32,
+            vec![bound],
+            Arg::Range(0, AxisKind::Loop),
+        );
         let a_idx = UOp::new(
             Op::Index,
             a_ptr.dtype(),
@@ -310,10 +346,117 @@ mod tests {
         UOp::sink(vec![store, end])
     }
 
+    fn build_shared_reduce_multi_acc_graph() -> UOp {
+        let device = DeviceId::Cpu;
+        let out_buf = UOp::param_buffer(0, DType::F32, 2, device);
+        let in_buf = UOp::param_buffer(1, DType::F32, 6, device);
+        let outer_bound = UOp::const_int(1, DType::I32, device);
+        let width = UOp::const_int(2, DType::I32, device);
+        let reduce_bound = UOp::const_int(3, DType::I32, device);
+        let zero = UOp::const_int(0, DType::I32, device);
+        let one = UOp::const_int(1, DType::I32, device);
+        let neg_inf = UOp::const_float(f64::NEG_INFINITY, DType::F32, device);
+
+        let outer = UOp::new(
+            Op::Range,
+            DType::I32,
+            vec![outer_bound],
+            Arg::Range(0, AxisKind::Loop),
+        );
+        let reduce = UOp::new(
+            Op::Range,
+            DType::I32,
+            vec![reduce_bound.clone()],
+            Arg::Range(1, AxisKind::Reduce),
+        );
+
+        let base = UOp::mul(outer.clone(), width.clone());
+        let lane0 = UOp::add(base.clone(), zero.clone());
+        let lane1 = UOp::add(base.clone(), one.clone());
+
+        let stride = reduce_bound.clone();
+        let in0 = UOp::add(UOp::mul(lane0.clone(), stride.clone()), reduce.clone());
+        let in1 = UOp::add(UOp::mul(lane1.clone(), stride), reduce.clone());
+        let in0_idx = UOp::new(
+            Op::Index,
+            in_buf.dtype(),
+            vec![in_buf.clone(), in0],
+            Arg::None,
+        );
+        let in1_idx = UOp::new(
+            Op::Index,
+            in_buf.dtype(),
+            vec![in_buf.clone(), in1],
+            Arg::None,
+        );
+        let in0_val = UOp::new(Op::Load, DType::F32, vec![in0_idx], Arg::None);
+        let in1_val = UOp::new(Op::Load, DType::F32, vec![in1_idx], Arg::None);
+
+        let acc0 = UOp::new_tagged(
+            Op::DefineAcc,
+            DType::F32,
+            vec![neg_inf.clone()],
+            Arg::None,
+            1,
+        );
+        let acc1 = UOp::new_tagged(Op::DefineAcc, DType::F32, vec![neg_inf], Arg::None, 2);
+        let upd0 = UOp::new(
+            Op::Assign,
+            DType::F32,
+            vec![
+                acc0.clone(),
+                UOp::new(Op::Max, DType::F32, vec![acc0.clone(), in0_val], Arg::None),
+            ],
+            Arg::None,
+        );
+        let upd1 = UOp::new(
+            Op::Assign,
+            DType::F32,
+            vec![
+                acc1.clone(),
+                UOp::new(Op::Max, DType::F32, vec![acc1.clone(), in1_val], Arg::None),
+            ],
+            Arg::None,
+        );
+        let reduce_end = UOp::new(
+            Op::End,
+            DType::Void,
+            vec![reduce, upd0.clone(), upd1.clone()],
+            Arg::None,
+        );
+
+        let out0_idx = UOp::new(
+            Op::Index,
+            out_buf.dtype(),
+            vec![out_buf.clone(), lane0],
+            Arg::None,
+        );
+        let out1_idx = UOp::new(
+            Op::Index,
+            out_buf.dtype(),
+            vec![out_buf.clone(), lane1],
+            Arg::None,
+        );
+        let store0 = UOp::new(
+            Op::Store,
+            DType::Void,
+            vec![out0_idx, UOp::after(acc0, reduce_end.clone())],
+            Arg::None,
+        );
+        let store1 = UOp::new(
+            Op::Store,
+            DType::Void,
+            vec![out1_idx, UOp::after(acc1, reduce_end.clone())],
+            Arg::None,
+        );
+        let outer_end = UOp::new(Op::End, DType::Void, vec![outer, store0, store1], Arg::None);
+        UOp::sink(vec![outer_end])
+    }
+
     #[test]
     fn test_render_add_kernel_structure() {
         let sink = build_add_graph(3);
-        let code = ClangRenderer.render(&sink, "add");
+        let code = render_sink(&sink, "add");
         assert!(code.contains("void add("));
         assert!(code.contains("float* restrict data0"));
         assert!(code.contains("float* restrict data1"));
@@ -326,7 +469,7 @@ mod tests {
     #[test]
     fn test_render_add_kernel_compiles_and_runs() {
         let sink = build_add_graph(3);
-        let code = ClangRenderer.render(&sink, "add");
+        let code = render_sink(&sink, "add");
 
         let dev = CpuDevice::new();
         let program = dev.compile(&code, "add", 3).expect("compile failed");
@@ -349,7 +492,12 @@ mod tests {
         let out_ptr = UOp::param_buffer(0, DType::F32, 3, device);
         let a_ptr = UOp::param_buffer(1, DType::F32, 3, device);
         let n = UOp::const_int(3, DType::I32, device);
-        let idx = UOp::new(Op::Range, DType::I32, vec![n], Arg::Index(0));
+        let idx = UOp::new(
+            Op::Range,
+            DType::I32,
+            vec![n],
+            Arg::Range(0, AxisKind::Loop),
+        );
         let a_idx = UOp::new(
             Op::Index,
             a_ptr.dtype(),
@@ -368,7 +516,7 @@ mod tests {
         let end = UOp::new(Op::End, DType::Void, vec![idx, store.clone()], Arg::None);
         let sink = UOp::sink(vec![store, end]);
 
-        let code = ClangRenderer.render(&sink, "negate");
+        let code = render_sink(&sink, "negate");
         let dev = CpuDevice::new();
         let program = dev.compile(&code, "negate", 2).expect("compile failed");
         let mut args = [
@@ -390,7 +538,12 @@ mod tests {
         let a_ptr = UOp::param_buffer(1, DType::F32, 4, device);
         let n = UOp::const_int(4, DType::I32, device);
         let zero = UOp::const_float(0.0, DType::F32, device);
-        let idx = UOp::new(Op::Range, DType::I32, vec![n], Arg::Index(0));
+        let idx = UOp::new(
+            Op::Range,
+            DType::I32,
+            vec![n],
+            Arg::Range(0, AxisKind::Loop),
+        );
         let a_idx = UOp::new(
             Op::Index,
             a_ptr.dtype(),
@@ -410,7 +563,7 @@ mod tests {
         let end = UOp::new(Op::End, DType::Void, vec![idx, store.clone()], Arg::None);
         let sink = UOp::sink(vec![store, end]);
 
-        let code = ClangRenderer.render(&sink, "relu");
+        let code = render_sink(&sink, "relu");
         let dev = CpuDevice::new();
         let program = dev.compile(&code, "relu", 2).expect("compile failed");
         let mut args = [
@@ -423,5 +576,98 @@ mod tests {
             panic!("output arg should stay a buffer");
         };
         assert_eq!(read_f32(&dev, out), vec![1.0, 0.0, 3.0, 0.0]);
+    }
+
+    #[test]
+    fn test_render_reduce_range_uses_same_loop_codegen() {
+        let device = DeviceId::Cpu;
+        let bound = UOp::const_int(4, DType::I32, device);
+        let reduce = UOp::new(
+            Op::Range,
+            DType::I32,
+            vec![bound],
+            Arg::Range(1, AxisKind::Reduce),
+        );
+        let sink = UOp::sink(vec![UOp::new(
+            Op::End,
+            DType::Void,
+            vec![reduce],
+            Arg::None,
+        )]);
+
+        let code = render_sink(&sink, "noop_reduce");
+        assert!(code.contains("for (int ridx1 = 0; ridx1 < 4; ridx1++)"));
+    }
+
+    #[test]
+    fn test_render_loop_and_reduce_axes_use_distinct_names() {
+        let device = DeviceId::Cpu;
+        let loop_bound = UOp::const_int(3, DType::I32, device);
+        let reduce_bound = UOp::const_int(2, DType::I32, device);
+        let loop_range = UOp::new(
+            Op::Range,
+            DType::I32,
+            vec![loop_bound],
+            Arg::Range(0, AxisKind::Loop),
+        );
+        let reduce_range = UOp::new(
+            Op::Range,
+            DType::I32,
+            vec![reduce_bound],
+            Arg::Range(0, AxisKind::Reduce),
+        );
+        let nested = UOp::new(
+            Op::End,
+            DType::Void,
+            vec![
+                loop_range,
+                UOp::new(Op::End, DType::Void, vec![reduce_range], Arg::None),
+            ],
+            Arg::None,
+        );
+        let sink = UOp::sink(vec![nested]);
+
+        let code = render_sink(&sink, "nested_ranges");
+        assert!(code.contains("for (int idx0 = 0; idx0 < 3; idx0++)"));
+        assert!(code.contains("for (int ridx0 = 0; ridx0 < 2; ridx0++)"));
+    }
+
+    #[test]
+    fn test_render_shared_reduce_multi_acc_declares_accumulators_before_loop() {
+        let sink = build_shared_reduce_multi_acc_graph();
+
+        let code = render_sink(&sink, "shared_reduce");
+        let loop_pos = code
+            .find("for (int ridx1 = 0; ridx1 < 3; ridx1++)")
+            .expect("missing reduce loop");
+        let acc_positions = code
+            .lines()
+            .filter(|line| line.contains("float acc") && line.contains("(-INFINITY);"))
+            .map(|line| code.find(line).expect("accumulator line should exist"))
+            .collect::<Vec<_>>();
+
+        assert!(acc_positions.len() >= 2);
+        assert!(acc_positions.iter().all(|pos| *pos < loop_pos));
+    }
+
+    #[test]
+    fn test_render_shared_reduce_multi_acc_compiles_and_runs() {
+        let sink = build_shared_reduce_multi_acc_graph();
+        let code = render_sink(&sink, "shared_reduce");
+
+        let dev = CpuDevice::new();
+        let program = dev
+            .compile(&code, "shared_reduce", 2)
+            .expect("compile failed");
+        let mut args = [
+            KernelArg::Buffer(dev.allocate(DType::F32, 2)),
+            KernelArg::Buffer(f32_buffer(&dev, &[1.0, 5.0, 3.0, -1.0, 0.0, 7.0])),
+        ];
+
+        dev.execute(&program, &mut args).unwrap();
+        let KernelArg::Buffer(out) = &args[0] else {
+            panic!("output arg should stay a buffer");
+        };
+        assert_eq!(read_f32(&dev, out), vec![5.0, 7.0]);
     }
 }

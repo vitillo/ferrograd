@@ -7,9 +7,10 @@
 //!
 //! Almost every transformation in the compiler is expressed as rewrite rules:
 //! - **Scheduling**: `Buffer → Param` (in [`crate::schedule`])
-//! - **Rangeify**: Store → loops, Index pushing, Reduce expansion
+//! - **Rangeify**: Store → loops, Index pushing, kernel `Reduce` creation
 //!   (in [`crate::schedule::rangeify`])
-//! - **Simplification**: `x+0 → x`, constant folding (in [`symbolic_simple`])
+//! - **Optimization**: symbolic simplification and loop unrolling
+//!   (in [`crate::optimize`])
 //!
 //! Tinygrad uses `PatternMatcher` + `UPat` patterns for the same purpose.
 //! We use Rust's native `match` instead — same fixed-point loop, same
@@ -22,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use crate::uop::{Arg, Op, UOp};
+use crate::uop::UOp;
 
 // ── graph_rewrite ───────────────────────────────────────────────────────────
 
@@ -78,136 +79,54 @@ pub fn graph_rewrite(root: &UOp, rewrite: &mut dyn FnMut(&UOp) -> Option<UOp>) -
     }
 }
 
-// ── Symbolic simplification ─────────────────────────────────────────────────
-//
-// These rules clean up the index arithmetic that rangeify generates.
-// For example, when a Reshape inserts a size-1 dim, flat_index produces
-// `idx * 1 + 0` — these rules simplify that to just `idx`.
-//
-// Tinygrad has a much larger set of symbolic rules (see `tinygrad/uop/symbolic.py`).
-// We start with the essentials: constant folding and identity elimination.
-
-/// Evaluate a binary op on two constant `Arg` values at compile time.
-/// Returns `None` if the types or op are unsupported for folding.
-fn fold_binary(op: Op, a: &Arg, b: &Arg) -> Option<Arg> {
-    match (op, a, b) {
-        (Op::Add, Arg::Float(x), Arg::Float(y)) => Some(Arg::Float(x + y)),
-        (Op::Add, Arg::Int(x), Arg::Int(y)) => Some(Arg::Int(x + y)),
-        (Op::Mul, Arg::Float(x), Arg::Float(y)) => Some(Arg::Float(x * y)),
-        (Op::Mul, Arg::Int(x), Arg::Int(y)) => Some(Arg::Int(x * y)),
-        _ => None,
-    }
-}
-
-/// Reconstruct a `Const` `UOp` from a folded `Arg`, inheriting dtype/device from `node`.
-fn const_from_arg(node: &UOp, arg: &Arg) -> UOp {
-    match arg {
-        Arg::Float(value) => UOp::const_float(*value, node.dtype(), node.device()),
-        Arg::Int(value) => UOp::const_int(*value, node.dtype(), node.device()),
-        Arg::Bool(value) => UOp::const_bool(*value, node.dtype(), node.device()),
-        _ => panic!("constant folding produced non-literal arg"),
-    }
-}
-
-/// Algebraic simplification rules for index arithmetic.
+/// Rebuild `root` while substituting any node found in `replacements`.
 ///
-/// These run as a separate pass after rangeify to clean up redundant
-/// operations in the generated index expressions. The rules are:
-///
-/// - **Constant folding**: `3 + 4` → `7`, `2 * 3` → `6`
-/// - **Additive identity**: `x + 0` → `x` (common from broadcast dims with stride 0)
-/// - **Multiplicative identity**: `x * 1` → `x` (common from innermost-dim stride)
-/// - **Multiplicative zero**: `x * 0` → `0` (dead index arithmetic)
-///
-/// Each commutative rule has two arms to handle both operand orderings.
+/// This is a one-pass bottom-up rebuild, not a fixed-point rewrite: every node
+/// is visited once in dependency order and either replaced directly or rebuilt
+/// from already-substituted sources.
 #[must_use]
-pub fn symbolic_simple(node: &UOp) -> Option<UOp> {
-    match (node.op(), node.srcs()) {
-        // const + const → const
-        (Op::Add, [a, b]) if a.is_const() && b.is_const() => fold_binary(Op::Add, a.arg(), b.arg())
-            .as_ref()
-            .map(|arg| const_from_arg(a, arg)),
-        // const * const → const
-        (Op::Mul, [a, b]) if a.is_const() && b.is_const() => fold_binary(Op::Mul, a.arg(), b.arg())
-            .as_ref()
-            .map(|arg| const_from_arg(a, arg)),
-        // x + 0 → x
-        (Op::Add, [x, y]) if y.is_zero() => Some(x.clone()),
-        (Op::Add, [x, y]) if x.is_zero() => Some(y.clone()),
-        // x * 1 → x
-        (Op::Mul, [x, y]) if y.is_one() => Some(x.clone()),
-        (Op::Mul, [x, y]) if x.is_one() => Some(y.clone()),
-        // x * 0 → 0
-        (Op::Mul, [_, y]) if y.is_zero() => Some(y.clone()),
-        (Op::Mul, [x, _]) if x.is_zero() => Some(x.clone()),
-        _ => None,
+pub(crate) fn substitute_with_map(root: &UOp, replacements: &HashMap<UOp, UOp>) -> UOp {
+    let order = root.toposort();
+    let mut substituted: HashMap<UOp, UOp> = HashMap::new();
+
+    for node in &order {
+        if let Some(replacement) = replacements.get(node) {
+            substituted.insert(node.clone(), replacement.clone());
+            continue;
+        }
+
+        let new_srcs: Vec<UOp> = node
+            .srcs()
+            .iter()
+            .map(|src| substituted.get(src).cloned().unwrap_or_else(|| src.clone()))
+            .collect();
+        let srcs_changed = node
+            .srcs()
+            .iter()
+            .zip(&new_srcs)
+            .any(|(old, new)| old != new);
+        let rebuilt = if srcs_changed {
+            UOp::new(node.op(), node.dtype(), new_srcs, node.arg().clone())
+        } else {
+            node.clone()
+        };
+        substituted.insert(node.clone(), rebuilt);
     }
+
+    substituted
+        .get(root)
+        .cloned()
+        .unwrap_or_else(|| root.clone())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::DeviceId;
-    use crate::dtype::DType;
-
-    #[test]
-    fn test_rewrite_add_zero_eliminated() {
-        let x = UOp::const_float(5.0, DType::F32, DeviceId::Cpu);
-        let zero = UOp::const_float(0.0, DType::F32, DeviceId::Cpu);
-        let sum = UOp::add(x, zero);
-        let result = graph_rewrite(&sum, &mut symbolic_simple);
-        assert_eq!(result.op(), Op::Const);
-        assert_eq!(*result.arg(), Arg::Float(5.0));
-    }
-
-    #[test]
-    fn test_rewrite_zero_plus_x_eliminated() {
-        let x = UOp::const_float(5.0, DType::F32, DeviceId::Cpu);
-        let zero = UOp::const_float(0.0, DType::F32, DeviceId::Cpu);
-        let sum = UOp::add(zero, x);
-        let result = graph_rewrite(&sum, &mut symbolic_simple);
-        assert_eq!(result.op(), Op::Const);
-        assert_eq!(*result.arg(), Arg::Float(5.0));
-    }
-
-    #[test]
-    fn test_rewrite_constant_folding_add() {
-        let two = UOp::const_float(2.0, DType::F32, DeviceId::Cpu);
-        let three = UOp::const_float(3.0, DType::F32, DeviceId::Cpu);
-        let sum = UOp::add(two, three);
-        let result = graph_rewrite(&sum, &mut symbolic_simple);
-        assert_eq!(result.op(), Op::Const);
-        assert_eq!(*result.arg(), Arg::Float(5.0));
-    }
-
-    #[test]
-    fn test_rewrite_fixed_point() {
-        let x = UOp::const_float(7.0, DType::F32, DeviceId::Cpu);
-        let zero = UOp::const_float(0.0, DType::F32, DeviceId::Cpu);
-        let one = UOp::const_float(1.0, DType::F32, DeviceId::Cpu);
-        let sum = UOp::add(x, zero);
-        let prod = UOp::mul(sum, one);
-        let result = graph_rewrite(&prod, &mut symbolic_simple);
-        assert_eq!(result.op(), Op::Const);
-        assert_eq!(*result.arg(), Arg::Float(7.0));
-    }
 
     #[test]
     fn test_rewrite_no_match_unchanged() {
-        let x = UOp::const_float(3.0, DType::F32, DeviceId::Cpu);
-        let y = UOp::const_float(4.0, DType::F32, DeviceId::Cpu);
-        let sum = UOp::add(x, y);
+        let sum = UOp::sink(vec![]);
         let result = graph_rewrite(&sum, &mut |_| None);
         assert_eq!(result, sum);
-    }
-
-    #[test]
-    fn test_rewrite_mul_zero() {
-        let x = UOp::const_float(42.0, DType::F32, DeviceId::Cpu);
-        let zero = UOp::const_float(0.0, DType::F32, DeviceId::Cpu);
-        let prod = UOp::mul(x, zero);
-        let result = graph_rewrite(&prod, &mut symbolic_simple);
-        assert_eq!(result.op(), Op::Const);
-        assert_eq!(*result.arg(), Arg::Float(0.0));
     }
 }

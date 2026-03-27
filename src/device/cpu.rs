@@ -44,6 +44,7 @@
 //! - **macOS**: clang produces `.dylib` files. Always available (ships with Xcode CLT).
 //! - **Linux**: clang (or gcc) produces `.so` files. Install via `apt install clang`.
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::process::Command;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
@@ -121,6 +122,17 @@ impl std::fmt::Debug for CompiledKernel {
 }
 
 impl CompiledKernel {
+    /// Return the CPU tuning flag for the current host.
+    ///
+    /// Tinygrad uses the same split in its clang JIT: x86 targets prefer
+    /// `-march=native`, while ARM uses `-mcpu=native`.
+    fn native_cpu_flag() -> &'static str {
+        match std::env::consts::ARCH {
+            "x86_64" => "-march=native",
+            _ => "-mcpu=native",
+        }
+    }
+
     /// Compile C source code and load the resulting shared library.
     ///
     /// # Arguments
@@ -135,7 +147,7 @@ impl CompiledKernel {
     /// # The compilation pipeline
     ///
     /// 1. Write `source` to a temporary .c file
-    /// 2. Run `clang -shared -O2 -o output.dylib input.c`
+    /// 2. Run `clang -shared -O3 <native-cpu-flag> -o output.dylib input.c`
     /// 3. Load the shared library with dlopen
     pub fn new(source: &str, func_name: &str) -> Result<Self, CpuError> {
         let src_file = tempfile::Builder::new().suffix(".c").tempfile()?;
@@ -169,10 +181,17 @@ impl CompiledKernel {
         })?;
 
         // -shared: produce a dynamically loadable library (not an executable)
-        // -O2: optimize without slow compile times
-        let output = Command::new("clang")
-            .args(["-shared", "-O2", "-o", &so_path_str, src_path_str])
-            .output()?;
+        // -O3: let LLVM be more aggressive now that kernels are cached
+        // -march/-mcpu=native: tune for the exact host CPU without changing semantics
+        let mut clang_args = vec![
+            OsString::from("-shared"),
+            OsString::from("-O3"),
+            OsString::from(Self::native_cpu_flag()),
+            OsString::from("-o"),
+            OsString::from(&so_path_str),
+            OsString::from(src_path_str),
+        ];
+        let output = Command::new("clang").args(clang_args.drain(..)).output()?;
 
         if !output.status.success() {
             return Err(CpuError::ClangFailed {
