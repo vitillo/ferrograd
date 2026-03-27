@@ -166,7 +166,8 @@ pub enum Op {
     ///
     /// This mirrors tinygrad's `Ops.VECTORIZE` and is introduced by the late
     /// expansion phase after scheduling has decided to compute multiple lanes
-    /// together.
+    /// together. The dtype is vectorized (e.g. `F32.vec(4)` for 4 lanes).
+    /// Individual lanes can be extracted via [`UOp::gep`].
     ///
     /// - **srcs:** `[lane_0, lane_1, …]` — one scalar value per lane
     /// - **arg:** `Arg::None`
@@ -295,6 +296,17 @@ pub enum Op {
     ///   the expression to write into it
     /// - **arg:** `Arg::None`
     Assign,
+
+    /// Extract one or more lanes from a vectorized value.
+    ///
+    /// This is tinygrad's `Ops.GEP`. When called on a `Vectorize` node via
+    /// `UOp::gep()`, it short-circuits and returns the indexed source directly
+    /// (no IR node created). Otherwise it creates this node to be resolved
+    /// later.
+    ///
+    /// - **srcs:** `[vector]` — the vectorized value to extract from
+    /// - **arg:** `Arg::Int(lane_index)` — which lane to extract
+    Gep,
 }
 
 impl Op {
@@ -996,6 +1008,36 @@ impl UOp {
     #[must_use]
     pub(crate) fn sink(stores: Vec<Self>) -> Self {
         Self::build(Op::Sink, DType::Void, stores, Arg::None)
+    }
+
+    /// Extract lane `i` from a vectorized value.
+    ///
+    /// If `self` is a `Vectorize` node, returns `self.srcs()[i]` directly
+    /// (no IR node created) — matching tinygrad's inline shortcut. Otherwise
+    /// creates an `Op::Gep` node with scalar dtype.
+    #[must_use]
+    pub(crate) fn gep(&self, i: usize) -> Self {
+        if self.op() == Op::Vectorize {
+            return self.srcs()[i].clone();
+        }
+        Self::new(
+            Op::Gep,
+            self.dtype().scalar(),
+            vec![self.clone()],
+            Arg::Int(i64::try_from(i).expect("gep index should fit i64")),
+        )
+    }
+
+    /// Broadcast a scalar to `n` lanes by repeating it.
+    ///
+    /// Creates `Vectorize(self, self, ..., self)` with `n` copies and a
+    /// vectorized dtype.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn broadcast(&self, n: usize) -> Self {
+        let lanes = vec![self.clone(); n];
+        let vcount = u16::try_from(n).expect("broadcast count should fit u16");
+        Self::new(Op::Vectorize, self.dtype().vec(vcount), lanes, Arg::None)
     }
 
     /// Iterative post-order DFS. Returns nodes in dependency order.

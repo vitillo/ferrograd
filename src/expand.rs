@@ -80,7 +80,6 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::dtype::DType;
-use crate::lane::{combine_lane_sources, make_lane_pack};
 use crate::rewrite::{graph_rewrite, substitute_with_map};
 use crate::uop::{Arg, AxisKind, Op, UOp};
 
@@ -103,17 +102,19 @@ fn lane_pack_for_range(range: &UOp) -> Option<UOp> {
         return None;
     };
     let lane_count = usize::try_from(*size).ok()?;
+    let vcount = u16::try_from(lane_count).expect("lane count should fit u16");
     let lanes: Vec<UOp> = (0..lane_count)
         .map(|idx| {
             let idx = i64::try_from(idx).expect("lane index should fit i64");
             UOp::const_int(idx, DType::I32, range.device())
         })
         .collect();
-    Some(make_lane_pack(
+    let vector = UOp::new(Op::Vectorize, DType::I32.vec(vcount), lanes, Arg::None);
+    Some(UOp::new(
         Op::Unroll,
         DType::I32,
-        lanes,
-        vec![(*axis, lane_count)].into_boxed_slice(),
+        vec![vector],
+        Arg::Lanes(vec![(*axis, lane_count)].into_boxed_slice()),
     ))
 }
 
@@ -230,50 +231,142 @@ fn fix_reduce_unroll(node: &UOp) -> Option<UOp> {
     Some(UOp::new(Op::Reduce, node.dtype(), srcs, node.arg().clone()))
 }
 
-/// Generic lane propagation: when any ALU, Load, or Index op has lane-valued
-/// operands, it is expanded into a lane pack of per-lane scalar ops. This
-/// is the core of tinygrad's `do_expand` -- it pushes lane structure upward
-/// through the expression graph until it reaches stores or reduces.
-fn expand_lane_expr(node: &UOp) -> Option<UOp> {
-    let (src_lanes, meta) = combine_lane_sources(node)?;
-    let lane_count = meta.iter().map(|(_, size)| *size).product::<usize>();
-
-    match node.op() {
-        Op::Add
-        | Op::Mul
-        | Op::Max
-        | Op::CmpLt
-        | Op::Where
-        | Op::Neg
-        | Op::Exp2
-        | Op::Log2
-        | Op::Sqrt
-        | Op::Reciprocal
-        | Op::Index
-        | Op::Load => {
-            let mut lanes = Vec::with_capacity(lane_count);
-            for lane_idx in 0..lane_count {
-                let scalar_srcs = src_lanes
-                    .iter()
-                    .map(|lanes| {
-                        if lanes.len() == 1 {
-                            lanes[0].clone()
-                        } else {
-                            lanes[lane_idx].clone()
-                        }
-                    })
-                    .collect();
-                lanes.push(UOp::new(
-                    node.op(),
-                    node.dtype(),
-                    scalar_srcs,
-                    node.arg().clone(),
-                ));
-            }
-            Some(make_lane_pack(Op::Unroll, node.dtype(), lanes, meta))
-        }
-        _ => None,
+/// Compute swizzle indices for broadcasting a source's lanes to the merged
+/// metadata shape. If the source has axes `[(0,4)]` and the merged shape is
+/// `[(0,4),(1,4)]` (16 lanes), this returns `[0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3]`
+/// — each source lane repeated along the missing axis.
+fn swizzle_indices(src_meta: &[(usize, usize)], merged: &[(usize, usize)]) -> Vec<usize> {
+    let merged_total: usize = merged.iter().map(|(_, s)| *s).product();
+    if src_meta == merged {
+        return (0..merged_total).collect();
     }
+
+    // For each position in the merged grid, project to the source's axes
+    // and compute the row-major index into the source lanes.
+    let src_strides: Vec<usize> = {
+        let mut strides = vec![1_usize; src_meta.len()];
+        for i in (0..src_meta.len().saturating_sub(1)).rev() {
+            strides[i] = strides[i + 1] * src_meta[i + 1].1;
+        }
+        strides
+    };
+    let merged_strides: Vec<usize> = {
+        let mut strides = vec![1_usize; merged.len()];
+        for i in (0..merged.len().saturating_sub(1)).rev() {
+            strides[i] = strides[i + 1] * merged[i + 1].1;
+        }
+        strides
+    };
+    // Map src axis → position in merged
+    let axis_to_merged: HashMap<usize, usize> = merged
+        .iter()
+        .enumerate()
+        .map(|(i, (a, _))| (*a, i))
+        .collect();
+
+    (0..merged_total)
+        .map(|flat| {
+            // Decompose flat index into merged coordinates
+            let mut src_flat = 0;
+            for (src_pos, (axis, _)) in src_meta.iter().enumerate() {
+                let merged_pos = axis_to_merged[axis];
+                let coord = (flat / merged_strides[merged_pos]) % merged[merged_pos].1;
+                src_flat += coord * src_strides[src_pos];
+            }
+            src_flat
+        })
+        .collect()
+}
+
+/// Expand ALU/Load/Index ops that have lane-valued (`Unroll`) operands by
+/// creating one scalar op per lane in the merged axis space. Sources with
+/// fewer axes are swizzled (lanes repeated along missing axes) via `gep`.
+/// Scalar sources are broadcast for every lane.
+fn expand_lane_expr(node: &UOp) -> Option<UOp> {
+    if !matches!(
+        node.op(),
+        Op::Add
+            | Op::Mul
+            | Op::Max
+            | Op::CmpLt
+            | Op::Where
+            | Op::Neg
+            | Op::Exp2
+            | Op::Log2
+            | Op::Sqrt
+            | Op::Reciprocal
+            | Op::Index
+            | Op::Load
+    ) {
+        return None;
+    }
+
+    // Collect Unroll metadata from all lane-valued sources.
+    let mut all_metas: Vec<&[(usize, usize)]> = Vec::new();
+    for src in node.srcs() {
+        if src.op() == Op::Unroll {
+            if let Arg::Lanes(meta) = src.arg() {
+                all_metas.push(meta);
+            }
+        }
+    }
+    if all_metas.is_empty() {
+        return None;
+    }
+
+    // Merge all axis metadata into a superset (sorted, deduplicated).
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for meta in &all_metas {
+        for &(axis, size) in *meta {
+            if !merged.iter().any(|(a, _)| *a == axis) {
+                merged.push((axis, size));
+            }
+        }
+    }
+    merged.sort_by_key(|(a, _)| *a);
+    let lane_count: usize = merged.iter().map(|(_, s)| *s).product();
+    let vcount = u16::try_from(lane_count).expect("lane count should fit u16");
+
+    // Build per-lane scalar ops using gep to extract from each source.
+    let mut result_lanes = Vec::with_capacity(lane_count);
+    for lane_idx in 0..lane_count {
+        let scalar_srcs: Vec<UOp> = node
+            .srcs()
+            .iter()
+            .map(|src| {
+                if src.op() == Op::Unroll {
+                    let Arg::Lanes(src_meta) = src.arg() else {
+                        return src.clone();
+                    };
+                    let inner = &src.srcs()[0]; // the Vectorize
+                    let swizzle = swizzle_indices(src_meta, &merged);
+                    inner.gep(swizzle[lane_idx])
+                } else {
+                    // Scalar — use as-is for every lane.
+                    src.clone()
+                }
+            })
+            .collect();
+        result_lanes.push(UOp::new(
+            node.op(),
+            node.dtype(),
+            scalar_srcs,
+            node.arg().clone(),
+        ));
+    }
+
+    let vector = UOp::new(
+        Op::Vectorize,
+        node.dtype().vec(vcount),
+        result_lanes,
+        Arg::None,
+    );
+    Some(UOp::new(
+        Op::Unroll,
+        node.dtype(),
+        vec![vector],
+        Arg::Lanes(merged.into_boxed_slice()),
+    ))
 }
 
 /// Merges multiple `End` nodes that close the same `Range` into a single

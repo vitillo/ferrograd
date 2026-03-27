@@ -49,7 +49,7 @@ use std::time::Instant;
 use crate::codegen::{ClangRenderer, Renderer};
 use crate::devectorize::devectorize;
 use crate::device::{self, DeviceId, KernelArg, Program};
-use crate::dtype::DType;
+use crate::dtype::{DType, DTypeKind};
 use crate::expand::late_expand;
 use crate::gradient;
 use crate::linearize::linearize;
@@ -289,11 +289,11 @@ impl Tensor {
     /// Panics if `dtype` is [`DType::Void`].
     #[must_use]
     pub fn ones(shape: &[usize], device: DeviceId, dtype: DType) -> Self {
-        match dtype {
-            DType::F32 => Self::full(shape, 1.0_f32, device),
-            DType::I32 => Self::full(shape, 1_i32, device),
-            DType::Bool => Self::full(shape, true, device),
-            DType::Void => panic!("ones requires a concrete dtype"),
+        match dtype.kind() {
+            DTypeKind::F32 => Self::full(shape, 1.0_f32, device),
+            DTypeKind::I32 => Self::full(shape, 1_i32, device),
+            DTypeKind::Bool => Self::full(shape, true, device),
+            DTypeKind::Void => panic!("ones requires a concrete dtype"),
         }
     }
 

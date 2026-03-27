@@ -59,7 +59,6 @@ pub mod device;
 pub mod dtype;
 mod expand;
 pub mod gradient;
-mod lane;
 mod linearize;
 pub mod nn;
 pub mod optim;
