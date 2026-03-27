@@ -132,7 +132,6 @@ pub fn schedule_many(exprs: &[UOp]) -> SchedulePlan {
             items.push(item);
         }
     }
-
     SchedulePlan {
         items,
         replacements,
@@ -144,7 +143,7 @@ pub fn schedule_many(exprs: &[UOp]) -> SchedulePlan {
 /// parameter slots to every buffer and scalar input.
 fn parameterize(expr: &UOp) -> ScheduleItem {
     let backend = device::get(expr.device());
-    let (parameterized, inputs) = parameterize_inputs(expr, 1, "schedule");
+    let (parameterized, inputs) = parameterize_inputs(expr, 1);
     let out_shape = parameterized.shape().unwrap_or_else(|| Shape::flat(1));
     let output_buffer = backend.reserve_buffer(expr.dtype(), out_shape.numel());
     let out_param = UOp::param_buffer(0, expr.dtype(), out_shape.numel(), expr.device());
@@ -173,9 +172,10 @@ fn parameterize_store(store: &UOp) -> ScheduleItem {
         Op::Store,
         "parameterize_store requires a Store root"
     );
-    let (parameterized_store, inputs) = parameterize_inputs(store, 0, "schedule_store");
+    let (parameterized_store, inputs) = parameterize_inputs(store, 0);
+    let sink = UOp::sink(vec![parameterized_store]);
     ScheduleItem {
-        sink: UOp::sink(vec![parameterized_store]),
+        sink,
         inputs,
         output_buffer: None,
         out_shape: None,
@@ -186,7 +186,7 @@ fn parameterize_store(store: &UOp) -> ScheduleItem {
 /// numbered `Param` nodes, collecting the corresponding runtime inputs.
 /// `slot_offset` reserves slot 0 for the output in allocating kernels (1) or
 /// starts at 0 for in-place stores where the destination is a regular input.
-fn parameterize_inputs(root: &UOp, slot_offset: usize, pass_name: &str) -> (UOp, Vec<KernelInput>) {
+fn parameterize_inputs(root: &UOp, slot_offset: usize) -> (UOp, Vec<KernelInput>) {
     let device = root.device();
     let mut inputs: Vec<KernelInput> = Vec::new();
     let mut params: HashMap<Buffer, UOp> = HashMap::new();
@@ -254,9 +254,8 @@ fn parameterize_inputs(root: &UOp, slot_offset: usize, pass_name: &str) -> (UOp,
         }
     };
 
-    (graph_rewrite(root, &mut rewrite_inputs, pass_name), inputs)
+    (graph_rewrite(root, &mut rewrite_inputs), inputs)
 }
-
 /// Convert a `Const` literal arg into the corresponding [`KernelInput`] scalar variant.
 fn scalar_input(literal: &Arg) -> KernelInput {
     match literal {

@@ -21,16 +21,8 @@
 //! `tinygrad/uop/ops.py` — `graph_rewrite` (the fixed-point loop concept).
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
 
 use crate::uop::{Arg, Op, UOp};
-
-static DEBUG: LazyLock<u8> = LazyLock::new(|| {
-    std::env::var("DEBUG")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
-});
 
 // ── graph_rewrite ───────────────────────────────────────────────────────────
 
@@ -41,15 +33,8 @@ static DEBUG: LazyLock<u8> = LazyLock::new(|| {
 /// iteration begins. The loop terminates when a full pass produces no
 /// changes.
 ///
-/// The `name` parameter identifies the pass in debug output. When
-/// `DEBUG >= 3`, prints the graph before and after the rewrite.
 #[must_use]
-pub fn graph_rewrite(root: &UOp, rewrite: &mut dyn FnMut(&UOp) -> Option<UOp>, name: &str) -> UOp {
-    let debug = *DEBUG;
-    if debug >= 3 {
-        eprintln!("━━━ {name} [before] ━━━\n{}", root.dump());
-    }
-
+pub fn graph_rewrite(root: &UOp, rewrite: &mut dyn FnMut(&UOp) -> Option<UOp>) -> UOp {
     let mut current = root.clone();
 
     loop {
@@ -88,9 +73,6 @@ pub fn graph_rewrite(root: &UOp, rewrite: &mut dyn FnMut(&UOp) -> Option<UOp>, n
         current = replace.get(&current).cloned().unwrap_or(current);
 
         if !changed {
-            if debug >= 3 {
-                eprintln!("━━━ {name} [after] ━━━\n{}", current.dump());
-            }
             return current;
         }
     }
@@ -173,7 +155,7 @@ mod tests {
         let x = UOp::const_float(5.0, DType::F32, DeviceId::Cpu);
         let zero = UOp::const_float(0.0, DType::F32, DeviceId::Cpu);
         let sum = UOp::add(x, zero);
-        let result = graph_rewrite(&sum, &mut symbolic_simple, "test");
+        let result = graph_rewrite(&sum, &mut symbolic_simple);
         assert_eq!(result.op(), Op::Const);
         assert_eq!(*result.arg(), Arg::Float(5.0));
     }
@@ -183,7 +165,7 @@ mod tests {
         let x = UOp::const_float(5.0, DType::F32, DeviceId::Cpu);
         let zero = UOp::const_float(0.0, DType::F32, DeviceId::Cpu);
         let sum = UOp::add(zero, x);
-        let result = graph_rewrite(&sum, &mut symbolic_simple, "test");
+        let result = graph_rewrite(&sum, &mut symbolic_simple);
         assert_eq!(result.op(), Op::Const);
         assert_eq!(*result.arg(), Arg::Float(5.0));
     }
@@ -193,7 +175,7 @@ mod tests {
         let two = UOp::const_float(2.0, DType::F32, DeviceId::Cpu);
         let three = UOp::const_float(3.0, DType::F32, DeviceId::Cpu);
         let sum = UOp::add(two, three);
-        let result = graph_rewrite(&sum, &mut symbolic_simple, "test");
+        let result = graph_rewrite(&sum, &mut symbolic_simple);
         assert_eq!(result.op(), Op::Const);
         assert_eq!(*result.arg(), Arg::Float(5.0));
     }
@@ -205,7 +187,7 @@ mod tests {
         let one = UOp::const_float(1.0, DType::F32, DeviceId::Cpu);
         let sum = UOp::add(x, zero);
         let prod = UOp::mul(sum, one);
-        let result = graph_rewrite(&prod, &mut symbolic_simple, "test");
+        let result = graph_rewrite(&prod, &mut symbolic_simple);
         assert_eq!(result.op(), Op::Const);
         assert_eq!(*result.arg(), Arg::Float(7.0));
     }
@@ -215,7 +197,7 @@ mod tests {
         let x = UOp::const_float(3.0, DType::F32, DeviceId::Cpu);
         let y = UOp::const_float(4.0, DType::F32, DeviceId::Cpu);
         let sum = UOp::add(x, y);
-        let result = graph_rewrite(&sum, &mut |_| None, "test");
+        let result = graph_rewrite(&sum, &mut |_| None);
         assert_eq!(result, sum);
     }
 
@@ -224,7 +206,7 @@ mod tests {
         let x = UOp::const_float(42.0, DType::F32, DeviceId::Cpu);
         let zero = UOp::const_float(0.0, DType::F32, DeviceId::Cpu);
         let prod = UOp::mul(x, zero);
-        let result = graph_rewrite(&prod, &mut symbolic_simple, "test");
+        let result = graph_rewrite(&prod, &mut symbolic_simple);
         assert_eq!(result.op(), Op::Const);
         assert_eq!(*result.arg(), Arg::Float(0.0));
     }
