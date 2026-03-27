@@ -18,71 +18,240 @@ use crate::dtype::DType;
 use crate::shape::Shape;
 
 /// The operations our IR supports.
+///
+/// Each variant documents its expected **sources** (`srcs`) and **argument**
+/// (`arg`). Sources are the edges in the DAG; the argument is an op-specific
+/// payload carried on the node itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Op {
     /// A device identity leaf.
+    ///
+    /// - **srcs:** none
+    /// - **arg:** `Arg::Device(DeviceId)`
     Device,
+
     /// A symbolic integer variable with a known min/max range.
+    ///
+    /// Used for dynamic shapes and symbolic index expressions.
+    ///
+    /// - **srcs:** none
+    /// - **arg:** `Arg::Variable(name, min, max)`
     DefineVar,
+
     /// Bind a concrete value to a symbolic variable for one execution.
+    ///
+    /// Pairs a `DefineVar` with a runtime value so the scheduler can
+    /// substitute it when launching a kernel.
+    ///
+    /// - **srcs:** `[var, value]` — the `DefineVar` node and a `Const` node
+    /// - **arg:** `Arg::None`
     Bind,
-    /// A realized data buffer.
+
+    /// A realized data buffer that already lives on a device.
+    ///
+    /// - **srcs:** `[device]` — a `Device` leaf identifying the owning device
+    /// - **arg:** `Arg::Buffer(Buffer)` — handle to the allocated memory
     Buffer,
+
     /// Narrow each dimension to a half-open range without copying.
+    ///
+    /// Selects a contiguous slice along every axis. Per-axis start offsets
+    /// are carried as extra source nodes so they can be symbolic.
+    ///
+    /// - **srcs:** `[data, start_0, start_1, …]` — the tensor followed by
+    ///   one start-offset node per dimension (often `Const` or `ParamScalar`)
+    /// - **arg:** `Arg::Bounds([len_0, len_1, …])` — the output length along
+    ///   each dimension
     Shrink,
-    /// Change shape without moving data.
+
+    /// Change logical shape without moving data (a zero-copy view).
+    ///
+    /// - **srcs:** `[data]`
+    /// - **arg:** `Arg::Shape(new_shape)`
     Reshape,
-    /// Reorder dimensions.
+
+    /// Reorder dimensions (transpose generalization).
+    ///
+    /// - **srcs:** `[data]`
+    /// - **arg:** `Arg::Axes([perm_0, perm_1, …])` — the new axis ordering
     Permute,
+
     /// Broadcast dimensions of size 1 to a larger size.
+    ///
+    /// - **srcs:** `[data]`
+    /// - **arg:** `Arg::Shape(broadcast_shape)`
     Expand,
-    /// Reduce over tensor axes.
+
+    /// Reduce over one or more tensor axes (tensor-level).
+    ///
+    /// Collapsed axes become size 1 in the output shape. The reduction
+    /// operation (e.g. `Add`, `Max`) is embedded in the arg.
+    ///
+    /// - **srcs:** `[data]`
+    /// - **arg:** `Arg::Reduce(reduce_op, [axis_0, axis_1, …])`
     ReduceAxis,
-    /// A kernel buffer parameter.
+
+    /// A kernel buffer parameter (pointer into device memory).
+    ///
+    /// Created during scheduling when tensor-level `Buffer` nodes are
+    /// replaced by numbered parameter slots for code generation.
+    ///
+    /// - **srcs:** `[device]` — a `Device` leaf
+    /// - **arg:** `Arg::ParamBuffer(slot, numel)` — parameter index and
+    ///   flattened element count
     ParamBuffer,
-    /// A kernel scalar parameter.
+
+    /// A kernel scalar parameter (a single runtime value).
+    ///
+    /// Used for dynamic values like symbolic variable bindings that are
+    /// passed to a compiled kernel at launch time.
+    ///
+    /// - **srcs:** `[device]` — a `Device` leaf
+    /// - **arg:** `Arg::ParamScalar(slot)` — parameter index
     ParamScalar,
-    /// Loop from 0 to bound.
+
+    /// Loop from 0 (inclusive) to a bound (exclusive).
+    ///
+    /// The induction variable is the node itself (dtype `I32`). Pairs
+    /// with a corresponding `End` node that closes the loop body.
+    ///
+    /// - **srcs:** `[bound]` — a node producing the upper bound
+    /// - **arg:** `Arg::Index(axis)` — which loop axis this range represents
     Range,
-    /// Close a `Range` loop.
+
+    /// Close a `Range` loop, carrying the loop body as a dependency.
+    ///
+    /// - **srcs:** `[range, body…]` — the `Range` node followed by
+    ///   side-effecting nodes (e.g. `Store`) inside the loop
+    /// - **arg:** `Arg::None`
     End,
+
     /// Root of a completed kernel graph.
+    ///
+    /// Collects all top-level side effects so the backend can emit them.
+    ///
+    /// - **srcs:** `[effect_0, effect_1, …]` — `Store` and `End` nodes
+    /// - **arg:** `Arg::None`
     Sink,
-    /// Tensor-level or kernel-level indexing.
+
+    /// Compute a memory address from a buffer pointer and an index.
+    ///
+    /// - **srcs:** `[buffer, index]` — a `ParamBuffer` and an index
+    ///   expression (often a `Range` node)
+    /// - **arg:** `Arg::None`
     Index,
-    /// Read a value from memory.
+
+    /// Read a value from memory at an indexed address.
+    ///
+    /// - **srcs:** `[address]` — an `Index` node
+    /// - **arg:** `Arg::None`
     Load,
-    /// Write a value to memory.
+
+    /// Write a value to memory at an indexed address.
+    ///
+    /// - **srcs:** `[address, value]` — an `Index` node and the value to store
+    /// - **arg:** `Arg::None`
     Store,
-    /// A compile-time constant.
+
+    /// A compile-time constant scalar.
+    ///
+    /// - **srcs:** `[device]` — a `Device` leaf
+    /// - **arg:** `Arg::Float(f64)` | `Arg::Int(i64)` | `Arg::Bool(bool)`
     Const,
-    /// `-x`.
+
+    /// Negate: `-x`.
+    ///
+    /// - **srcs:** `[x]`
+    /// - **arg:** `Arg::None`
     Neg,
-    /// `2^x`.
+
+    /// Base-2 exponential: `2^x`.
+    ///
+    /// - **srcs:** `[x]`
+    /// - **arg:** `Arg::None`
     Exp2,
-    /// `log2(x)`.
+
+    /// Base-2 logarithm: `log2(x)`.
+    ///
+    /// - **srcs:** `[x]`
+    /// - **arg:** `Arg::None`
     Log2,
-    /// `sqrt(x)`.
+
+    /// Square root: `sqrt(x)`.
+    ///
+    /// - **srcs:** `[x]`
+    /// - **arg:** `Arg::None`
     Sqrt,
-    /// `1/x`.
+
+    /// Reciprocal: `1/x`.
+    ///
+    /// - **srcs:** `[x]`
+    /// - **arg:** `Arg::None`
     Reciprocal,
-    /// `x + y`.
+
+    /// Addition: `x + y`.
+    ///
+    /// - **srcs:** `[x, y]`
+    /// - **arg:** `Arg::None`
     Add,
-    /// `x * y`.
+
+    /// Multiplication: `x * y`.
+    ///
+    /// - **srcs:** `[x, y]`
+    /// - **arg:** `Arg::None`
     Mul,
-    /// `max(x, y)`.
+
+    /// Element-wise maximum: `max(x, y)`.
+    ///
+    /// - **srcs:** `[x, y]`
+    /// - **arg:** `Arg::None`
     Max,
-    /// `x < y`.
+
+    /// Strict less-than comparison: `x < y`.
+    ///
+    /// Always produces `DType::Bool` regardless of input dtype.
+    ///
+    /// - **srcs:** `[x, y]`
+    /// - **arg:** `Arg::None`
     CmpLt,
-    /// `if cond { t } else { f }`.
+
+    /// Ternary select: `if cond { on_true } else { on_false }`.
+    ///
+    /// - **srcs:** `[cond, on_true, on_false]` — `cond` must be `DType::Bool`
+    /// - **arg:** `Arg::None`
     Where,
-    /// Kernel-level reduction placeholder.
+
+    /// Kernel-level reduction placeholder (post-lowering).
+    ///
+    /// Replaces `ReduceAxis` after the rangeify pass lowers tensor-level
+    /// reductions into explicit loops with accumulators.
+    ///
+    /// - **srcs:** `[value]` — the expression being accumulated
+    /// - **arg:** `Arg::Reduce(reduce_op, [axis_0, …])`
     Reduce,
-    /// Ordering barrier.
+
+    /// Ordering barrier: ensures an effect completes before using a value.
+    ///
+    /// Used to sequence a `Store` before a subsequent read of the same
+    /// buffer, e.g. for multi-kernel pipelines.
+    ///
+    /// - **srcs:** `[value, effect]` — the value to pass through, and the
+    ///   side effect that must complete first
+    /// - **arg:** `Arg::None`
     After,
-    /// Declare an accumulator.
+
+    /// Declare a loop accumulator with an initial value.
+    ///
+    /// - **srcs:** `[initial_value, range]` — the starting value and the
+    ///   `Range` node whose loop body updates this accumulator
+    /// - **arg:** `Arg::None`
     DefineAcc,
-    /// Update an accumulator.
+
+    /// Update an accumulator inside a loop body.
+    ///
+    /// - **srcs:** `[accumulator, new_value]` — the `DefineAcc` node and
+    ///   the expression to write into it
+    /// - **arg:** `Arg::None`
     Assign,
 }
 
