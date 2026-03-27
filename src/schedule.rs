@@ -278,9 +278,7 @@ fn nested_reduce_inputs(order: &[UOp]) -> HashSet<UOp> {
     let mut feeds_reduce = HashSet::new();
     for node in order.iter().rev() {
         if node.op() == Op::ReduceAxis || feeds_reduce.contains(node) {
-            for src in node.srcs() {
-                feeds_reduce.insert(src.clone());
-            }
+            feeds_reduce.extend(node.srcs().iter().cloned());
         }
     }
     feeds_reduce
