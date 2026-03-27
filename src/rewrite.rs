@@ -23,7 +23,8 @@
 
 use std::collections::HashMap;
 
-use crate::uop::UOp;
+use crate::dtype::DType;
+use crate::uop::{Arg, Op, UOp};
 
 // ── graph_rewrite ───────────────────────────────────────────────────────────
 
@@ -117,6 +118,54 @@ pub(crate) fn substitute_with_map(root: &UOp, replacements: &HashMap<UOp, UOp>) 
         .get(root)
         .cloned()
         .unwrap_or_else(|| root.clone())
+}
+
+// ── shared structural flattening rules ──────────────────────────────────────
+
+/// Flattens `End(range, Sink(body0, body1))` into `End(range, body0, body1)`.
+///
+/// Both the expander and devectorizer can produce `End` nodes whose body slot
+/// wraps multiple effects in a temporary `Sink`. This rule inlines the `Sink`
+/// children directly into the `End`, keeping its source list uniform for
+/// downstream passes (linearizer, renderer).
+pub(crate) fn flatten_end_bodies(node: &UOp) -> Option<UOp> {
+    if node.op() != Op::End || node.srcs().len() < 2 {
+        return None;
+    }
+
+    let mut changed = false;
+    let mut srcs = vec![node.srcs()[0].clone()];
+    for body in &node.srcs()[1..] {
+        if body.op() == Op::Sink {
+            changed = true;
+            srcs.extend(body.srcs().iter().cloned());
+            continue;
+        }
+        srcs.push(body.clone());
+    }
+    changed.then(|| UOp::new(Op::End, DType::Void, srcs, Arg::None))
+}
+
+/// Flattens `Sink(Sink(..), ..)` into a single `Sink(..)`.
+///
+/// Inlining effects during expansion or store scalarization can produce
+/// nested sinks. This rule collapses them into one flat effect list.
+pub(crate) fn flatten_nested_sinks(node: &UOp) -> Option<UOp> {
+    if node.op() != Op::Sink {
+        return None;
+    }
+
+    let mut changed = false;
+    let mut srcs = Vec::new();
+    for src in node.srcs() {
+        if src.op() == Op::Sink {
+            changed = true;
+            srcs.extend(src.srcs().iter().cloned());
+            continue;
+        }
+        srcs.push(src.clone());
+    }
+    changed.then(|| UOp::sink(srcs))
 }
 
 #[cfg(test)]

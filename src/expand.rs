@@ -80,7 +80,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::dtype::DType;
-use crate::rewrite::{graph_rewrite, substitute_with_map};
+use crate::rewrite::{
+    flatten_end_bodies, flatten_nested_sinks, graph_rewrite, substitute_with_map,
+};
 use crate::uop::{Arg, AxisKind, Op, UOp};
 
 /// Converts a scheduled `Range` node (Upcast or Unroll kind) into a lane pack
@@ -116,48 +118,6 @@ fn lane_pack_for_range(range: &UOp) -> Option<UOp> {
         vec![vector],
         Arg::Lanes(vec![(*axis, lane_count)].into_boxed_slice()),
     ))
-}
-
-/// Flattens `End(range, Sink(body0, body1))` into `End(range, body0, body1)`.
-/// After upcast expansion inlines effects, an End's body slot may contain a
-/// Sink grouping multiple stores. Flattening keeps the End node's children
-/// uniform for downstream passes.
-fn flatten_end_bodies(node: &UOp) -> Option<UOp> {
-    if node.op() != Op::End || node.srcs().len() < 2 {
-        return None;
-    }
-
-    let mut changed = false;
-    let mut srcs = vec![node.srcs()[0].clone()];
-    for body in &node.srcs()[1..] {
-        if body.op() == Op::Sink {
-            changed = true;
-            srcs.extend(body.srcs().iter().cloned());
-            continue;
-        }
-        srcs.push(body.clone());
-    }
-    changed.then(|| UOp::new(Op::End, DType::Void, srcs, Arg::None))
-}
-
-/// Flattens `Sink(Sink(..), ..)` into a single `Sink(..)`. Upcast expansion
-/// can inline several effects at once, which naturally creates nested sinks.
-fn flatten_nested_sinks(node: &UOp) -> Option<UOp> {
-    if node.op() != Op::Sink {
-        return None;
-    }
-
-    let mut changed = false;
-    let mut srcs = Vec::new();
-    for src in node.srcs() {
-        if src.op() == Op::Sink {
-            changed = true;
-            srcs.extend(src.srcs().iter().cloned());
-            continue;
-        }
-        srcs.push(src.clone());
-    }
-    changed.then(|| UOp::sink(srcs))
 }
 
 /// Eliminates upcast `End` nodes by substituting their `Range` with a lane

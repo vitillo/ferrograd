@@ -88,51 +88,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::dtype::DType;
-use crate::rewrite::graph_rewrite;
+use crate::rewrite::{flatten_end_bodies, flatten_nested_sinks, graph_rewrite};
 use crate::uop::{Arg, Op, UOp};
 
 type LaneMeta = Box<[(usize, usize)]>;
-
-/// Flattens `End(range, Sink(body0, body1))` into `End(range, body0, body1)`.
-/// Devectorization can scalarize one logical write into several stores, which
-/// temporarily introduces nested sink groupings.
-fn flatten_end_bodies(node: &UOp) -> Option<UOp> {
-    if node.op() != Op::End || node.srcs().len() < 2 {
-        return None;
-    }
-
-    let mut changed = false;
-    let mut srcs = vec![node.srcs()[0].clone()];
-    for body in &node.srcs()[1..] {
-        if body.op() == Op::Sink {
-            changed = true;
-            srcs.extend(body.srcs().iter().cloned());
-            continue;
-        }
-        srcs.push(body.clone());
-    }
-    changed.then(|| UOp::new(Op::End, DType::Void, srcs, Arg::None))
-}
-
-/// Flattens `Sink(Sink(..), ..)` into one sink after scalarizing lane-valued
-/// stores into multiple effects.
-fn flatten_nested_sinks(node: &UOp) -> Option<UOp> {
-    if node.op() != Op::Sink {
-        return None;
-    }
-
-    let mut changed = false;
-    let mut srcs = Vec::new();
-    for src in node.srcs() {
-        if src.op() == Op::Sink {
-            changed = true;
-            srcs.extend(src.srcs().iter().cloned());
-            continue;
-        }
-        srcs.push(src.clone());
-    }
-    changed.then(|| UOp::sink(srcs))
-}
 
 /// Scalarize any operation with a vectorized dtype by splitting it into
 /// per-lane scalar ops via `gep(i)`, then wrapping in `Vectorize`.
