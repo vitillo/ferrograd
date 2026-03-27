@@ -211,17 +211,17 @@ fn reduce_lane_groups(value: &UOp) -> Option<(Vec<Vec<UOp>>, LaneMeta)> {
         // For each output position, collect the contracted lanes.
         // With row-major layout, contracted (inner) axes are consecutive.
         let stride = contract_size;
-        let mut groups = Vec::with_capacity(remaining_size);
-        for out_idx in 0..remaining_size {
-            let group: Vec<UOp> = (0..stride)
-                .map(|c_idx| {
-                    let flat = out_idx * stride + c_idx;
-                    assert!(flat < total, "lane index out of bounds");
-                    inner_vec.gep(flat)
-                })
-                .collect();
-            groups.push(group);
-        }
+        let groups: Vec<Vec<UOp>> = (0..remaining_size)
+            .map(|out_idx| {
+                (0..stride)
+                    .map(|c_idx| {
+                        let flat = out_idx * stride + c_idx;
+                        assert!(flat < total, "lane index out of bounds");
+                        inner_vec.gep(flat)
+                    })
+                    .collect()
+            })
+            .collect();
         return Some((groups, remaining_meta.into_boxed_slice()));
     }
 

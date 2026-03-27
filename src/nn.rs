@@ -107,9 +107,7 @@ impl Linear {
 impl Parameters for Linear {
     fn parameters(&self) -> Vec<Tensor> {
         let mut params = vec![self.weight.clone()];
-        if let Some(bias) = &self.bias {
-            params.push(bias.clone());
-        }
+        params.extend(self.bias.iter().cloned());
         params
     }
 }
