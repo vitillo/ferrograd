@@ -653,6 +653,15 @@ impl Tensor {
         Self::from_uop(UOp::permute(self.uop(), order), self.requires_grad())
     }
 
+    /// Materialize a densely packed row-major copy of this tensor.
+    #[must_use]
+    pub fn contiguous(&self) -> Self {
+        if self.is_realized() {
+            return self.clone();
+        }
+        Self::from_uop(UOp::contiguous(self.uop()), self.requires_grad())
+    }
+
     /// Broadcast size-1 dimensions.
     ///
     /// # Panics
@@ -798,6 +807,7 @@ impl Tensor {
         let a = self.reshape(&[m, 1, k]).expand(&[m, n, k]);
         let b = other
             .permute(&[1, 0])
+            .contiguous()
             .reshape(&[1, n, k])
             .expand(&[m, n, k]);
         a.mul(&b).sum(&[2]).reshape(&[m, n])
@@ -1168,6 +1178,7 @@ fn assert_codegen_ready(root: &UOp) {
                     | Op::Reshape
                     | Op::Permute
                     | Op::Expand
+                    | Op::Contiguous
                     | Op::ReduceAxis
                     | Op::Reduce
             ),
@@ -1280,6 +1291,19 @@ mod tests {
     }
 
     #[test]
+    fn test_contiguous_preserves_permuted_values() {
+        // Arrange
+        let x = Tensor::new(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], cpu());
+
+        // Act
+        let contiguous = x.permute(&[1, 0]).contiguous();
+
+        // Assert
+        assert_eq!(contiguous.shape(), [3, 2]);
+        assert_eq!(contiguous.to_vec(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
     fn test_gradients_skip_untracked_narrow_inputs() {
         let x = Tensor::new(&[1.0, 2.0, 3.0, 4.0], &[2, 2], cpu()).narrow(0, 1, 1);
         let w = Tensor::new(&[10.0, 20.0], &[2, 1], cpu()).with_requires_grad(true);
@@ -1287,6 +1311,19 @@ mod tests {
         let grads = loss.gradient(&[&w]);
         assert_eq!(grads[0].to_vec(), vec![3.0, 4.0]);
         assert!(!grads[0].requires_grad());
+    }
+
+    #[test]
+    fn test_gradients_flow_through_contiguous() {
+        // Arrange
+        let x = Tensor::new(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], cpu()).with_requires_grad(true);
+
+        // Act
+        let loss = x.permute(&[1, 0]).contiguous().sum(&[0, 1]);
+        let grads = loss.gradient(&[&x]);
+
+        // Assert
+        assert_eq!(grads[0].to_vec(), vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]

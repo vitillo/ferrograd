@@ -178,6 +178,7 @@ fn gradient_for_op(node: &UOp, grad: &UOp) -> Vec<Option<UOp>> {
                 vec![Some(UOp::reduce_axis(grad.clone(), Op::Add, &reduce_axes))]
             }
         }
+        Op::Contiguous => vec![Some(grad.clone())],
         Op::ReduceAxis => {
             let Arg::Reduce(reduce_op, axes) = node.arg() else {
                 panic!("ReduceAxis must have Reduce arg");

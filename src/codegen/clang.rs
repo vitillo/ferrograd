@@ -249,6 +249,7 @@ impl Renderer for ClangRenderer {
                 | Op::Reshape
                 | Op::Permute
                 | Op::Expand
+                | Op::Contiguous
                 | Op::ReduceAxis
                 | Op::Reduce => {
                     unreachable!("{op:?} should be lowered before codegen", op = node.op())

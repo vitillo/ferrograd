@@ -324,6 +324,9 @@ fn should_materialize(
     ) {
         return false;
     }
+    if node.op() == Op::Contiguous {
+        return true;
+    }
     if node.op().is_movement() {
         return false;
     }

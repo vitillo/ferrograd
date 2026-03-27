@@ -230,7 +230,7 @@ fn rangeify_rule(node: &UOp) -> Option<UOp> {
             let idxs = &node.srcs()[1..];
             match inner.op() {
                 op if op.is_alu() => rewrite_index_alu(inner, idxs),
-                Op::Expand | Op::Permute | Op::Reshape | Op::Shrink => {
+                Op::Expand | Op::Permute | Op::Reshape | Op::Shrink | Op::Contiguous => {
                     rewrite_index_movement(inner, idxs)
                 }
                 Op::ReduceAxis => rewrite_index_reduce(inner, idxs),
