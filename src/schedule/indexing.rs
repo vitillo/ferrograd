@@ -160,6 +160,7 @@ pub fn rewrite_index_movement(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
                 vec![flat_index(idxs, &contiguous_strides(shape.as_slice()))]
             }
         }
+        Op::Contiguous => idxs.to_vec(),
         _ => unreachable!("rangeify only sends movement ops here"),
     };
 

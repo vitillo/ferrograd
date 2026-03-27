@@ -82,6 +82,15 @@ pub enum Op {
     /// - **arg:** `Arg::Shape(broadcast_shape)`
     Expand,
 
+    /// Copy into standard row-major contiguous layout.
+    ///
+    /// Unlike other movement ops, this is an explicit copy boundary: it keeps
+    /// the same logical shape but requests a fresh densely packed buffer.
+    ///
+    /// - **srcs:** `[data]`
+    /// - **arg:** `Arg::None`
+    Contiguous,
+
     /// Reduce over one or more tensor axes (tensor-level).
     ///
     /// Collapsed axes become size 1 in the output shape. The reduction
@@ -716,7 +725,7 @@ impl UOp {
                 ))
             }
             Op::Const => Some(Shape::flat(1)),
-            Op::After => self.srcs()[0].shape(),
+            Op::Contiguous | Op::After => self.srcs()[0].shape(),
             Op::ParamScalar | Op::Device | Op::DefineVar | Op::Bind => None,
             op if op.is_alu() => self.srcs()[0].shape(),
             _ => None,
@@ -798,6 +807,12 @@ impl UOp {
     pub(crate) fn expand(src: Self, shape: Shape) -> Self {
         let dtype = src.dtype();
         Self::new(Op::Expand, dtype, vec![src], Arg::Shape(shape))
+    }
+
+    #[must_use]
+    pub(crate) fn contiguous(src: Self) -> Self {
+        let dtype = src.dtype();
+        Self::new(Op::Contiguous, dtype, vec![src], Arg::None)
     }
 
     #[must_use]
