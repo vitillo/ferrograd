@@ -275,6 +275,7 @@ impl Renderer for ClangRenderer {
                 | Op::Vectorize
                 | Op::Unroll
                 | Op::Contract
+                | Op::Gep
                 | Op::ReduceAxis
                 | Op::Reduce => {
                     unreachable!("{op:?} should be lowered before codegen", op = node.op())

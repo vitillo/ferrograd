@@ -88,11 +88,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::dtype::DType;
-use crate::lane::{
-    combine_lane_sources, coord_product, coord_to_index, lane_value, make_lane_pack, LaneMeta,
-};
 use crate::rewrite::graph_rewrite;
 use crate::uop::{Arg, Op, UOp};
+
+type LaneMeta = Box<[(usize, usize)]>;
 
 /// Flattens `End(range, Sink(body0, body1))` into `End(range, body0, body1)`.
 /// Devectorization can scalarize one logical write into several stores, which
@@ -135,12 +134,17 @@ fn flatten_nested_sinks(node: &UOp) -> Option<UOp> {
     changed.then(|| UOp::sink(srcs))
 }
 
-/// Propagates lane-valued results introduced by reduce lowering through simple
-/// scalar expressions until the final store can be scalarized.
-fn expand_lane_expr(node: &UOp) -> Option<UOp> {
-    let (src_lanes, meta) = combine_lane_sources(node)?;
-    let lane_count = meta.iter().map(|(_, size)| *size).product::<usize>();
-
+/// Scalarize any operation with a vectorized dtype by splitting it into
+/// per-lane scalar ops via `gep(i)`, then wrapping in `Vectorize`.
+///
+/// This is tinygrad's `no_vectorized_alu`: for each lane `i`, extract
+/// scalar operands with `gep(i)` and create a scalar op. The `gep(i)`
+/// shortcut on `Vectorize` returns `srcs[i]` directly, so this is
+/// zero-cost for already-vectorized inputs.
+fn no_vectorized_alu(node: &UOp) -> Option<UOp> {
+    if node.dtype().is_scalar() {
+        return None;
+    }
     match node.op() {
         Op::Add
         | Op::Mul
@@ -154,97 +158,93 @@ fn expand_lane_expr(node: &UOp) -> Option<UOp> {
         | Op::Reciprocal
         | Op::Index
         | Op::Load
-        | Op::After => {
-            let mut lanes = Vec::with_capacity(lane_count);
-            for lane_idx in 0..lane_count {
-                let scalar_srcs = src_lanes
-                    .iter()
-                    .map(|lanes| {
-                        if lanes.len() == 1 {
-                            lanes[0].clone()
-                        } else {
-                            lanes[lane_idx].clone()
-                        }
-                    })
-                    .collect();
-                lanes.push(UOp::new(
-                    node.op(),
-                    node.dtype(),
-                    scalar_srcs,
-                    node.arg().clone(),
-                ));
-            }
-            Some(make_lane_pack(Op::Unroll, node.dtype(), lanes, meta))
-        }
-        _ => None,
+        | Op::After => {}
+        _ => return None,
     }
+
+    let n = usize::from(node.dtype().vcount());
+    let scalar_dtype = node.dtype().scalar();
+    let lanes: Vec<UOp> = (0..n)
+        .map(|i| {
+            let scalar_srcs: Vec<UOp> = node
+                .srcs()
+                .iter()
+                .map(|src| {
+                    if src.dtype().is_scalar() {
+                        src.clone()
+                    } else {
+                        src.gep(i)
+                    }
+                })
+                .collect();
+            UOp::new(node.op(), scalar_dtype, scalar_srcs, node.arg().clone())
+        })
+        .collect();
+    Some(UOp::new(Op::Vectorize, node.dtype(), lanes, Arg::None))
 }
 
-/// Splits a `Contract(Unroll(Vectorize(...)))` into groups of lanes that share
-/// the same output position. Each group contains the lanes that differ only
-/// along contracted axes -- these will be horizontally reduced together. The
-/// returned metadata describes the remaining (non-contracted) axes.
-fn contract_lane_groups(node: &UOp) -> Option<(Vec<Vec<UOp>>, LaneMeta)> {
-    if node.op() != Op::Contract || node.srcs().len() != 1 {
+/// Extract lane groups from a Contract or Unroll node for reduction.
+///
+/// A `Contract` marks which axes should be horizontally reduced. For each
+/// output position (remaining axes), we collect the lanes that differ only
+/// along contracted axes — these get horizontally folded. Uses `gep(i)` to
+/// extract individual lanes from the inner Vectorize.
+///
+/// A plain `Unroll` (no contraction) produces one group per lane.
+fn reduce_lane_groups(value: &UOp) -> Option<(Vec<Vec<UOp>>, LaneMeta)> {
+    if value.op() == Op::Contract {
+        let Arg::Lanes(contract_axes) = value.arg() else {
+            return None;
+        };
+        let inner = &value.srcs()[0];
+        let (inner_vec, full_meta) = unwrap_unroll(inner)?;
+        let contracted: HashSet<usize> = contract_axes.iter().map(|(a, _)| *a).collect();
+        let remaining_meta: Vec<(usize, usize)> = full_meta
+            .iter()
+            .copied()
+            .filter(|(a, _)| !contracted.contains(a))
+            .collect();
+        let contract_size: usize = contract_axes.iter().map(|(_, s)| *s).product();
+        let remaining_size: usize = remaining_meta.iter().map(|(_, s)| *s).product();
+        let total = inner_vec.srcs().len();
+
+        // For each output position, collect the contracted lanes.
+        // With row-major layout, contracted (inner) axes are consecutive.
+        let stride = contract_size;
+        let mut groups = Vec::with_capacity(remaining_size);
+        for out_idx in 0..remaining_size {
+            let group: Vec<UOp> = (0..stride)
+                .map(|c_idx| {
+                    let flat = out_idx * stride + c_idx;
+                    assert!(flat < total, "lane index out of bounds");
+                    inner_vec.gep(flat)
+                })
+                .collect();
+            groups.push(group);
+        }
+        return Some((groups, remaining_meta.into_boxed_slice()));
+    }
+
+    // Plain Unroll: each lane is its own group.
+    let (vec_node, meta) = unwrap_unroll(value)?;
+    let n = vec_node.srcs().len();
+    let groups = (0..n).map(|i| vec![vec_node.gep(i)]).collect();
+    Some((groups, meta))
+}
+
+/// Unwrap `Unroll(Vectorize(...))` into the Vectorize node and lane metadata.
+fn unwrap_unroll(node: &UOp) -> Option<(UOp, LaneMeta)> {
+    if node.op() != Op::Unroll || node.srcs().len() != 1 {
         return None;
     }
-    let Arg::Lanes(contract_axes) = node.arg() else {
+    let Arg::Lanes(meta) = node.arg() else {
         return None;
     };
-    let (lanes, full_meta) = lane_value(&node.srcs()[0])?;
-    let contracted_axes: HashSet<usize> = contract_axes.iter().map(|(axis, _)| *axis).collect();
-    let remaining_meta: Vec<(usize, usize)> = full_meta
-        .iter()
-        .copied()
-        .filter(|(axis, _)| !contracted_axes.contains(axis))
-        .collect();
-    let contract_meta: Vec<(usize, usize)> = full_meta
-        .iter()
-        .copied()
-        .filter(|(axis, _)| contracted_axes.contains(axis))
-        .collect();
-
-    let mut full_positions = HashMap::new();
-    for (idx, (axis, _)) in full_meta.iter().enumerate() {
-        full_positions.insert(*axis, idx);
+    let inner = &node.srcs()[0];
+    if inner.op() != Op::Vectorize {
+        return None;
     }
-
-    let remaining_coords = coord_product(&remaining_meta);
-    let contract_coords = coord_product(&contract_meta);
-    let mut groups = Vec::with_capacity(remaining_coords.len());
-
-    for remaining in &remaining_coords {
-        let mut group = Vec::with_capacity(contract_coords.len().max(1));
-        for contract in &contract_coords {
-            let mut full = vec![0_usize; full_meta.len()];
-            for ((axis, _), coord) in remaining_meta.iter().zip(remaining) {
-                full[*full_positions
-                    .get(axis)
-                    .expect("remaining axis should exist in full lane metadata")] = *coord;
-            }
-            for ((axis, _), coord) in contract_meta.iter().zip(contract) {
-                full[*full_positions
-                    .get(axis)
-                    .expect("contract axis should exist in full lane metadata")] = *coord;
-            }
-            group.push(lanes[coord_to_index(&full_meta, &full)].clone());
-        }
-        groups.push(group);
-    }
-
-    Some((groups, remaining_meta.into_boxed_slice()))
-}
-
-/// Prepares a reduce operand for per-lane reduction. If the value is a plain
-/// lane pack, each lane becomes its own single-element group. If it is a
-/// Contract, lanes are grouped by contracted axes. Either way the result is
-/// ready for `horizontal_reduce` within each group.
-fn reduce_lane_groups(value: &UOp) -> Option<(Vec<Vec<UOp>>, LaneMeta)> {
-    if let Some((lanes, meta)) = lane_value(value) {
-        let groups = lanes.into_iter().map(|lane| vec![lane]).collect();
-        return Some((groups, meta));
-    }
-    contract_lane_groups(value)
+    Some((inner.clone(), meta.clone()))
 }
 
 /// Folds multiple lane values into one using a left-associative chain of
@@ -383,52 +383,50 @@ fn lower_reduce(node: &UOp) -> Option<UOp> {
         );
     }
 
-    Some(make_lane_pack(Op::Unroll, node.dtype(), afters, meta))
+    let vcount = u16::try_from(afters.len()).expect("lane count should fit u16");
+    let vector = UOp::new(Op::Vectorize, node.dtype().vec(vcount), afters, Arg::None);
+    Some(UOp::new(
+        Op::Unroll,
+        node.dtype(),
+        vec![vector],
+        Arg::Lanes(meta),
+    ))
 }
 
-/// Splits a store whose index or value carries lanes into one scalar store per
-/// lane. After expansion, a single Store may write multiple output positions
-/// (one per unrolled lane). This pass makes each write explicit so the
-/// linearizer only sees simple scalar stores.
+/// Splits a store whose index or value is an `Unroll` into one scalar store
+/// per lane, using `gep(i)` to extract each lane's index and value.
 fn scalarize_lane_store(node: &UOp) -> Option<UOp> {
     if node.op() != Op::Store || node.srcs().len() != 2 {
         return None;
     }
 
-    let idx_lanes = lane_value(&node.srcs()[0]);
-    let value_lanes = lane_value(&node.srcs()[1]);
-    if idx_lanes.is_none() && value_lanes.is_none() {
+    let idx_src = &node.srcs()[0];
+    let val_src = &node.srcs()[1];
+    let has_lanes = idx_src.op() == Op::Unroll || val_src.op() == Op::Unroll;
+    if !has_lanes {
         return None;
     }
 
-    let meta = idx_lanes
-        .as_ref()
-        .map(|(_, meta)| meta.clone())
-        .or_else(|| value_lanes.as_ref().map(|(_, meta)| meta.clone()))
-        .expect("at least one store input should carry lanes");
-    if let (Some((_, idx_meta)), Some((_, value_meta))) = (&idx_lanes, &value_lanes) {
-        if idx_meta.as_ref() != value_meta.as_ref() {
-            return None;
-        }
-    }
-    let lane_count = meta.iter().map(|(_, size)| *size).product::<usize>();
+    // Determine lane count from whichever source carries lanes.
+    let lane_count = if idx_src.op() == Op::Unroll {
+        idx_src.srcs()[0].srcs().len()
+    } else {
+        val_src.srcs()[0].srcs().len()
+    };
 
-    let idx_values = idx_lanes.map_or_else(|| vec![node.srcs()[0].clone()], |(lanes, _)| lanes);
-    let value_values = value_lanes.map_or_else(|| vec![node.srcs()[1].clone()], |(lanes, _)| lanes);
-
-    let stores = (0..lane_count)
-        .map(|lane_idx| {
-            let idx = if idx_values.len() == 1 {
-                idx_values[0].clone()
+    let stores: Vec<UOp> = (0..lane_count)
+        .map(|i| {
+            let idx = if idx_src.op() == Op::Unroll {
+                idx_src.srcs()[0].gep(i)
             } else {
-                idx_values[lane_idx].clone()
+                idx_src.clone()
             };
-            let value = if value_values.len() == 1 {
-                value_values[0].clone()
+            let val = if val_src.op() == Op::Unroll {
+                val_src.srcs()[0].gep(i)
             } else {
-                value_values[lane_idx].clone()
+                val_src.clone()
             };
-            UOp::new(Op::Store, DType::Void, vec![idx, value], Arg::None)
+            UOp::new(Op::Store, DType::Void, vec![idx, val], Arg::None)
         })
         .collect();
     Some(UOp::sink(stores))
@@ -520,8 +518,8 @@ fn lift_after_in_store(node: &UOp) -> Option<UOp> {
 #[must_use]
 pub(crate) fn devectorize(root: &UOp) -> UOp {
     let reduced = graph_rewrite(root, &mut lower_reduce);
-    let expanded_lanes = graph_rewrite(&reduced, &mut expand_lane_expr);
-    let scalarized_stores = graph_rewrite(&expanded_lanes, &mut scalarize_lane_store);
+    let scalarized_alu = graph_rewrite(&reduced, &mut no_vectorized_alu);
+    let scalarized_stores = graph_rewrite(&scalarized_alu, &mut scalarize_lane_store);
     let flattened_ends = graph_rewrite(&scalarized_stores, &mut flatten_end_bodies);
     let lifted_afters = graph_rewrite(&flattened_ends, &mut lift_after_in_store);
     graph_rewrite(&lifted_afters, &mut flatten_nested_sinks)
