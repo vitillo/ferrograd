@@ -459,12 +459,22 @@ impl Tensor {
     }
 
     /// Element-wise addition with broadcasting.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tensors are on different devices or their shapes are not
+    /// broadcast-compatible.
     #[must_use]
     pub fn add(&self, other: &Self) -> Self {
         self.broadcasted(other, Op::Add, self.dtype())
     }
 
     /// Element-wise multiplication with broadcasting.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tensors are on different devices or their shapes are not
+    /// broadcast-compatible.
     #[must_use]
     pub fn mul(&self, other: &Self) -> Self {
         self.broadcasted(other, Op::Mul, self.dtype())
@@ -477,6 +487,11 @@ impl Tensor {
     }
 
     /// Element-wise subtraction with broadcasting.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tensors are on different devices or their shapes are not
+    /// broadcast-compatible.
     #[must_use]
     pub fn sub(&self, other: &Self) -> Self {
         self.add(&other.neg())
