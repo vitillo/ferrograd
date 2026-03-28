@@ -112,9 +112,10 @@ fn parse_images(path: &Path) -> Result<(Tensor, usize)> {
     let magic = read_u32(&mut file)?;
     assert_eq!(magic, 2051, "bad IDX image magic");
 
-    let count = read_u32(&mut file)? as usize;
-    let rows = read_u32(&mut file)? as usize;
-    let cols = read_u32(&mut file)? as usize;
+    let count =
+        usize::try_from(read_u32(&mut file)?).expect("image count overflows usize");
+    let rows = usize::try_from(read_u32(&mut file)?).expect("row count overflows usize");
+    let cols = usize::try_from(read_u32(&mut file)?).expect("col count overflows usize");
     assert_eq!((rows, cols), (28, 28));
 
     let mut pixels = vec![0u8; count * rows * cols];
@@ -130,7 +131,8 @@ fn parse_labels(path: &Path) -> Result<Vec<u8>> {
     let magic = read_u32(&mut file)?;
     assert_eq!(magic, 2049, "bad IDX label magic");
 
-    let count = read_u32(&mut file)? as usize;
+    let count =
+        usize::try_from(read_u32(&mut file)?).expect("label count overflows usize");
     let mut labels = vec![0u8; count];
     file.read_exact(&mut labels)?;
     Ok(labels)
