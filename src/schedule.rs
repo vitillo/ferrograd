@@ -21,24 +21,11 @@ pub mod rangeify;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::device::{self, Buffer};
+use crate::device::{self, Buffer, KernelArg};
 use crate::dtype::DType;
 use crate::rewrite::graph_rewrite;
 use crate::shape::Shape;
 use crate::uop::{self, Arg, Op, UOp};
-
-#[derive(Debug, Clone)]
-/// A runtime input to a compiled kernel.
-pub enum KernelInput {
-    /// A realized tensor buffer referenced by a shared slot handle.
-    Buffer(Buffer),
-    /// A scalar `i32` input.
-    I32(i32),
-    /// A scalar `f32` input.
-    F32(f32),
-    /// A scalar boolean input.
-    Bool(bool),
-}
 
 /// A single kernel to compile and execute.
 #[derive(Debug)]
@@ -46,7 +33,7 @@ pub struct ScheduleItem {
     /// Kernel-ready `Sink(Store(Param(0), expr))`.
     pub sink: UOp,
     /// Runtime inputs in parameter-slot order, excluding output slot 0.
-    pub inputs: Vec<KernelInput>,
+    pub inputs: Vec<KernelArg>,
     /// Output buffer slot reserved for slot 0, or `None` for in-place stores.
     pub output_buffer: Option<Buffer>,
     /// Output shape for allocated outputs.
@@ -186,9 +173,9 @@ fn parameterize_store(store: &UOp) -> ScheduleItem {
 /// numbered `Param` nodes, collecting the corresponding runtime inputs.
 /// `slot_offset` reserves slot 0 for the output in allocating kernels (1) or
 /// starts at 0 for in-place stores where the destination is a regular input.
-fn parameterize_inputs(root: &UOp, slot_offset: usize) -> (UOp, Vec<KernelInput>) {
+fn parameterize_inputs(root: &UOp, slot_offset: usize) -> (UOp, Vec<KernelArg>) {
     let device = root.device();
-    let mut inputs: Vec<KernelInput> = Vec::new();
+    let mut inputs: Vec<KernelArg> = Vec::new();
     let mut params: HashMap<Buffer, UOp> = HashMap::new();
     let mut scalar_params: HashMap<UOp, UOp> = HashMap::new();
 
@@ -207,7 +194,7 @@ fn parameterize_inputs(root: &UOp, slot_offset: usize) -> (UOp, Vec<KernelInput>
                         .entry(handle.clone())
                         .or_insert_with(|| {
                             let slot = inputs.len() + slot_offset;
-                            inputs.push(KernelInput::Buffer(handle.clone()));
+                            inputs.push(KernelArg::Buffer(handle.clone()));
                             UOp::param_buffer(slot, dtype, handle.numel(), device)
                         })
                         .clone(),
@@ -256,15 +243,15 @@ fn parameterize_inputs(root: &UOp, slot_offset: usize) -> (UOp, Vec<KernelInput>
 
     (graph_rewrite(root, &mut rewrite_inputs), inputs)
 }
-/// Convert a `Const` literal arg into the corresponding [`KernelInput`] scalar variant.
-fn scalar_input(literal: &Arg) -> KernelInput {
+/// Convert a `Const` literal arg into the corresponding [`KernelArg`] scalar variant.
+fn scalar_input(literal: &Arg) -> KernelArg {
     match literal {
         #[allow(clippy::cast_possible_truncation)]
-        Arg::Float(value) => KernelInput::F32(*value as f32),
+        Arg::Float(value) => KernelArg::F32(*value as f32),
         Arg::Int(value) => {
-            KernelInput::I32(i32::try_from(*value).expect("kernel scalar int must fit in i32"))
+            KernelArg::I32(i32::try_from(*value).expect("kernel scalar int must fit in i32"))
         }
-        Arg::Bool(value) => KernelInput::Bool(*value),
+        Arg::Bool(value) => KernelArg::Bool(*value),
         _ => panic!("kernel scalar input must be a literal"),
     }
 }
@@ -422,7 +409,7 @@ fn substitute_materialized(root: &UOp, replacements: &HashMap<UOp, UOp>) -> UOp 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{self, DeviceId};
+    use crate::device::{self, DeviceId, KernelArg};
 
     fn buffer_uop(data: &[f32], shape: &[usize]) -> UOp {
         let device = DeviceId::Cpu;
@@ -444,7 +431,7 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert!(matches!(
             items[1].inputs[0],
-            KernelInput::Buffer(ref handle) if Some(handle.clone()) == items[0].output_buffer
+            KernelArg::Buffer(ref handle) if Some(handle.clone()) == items[0].output_buffer
         ));
     }
 
@@ -462,19 +449,19 @@ mod tests {
         assert_eq!(items.len(), 4);
         assert!(matches!(
             items[1].inputs[0],
-            KernelInput::Buffer(ref handle) if Some(handle.clone()) == items[0].output_buffer
+            KernelArg::Buffer(ref handle) if Some(handle.clone()) == items[0].output_buffer
         ));
         assert!(matches!(
             items[2].inputs[0],
-            KernelInput::Buffer(ref handle) if Some(handle.clone()) == items[0].output_buffer
+            KernelArg::Buffer(ref handle) if Some(handle.clone()) == items[0].output_buffer
         ));
         assert!(matches!(
             items[3].inputs[0],
-            KernelInput::Buffer(ref handle) if Some(handle.clone()) == items[1].output_buffer
+            KernelArg::Buffer(ref handle) if Some(handle.clone()) == items[1].output_buffer
         ));
         assert!(matches!(
             items[3].inputs[1],
-            KernelInput::Buffer(ref handle) if Some(handle.clone()) == items[2].output_buffer
+            KernelArg::Buffer(ref handle) if Some(handle.clone()) == items[2].output_buffer
         ));
     }
 
@@ -496,7 +483,7 @@ mod tests {
             .filter(|input| {
                 matches!(
                     input,
-                    KernelInput::I32(_) | KernelInput::F32(_) | KernelInput::Bool(_)
+                    KernelArg::I32(_) | KernelArg::F32(_) | KernelArg::Bool(_)
                 )
             })
             .count();
@@ -515,9 +502,9 @@ mod tests {
 
         let item = parameterize_store(&UOp::store(dst, narrowed));
 
-        assert!(matches!(item.inputs[0], KernelInput::Buffer(_)));
-        assert!(matches!(item.inputs[1], KernelInput::Buffer(_)));
-        assert!(matches!(item.inputs[2], KernelInput::I32(1)));
+        assert!(matches!(item.inputs[0], KernelArg::Buffer(_)));
+        assert!(matches!(item.inputs[1], KernelArg::Buffer(_)));
+        assert!(matches!(item.inputs[2], KernelArg::I32(1)));
     }
 
     #[test]
@@ -537,17 +524,17 @@ mod tests {
 
         // Assert
         assert_eq!(items.len(), 3);
-        assert!(matches!(items[0].inputs[0], KernelInput::Buffer(_)));
-        assert!(matches!(items[0].inputs[1], KernelInput::Buffer(_)));
-        assert!(matches!(items[1].inputs[0], KernelInput::Buffer(_)));
-        assert!(matches!(items[1].inputs[1], KernelInput::Buffer(_)));
+        assert!(matches!(items[0].inputs[0], KernelArg::Buffer(_)));
+        assert!(matches!(items[0].inputs[1], KernelArg::Buffer(_)));
+        assert!(matches!(items[1].inputs[0], KernelArg::Buffer(_)));
+        assert!(matches!(items[1].inputs[1], KernelArg::Buffer(_)));
         assert!(matches!(
             items[2].inputs[0],
-            KernelInput::Buffer(ref handle) if Some(handle.clone()) == items[0].output_buffer
+            KernelArg::Buffer(ref handle) if Some(handle.clone()) == items[0].output_buffer
         ));
         assert!(matches!(
             items[2].inputs[1],
-            KernelInput::Buffer(ref handle) if Some(handle.clone()) == items[1].output_buffer
+            KernelArg::Buffer(ref handle) if Some(handle.clone()) == items[1].output_buffer
         ));
     }
 
@@ -573,14 +560,14 @@ mod tests {
         assert!(plan
             .items
             .iter()
-            .all(|item| matches!(item.inputs[0], KernelInput::Buffer(_))));
+            .all(|item| matches!(item.inputs[0], KernelArg::Buffer(_))));
         assert!(plan
             .items
             .iter()
-            .all(|item| matches!(item.inputs[1], KernelInput::Buffer(_))));
+            .all(|item| matches!(item.inputs[1], KernelArg::Buffer(_))));
         assert!(plan
             .items
             .iter()
-            .all(|item| matches!(item.inputs[2], KernelInput::Buffer(_))));
+            .all(|item| matches!(item.inputs[2], KernelArg::Buffer(_))));
     }
 }

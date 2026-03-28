@@ -833,7 +833,7 @@ impl Tensor {
     /// Codegen, compile (or hit cache), and execute one lowered kernel.
     fn execute_item(
         sink: &UOp,
-        inputs: &[schedule::KernelInput],
+        inputs: &[KernelArg],
         output_buffer: Option<&device::Buffer>,
     ) {
         let backend = device::get(sink.device());
@@ -891,12 +891,12 @@ impl Tensor {
         if let Some(output_buffer) = output_buffer.cloned() {
             output_buffer.ensure_allocated();
             args.push(KernelArg::Buffer(output_buffer));
-            execute_inputs(inputs, &mut args);
+            push_realized_args(inputs, &mut args);
             run_kernel(backend.as_ref(), &program, &mut args, debug);
             return;
         }
 
-        execute_inputs(inputs, &mut args);
+        push_realized_args(inputs, &mut args);
         run_kernel(backend.as_ref(), &program, &mut args, debug);
     }
 
@@ -1001,19 +1001,20 @@ impl Tensor {
     }
 }
 
-/// Convert scheduled kernel inputs (buffers and scalar constants) into
-/// concrete `KernelArg` values.
-fn execute_inputs(inputs: &[schedule::KernelInput], args: &mut Vec<KernelArg>) {
-    let input_args = inputs.iter().map(|input| match input {
-        schedule::KernelInput::Buffer(buffer) => {
-            assert!(buffer.is_realized(), "scheduled input buffer missing");
-            KernelArg::Buffer(buffer.clone())
+/// Append scheduled [`KernelArg`]s to `args`, cloning buffers after verifying they are realized.
+fn push_realized_args(scheduled: &[KernelArg], args: &mut Vec<KernelArg>) {
+    args.reserve(scheduled.len());
+    for input in scheduled {
+        match input {
+            KernelArg::Buffer(buffer) => {
+                assert!(buffer.is_realized(), "scheduled input buffer missing");
+                args.push(KernelArg::Buffer(buffer.clone()));
+            }
+            &KernelArg::I32(value) => args.push(KernelArg::I32(value)),
+            &KernelArg::F32(value) => args.push(KernelArg::F32(value)),
+            &KernelArg::Bool(value) => args.push(KernelArg::Bool(value)),
         }
-        schedule::KernelInput::I32(value) => KernelArg::I32(*value),
-        schedule::KernelInput::F32(value) => KernelArg::F32(*value),
-        schedule::KernelInput::Bool(value) => KernelArg::Bool(*value),
-    });
-    args.extend(input_args);
+    }
 }
 
 /// Execute a compiled kernel and optionally log timing when `debug >= 2`.

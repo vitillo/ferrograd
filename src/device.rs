@@ -7,6 +7,7 @@
 //! - [`Device`] trait -- the interface every backend (CPU, CUDA, ...) implements
 //! - [`Buffer`] -- typed memory that lives on some device
 //! - [`Storage`] -- opaque, device-specific memory (CPU = `Vec<u8>`, CUDA = device ptr)
+//! - [`KernelArg`] -- buffers and scalars in kernel parameter order (scheduler output, device input)
 //! - [`Program`] -- a compiled kernel, ready to execute on its device
 //! - a device registry for resolving [`DeviceId`] to backend objects
 //!
@@ -233,7 +234,11 @@ fn next_buffer_id() -> BufferId {
     BufferId(NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed))
 }
 
-/// A runtime argument passed to a compiled kernel.
+/// A runtime kernel argument: buffers and scalars in parameter-slot order.
+///
+/// The scheduler builds the same [`Vec`] stored on [`crate::schedule::ScheduleItem`]
+/// that execution later passes to [`Device::execute`], matching tinygrad’s single
+/// notion of kernel inputs rather than a separate schedule-time type.
 #[derive(Debug, Clone)]
 pub enum KernelArg {
     /// Tensor storage passed by pointer.
