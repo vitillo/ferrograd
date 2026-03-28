@@ -53,6 +53,7 @@ use crate::dtype::{DType, DTypeKind};
 use crate::expand::late_expand;
 use crate::gradient;
 use crate::linearize::linearize;
+use crate::rewrite::substitute_with_map;
 use crate::optimize;
 use crate::schedule::{self, rangeify::rangeify};
 use crate::shape::Shape;
@@ -1026,44 +1027,6 @@ fn run_kernel(device: &dyn device::Device, program: &Program, args: &mut [Kernel
             elapsed.as_secs_f64() * 1000.0,
         );
     }
-}
-
-/// Walk `root` in topological order and replace any node found in
-/// `replacements`. Children of replaced nodes are *not* traversed — the
-/// replacement is taken as-is, which is correct because replaced subtrees are
-/// fully realized and self-contained.
-fn substitute_with_map(root: &UOp, replacements: &HashMap<UOp, UOp>) -> UOp {
-    let order = root.toposort();
-    let mut substituted: HashMap<UOp, UOp> = HashMap::new();
-
-    for node in &order {
-        if let Some(replacement) = replacements.get(node) {
-            substituted.insert(node.clone(), replacement.clone());
-            continue;
-        }
-
-        let new_srcs: Vec<UOp> = node
-            .srcs()
-            .iter()
-            .map(|src| substituted.get(src).cloned().unwrap_or_else(|| src.clone()))
-            .collect();
-        let changed = node
-            .srcs()
-            .iter()
-            .zip(&new_srcs)
-            .any(|(old, new)| old != new);
-        let rewritten = if changed {
-            UOp::new(node.op(), node.dtype(), new_srcs, node.arg().clone())
-        } else {
-            node.clone()
-        };
-        substituted.insert(node.clone(), rewritten);
-    }
-
-    substituted
-        .get(root)
-        .cloned()
-        .unwrap_or_else(|| root.clone())
 }
 
 /// Substitute multiple roots in a single pass by wrapping them in a temporary
