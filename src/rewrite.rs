@@ -10,7 +10,7 @@
 //! - **Rangeify**: Store → loops, Index pushing, kernel `Reduce` creation
 //!   (in [`crate::schedule::rangeify`])
 //! - **Optimization**: symbolic simplification and loop unrolling
-//!   (in [`crate::optimize`])
+//!   (in the `optimize` module)
 //!
 //! Tinygrad uses `PatternMatcher` + `UPat` patterns for the same purpose.
 //! We use Rust's native `match` instead — same fixed-point loop, same
