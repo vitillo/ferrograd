@@ -62,7 +62,7 @@ pub trait Parameters {
 /// transposed in [`forward`](Self::forward) to feed ferrograd's `[M, K] @ [K, N]`
 /// matrix multiply. The default initialization uses Kaiming normal weights and
 /// zero bias, which is a better default than bounded uniform for `ReLU` MLPs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Linear {
     /// Trainable weight matrix with shape `[out_features, in_features]`.
     pub weight: Tensor,

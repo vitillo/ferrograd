@@ -41,7 +41,7 @@ pub enum KernelInput {
 }
 
 /// A single kernel to compile and execute.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ScheduleItem {
     /// Kernel-ready `Sink(Store(Param(0), expr))`.
     pub sink: UOp,
@@ -54,7 +54,7 @@ pub struct ScheduleItem {
 }
 
 /// A full execution plan for realizing one or more lazy roots.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SchedulePlan {
     /// Kernels to execute in dependency order.
     pub items: Vec<ScheduleItem>,
