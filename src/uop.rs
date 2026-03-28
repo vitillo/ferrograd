@@ -1116,6 +1116,15 @@ impl UOp {
         }
         out
     }
+
+    pub(crate) fn ended_ranges(&self) -> Vec<Self> {
+        ended_ranges_impl(self, &mut HashMap::new())
+    }
+
+    #[must_use]
+    pub(crate) fn tag(&self) -> Option<u64> {
+        self.0.tag
+    }
 }
 
 /// Build a map from each node to the nodes that consume it as a source.
@@ -1159,22 +1168,9 @@ impl PartialEq for UOp {
 
 impl Eq for UOp {}
 
-impl UOp {
-    pub(crate) fn ended_ranges(&self) -> Vec<Self> {
-        ended_ranges_impl(self, &mut HashMap::new())
-    }
-}
-
 impl std::hash::Hash for UOp {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.ptr_id().hash(state);
-    }
-}
-
-impl UOp {
-    #[must_use]
-    pub(crate) fn tag(&self) -> Option<u64> {
-        self.0.tag
     }
 }
 

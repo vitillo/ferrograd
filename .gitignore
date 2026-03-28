@@ -1,1 +1,8 @@
 target/
+
+# Local datasets, logs, and tabular run outputs
+data/
+logs/
+*.tsv
+result.tsv
+results.tsv
