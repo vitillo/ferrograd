@@ -202,7 +202,7 @@ fn rangeify_rule(node: &UOp) -> Option<UOp> {
 /// Output: kernel-level Sink with Ranges, Loads, Stores, and kernel `Reduce`
 /// nodes ready for later optimization and late lowering.
 #[must_use]
-pub fn rangeify(sink: &UOp) -> UOp {
+pub(crate) fn rangeify(sink: &UOp) -> UOp {
     graph_rewrite(sink, &mut rangeify_rule)
 }
 

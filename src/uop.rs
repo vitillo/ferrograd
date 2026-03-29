@@ -1132,7 +1132,7 @@ impl UOp {
 /// multi-consumer nodes that need materialization) and autograd (to propagate
 /// gradients along consumer edges).
 #[must_use]
-pub fn build_consumer_map(order: &[UOp]) -> HashMap<UOp, Vec<UOp>> {
+pub(crate) fn build_consumer_map(order: &[UOp]) -> HashMap<UOp, Vec<UOp>> {
     let mut consumers: HashMap<UOp, Vec<UOp>> = HashMap::new();
     for node in order {
         for src in node.srcs() {
