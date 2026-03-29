@@ -347,11 +347,9 @@ fn buffer_replacement(item: &ScheduleItem) -> UOp {
         .out_shape
         .clone()
         .expect("buffer_replacement requires an allocated output shape");
-    let buffer = UOp::buffer(
-        output_buffer.clone(),
-        output_buffer.dtype(),
-        item.sink.device(),
-    );
+    let dtype = output_buffer.dtype();
+    let device = item.sink.device();
+    let buffer = UOp::buffer(output_buffer, dtype, device);
     UOp::reshape(buffer, out_shape)
 }
 
