@@ -16,7 +16,6 @@
 //! that are multi-consumer or chained reductions, and parameterizes each kernel
 //! subgraph so it's ready for lowering.
 
-
 pub(crate) mod indexing;
 pub(crate) mod rangeify;
 

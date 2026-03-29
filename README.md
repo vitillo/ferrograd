@@ -29,25 +29,49 @@ Each layer is a standalone module you can study independently:
 
 ## Example
 
+Train a two-layer MLP on MNIST from scratch:
+
 ```rust
-use ferrograd::tensor::{Tensor, cpu};
+use ferrograd::dataset::MNISTDataset;
+use ferrograd::nn::{Linear, Parameters};
+use ferrograd::optim::Sgd;
+use ferrograd::tensor::{cpu, Tensor};
 
-let dev = cpu();
+// Define a model
+struct Mlp { l1: Linear, l2: Linear }
 
-let a = Tensor::new(&[1.0, 2.0, 3.0], &[3], dev);
-let b = Tensor::new(&[10.0, 20.0, 30.0], &[3], dev);
+impl Mlp {
+    fn forward(&self, x: &Tensor) -> Tensor {
+        let h = self.l1.forward(x).relu();
+        self.l2.forward(&h)
+    }
+}
 
-// Nothing executes yet — just builds a lazy graph.
-let c = a.add(&b).mul(&Tensor::new(&[2.0, 2.0, 2.0], &[3], dev));
+impl Parameters for Mlp {
+    fn parameters(&self) -> Vec<Tensor> {
+        [self.l1.parameters(), self.l2.parameters()].concat()
+    }
+}
 
-// realize() lowers to a single fused kernel, compiles, and runs.
-let result = c.to_vec(); // [22.0, 44.0, 66.0]
+// Train
+let dataset = MNISTDataset::load().unwrap();
+let model = Mlp { l1: Linear::new(784, 128), l2: Linear::new(128, 10) };
+let optim = Sgd::new(model.parameters(), 0.01);
+
+let batch_x = dataset.train_images.narrow(0, 0, 256);
+let batch_t = one_hot(&dataset.train_labels[..256], 10);
+
+let loss = model.forward(&batch_x).cross_entropy(&batch_t);
+loss.backward();  // reverse-mode autograd
+optim.step();     // SGD update
 ```
 
-Set `DEBUG=4` to see the generated C source:
+Everything is lazy — `forward`, `cross_entropy`, and `backward` just build a
+graph. `optim.step()` fuses it into kernels, compiles C via clang, and executes.
 
 ```sh
-DEBUG=4 cargo run --example demo
+cargo run --example mnist --release   # full training loop
+DEBUG=4 cargo run --example demo      # see generated C source
 ```
 
 ## Status
