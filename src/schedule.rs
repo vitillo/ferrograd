@@ -17,8 +17,8 @@
 //! subgraph so it's ready for lowering.
 
 
-pub mod indexing;
-pub mod rangeify;
+pub(crate) mod indexing;
+pub(crate) mod rangeify;
 
 use std::collections::{HashMap, HashSet};
 

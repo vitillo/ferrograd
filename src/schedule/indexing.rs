@@ -19,7 +19,7 @@ use crate::uop::{Arg, AxisKind, Op, UOp};
 
 /// Row-major contiguous strides for a shape.
 #[must_use]
-pub fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
+pub(super) fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
     let mut strides: Vec<usize> = shape
         .iter()
         .rev()
@@ -39,7 +39,7 @@ pub fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
 ///
 /// Panics if `idxs` and `strides` have different lengths or `idxs` is empty.
 #[must_use]
-pub fn flat_index(idxs: &[UOp], strides: &[usize]) -> UOp {
+pub(super) fn flat_index(idxs: &[UOp], strides: &[usize]) -> UOp {
     assert_eq!(idxs.len(), strides.len());
     let device = idxs
         .first()
@@ -64,7 +64,7 @@ pub fn flat_index(idxs: &[UOp], strides: &[usize]) -> UOp {
 
 /// Wrap a source in a tensor-level `Index` with per-dimension indices.
 #[must_use]
-pub fn index_wrap(src: &UOp, idxs: &[UOp]) -> UOp {
+pub(super) fn index_wrap(src: &UOp, idxs: &[UOp]) -> UOp {
     let mut srcs = vec![src.clone()];
     srcs.extend_from_slice(idxs);
     UOp::new(Op::Index, src.dtype(), srcs, Arg::None)
@@ -82,7 +82,8 @@ fn same_squeezed_dims(src_shape: &Shape, dst_shape: &Shape) -> bool {
 
 /// Push `Index` through elementwise ops.
 #[must_use]
-pub fn rewrite_index_alu(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
+#[allow(clippy::unnecessary_wraps)]
+pub(super) fn rewrite_index_alu(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
     let new_srcs: Vec<UOp> = inner
         .srcs()
         .iter()
@@ -99,7 +100,7 @@ pub fn rewrite_index_alu(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
 /// Push `Index` through movement ops.
 #[must_use]
 #[allow(clippy::missing_panics_doc)]
-pub fn rewrite_index_movement(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
+pub(super) fn rewrite_index_movement(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
     let src = &inner.srcs()[0];
 
     let new_idxs = match inner.op() {
@@ -181,7 +182,7 @@ pub fn rewrite_index_movement(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
 /// Panics if the reduction node does not carry `Arg::Reduce` or if `idxs`
 /// does not match the source rank.
 #[must_use]
-pub fn rewrite_index_reduce(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
+pub(super) fn rewrite_index_reduce(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
     let Arg::Reduce(reduce_op, axes) = inner.arg() else {
         panic!("ReduceAxis must have Arg::Reduce");
     };
@@ -219,7 +220,8 @@ pub fn rewrite_index_reduce(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
 
 /// Constants are scalars, so indexing does nothing.
 #[must_use]
-pub fn rewrite_index_const(inner: &UOp, _idxs: &[UOp]) -> Option<UOp> {
+#[allow(clippy::unnecessary_wraps)]
+pub(super) fn rewrite_index_const(inner: &UOp, _idxs: &[UOp]) -> Option<UOp> {
     Some(inner.clone())
 }
 
@@ -229,7 +231,8 @@ pub fn rewrite_index_const(inner: &UOp, _idxs: &[UOp]) -> Option<UOp> {
 ///
 /// Panics if the index list has not already been flattened to one dimension.
 #[must_use]
-pub fn rewrite_index_param(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
+#[allow(clippy::unnecessary_wraps)]
+pub(super) fn rewrite_index_param(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
     assert_eq!(idxs.len(), 1, "Param should have exactly one flat index");
     let index = UOp::new(
         Op::Index,
