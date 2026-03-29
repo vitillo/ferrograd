@@ -39,7 +39,6 @@ use super::indexing::{
 /// emitting a trivial `Range(0..1)` loop, we return `const(0)` directly.
 /// This avoids a useless loop and lets downstream code distinguish real
 /// loops (Range ops) from collapsed dims when building End nodes.
-#[allow(clippy::cast_possible_wrap)]
 fn new_range(axis: usize, size: usize, device: DeviceId) -> UOp {
     if size == 1 {
         return UOp::const_int(0, DType::I32, device);
@@ -47,7 +46,7 @@ fn new_range(axis: usize, size: usize, device: DeviceId) -> UOp {
     UOp::new(
         Op::Range,
         DType::I32,
-        vec![UOp::const_int(size as i64, DType::I32, device)],
+        vec![UOp::const_int(i64::try_from(size).expect("dimension size exceeds i64 range"), DType::I32, device)],
         Arg::Range(axis, AxisKind::Loop),
     )
 }

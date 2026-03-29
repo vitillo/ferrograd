@@ -53,8 +53,7 @@ pub fn flat_index(idxs: &[UOp], strides: &[usize]) -> UOp {
             if stride == 1 {
                 idx.clone()
             } else {
-                #[allow(clippy::cast_possible_wrap)]
-                let s = UOp::const_int(stride as i64, DType::I32, idx.device());
+                let s = UOp::const_int(i64::try_from(stride).expect("stride exceeds i64 range"), DType::I32, idx.device());
                 UOp::mul(idx.clone(), s)
             }
         })
@@ -192,8 +191,7 @@ pub fn rewrite_index_reduce(inner: &UOp, idxs: &[UOp]) -> Option<UOp> {
     let mut reduce_ranges = Vec::new();
     for (axis, &size) in src_shape.iter().enumerate() {
         if axes.contains(&axis) {
-            #[allow(clippy::cast_possible_wrap)]
-            let bound = UOp::const_int(size as i64, DType::I32, src.device());
+            let bound = UOp::const_int(i64::try_from(size).expect("dimension size exceeds i64 range"), DType::I32, src.device());
             let range = UOp::new(
                 Op::Range,
                 DType::I32,
