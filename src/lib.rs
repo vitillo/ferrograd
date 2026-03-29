@@ -9,7 +9,7 @@
 //! Tensor API → Lazy UOp Graph → Scheduling → Rangeify → Codegen → Compilation → Execution
 //! ```
 //!
-//! The design follows tinygrad's core split:
+//! The design splits concerns as follows:
 //!
 //! - tensor semantics live in the lazy [`uop`] graph
 //! - device identity is part of that graph
@@ -34,9 +34,8 @@
 //!   symbolic index arithmetic generated during lowering.
 //! - [`codegen`] renders kernel-level `UOp` graphs to C for the CPU backend.
 //! - [`gradient`] builds reverse-mode graphs on top of the same lazy IR.
-//! - [`nn`] provides lightweight layer structs such as `Linear`, staying close
-//!   to tinygrad's small `nn` surface without introducing a heavy module base
-//!   class.
+//! - [`nn`] provides lightweight layer structs such as `Linear`, keeping a small
+//!   surface without introducing a heavy module base class.
 //! - [`optim`] applies parameter updates using lazy tensor assignments.
 //! - [`shape`] centralizes shape metadata and shape-only transformations.
 //! - [`dataset`] provides pre-packaged datasets (MNIST) with automatic

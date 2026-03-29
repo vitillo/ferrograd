@@ -8,11 +8,7 @@
 //! they don't compute numbers, they build more graph. This means the
 //! backward pass reuses the exact same scheduling → rangeify → codegen
 //! pipeline as the forward pass, with no special runtime support needed.
-//!
-//! ## Tinygrad reference
-//!
-//! `tinygrad/autograd/gradient.py` — same reverse-toposort + chain-rule
-//! structure, same trick of emitting lazy ops for gradients.
+
 
 use std::collections::{HashMap, HashSet};
 

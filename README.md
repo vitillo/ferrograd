@@ -1,7 +1,6 @@
 # ferrograd
 
 A from-scratch tensor compiler in Rust, inspired by [tinygrad](https://github.com/tinygrad/tinygrad).
-Built for learning how tensor compilers work, one milestone at a time.
 
 ## Architecture
 
@@ -15,13 +14,18 @@ Each layer is a standalone module you can study independently:
 
 | Module | What it does | Compiler concept |
 |--------|-------------|-----------------|
+| `tensor` | Lazy tensor API with kernel fusion | Lazy evaluation, scheduling |
+| `uop` | DAG-based IR with hash-consing | Intermediate representations |
+| `schedule` | Lazy graph → proto-kernels + rangeify | Scheduling, lowering |
+| `optimize` | Symbolic simplification, upcast, unroll | Compiler optimizations |
+| `codegen` | UOp graph → C source | Code emission |
+| `gradient` | Reverse-mode autograd as graph transforms | Automatic differentiation |
+| `rewrite` | Fixed-point graph simplification | Term rewriting |
+| `nn` | Linear layers and loss functions | Neural network primitives |
 | `dtype` | Data types bridging Rust, IR, and C | Type systems |
 | `device` | Buffer, Device trait, CPU backend | Hardware abstraction |
-| `uop` | DAG-based IR with hash-consing | Intermediate representations |
-| `codegen` | UOp graph → C source | Code emission / lowering |
-| `rewrite` | Pattern matching + algebraic simplification | Term rewriting |
-| `tensor` | Lazy tensor API with kernel fusion | Lazy evaluation, scheduling |
-| `lower` | Tensor ops → kernel-level UOps | Lowering |
+| `shape` | Shape metadata and transformations | Tensor algebra |
+| `dataset` | MNIST with auto-download and caching | Data loading |
 
 ## Example
 
@@ -46,22 +50,11 @@ Set `DEBUG=4` to see the generated C source:
 DEBUG=4 cargo run --example demo
 ```
 
-## Roadmap
+## Status
 
-The project follows a 10-milestone plan (see [`dev/PLAN.md`](dev/PLAN.md)):
-
-1. **JIT Hello World** — emit C → compile → dlopen → run
-2. **DType + Buffer + Device** — type system and hardware abstraction
-3. **UOp IR** — DAG-based intermediate representation with interning
-4. **Code Generation** — IR to C
-5. **Graph Rewriting** — pattern matching and algebraic simplification
-6. **Tensor + Lazy Eval** — lazy evaluation and kernel fusion
-7. **Reductions + Matmul** — loop nests and index arithmetic
-8. **Autograd** — reverse-mode AD as graph transformation
-9. **CUDA Backend** — GPU codegen (thread grids replace loops)
-10. **MNIST** — train an MLP end-to-end
-
-Milestones 1–6 are implemented.
+The compiler pipeline is functional end-to-end: lazy tensor graphs, multi-kernel
+scheduling, reverse-mode autograd, and CPU code generation via clang. The MNIST
+example trains a small MLP from scratch.
 
 ## Building
 

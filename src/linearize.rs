@@ -13,9 +13,9 @@
 //! correctly, sibling loops must not interleave, and accumulators must be
 //! declared before the loop that updates them.
 //!
-//! Tinygrad solves this the same way: a late `linearize` pass builds
-//! explicit control-flow edges between related nodes and then runs a
-//! priority-aware topological sort that respects those edges.
+//! The `linearize` pass solves this by building explicit control-flow edges
+//! between related nodes and then running a priority-aware topological sort
+//! that respects those edges.
 //!
 //! ## What the pass does
 //!
@@ -23,10 +23,10 @@
 //!    are nested inside which parent `End` (or the root `Sink`).
 //! 2. **Inject sibling edges**: if two loops share a parent, add the first
 //!    loop's `End` as an extra source on the second loop's `Range`. This
-//!    bakes the ordering into the graph itself (matching tinygrad's
-//!    `pm_add_control_flow`), so the linearizer needs no side tables.
-//! 3. **Priority sort**: assign tinygrad-style priorities (params first,
-//!    then loads, then ALU, then stores, then loop open/close) and run a
+//!    bakes the ordering into the graph itself, so the linearizer needs no
+//!    side tables.
+//! 3. **Priority sort**: assign per-op priorities (params first, then loads,
+//!    then ALU, then stores, then loop open/close) and run a
 //!    max-heap topological traversal that pops the highest-priority ready
 //!    node at each step.
 //!
@@ -38,10 +38,6 @@
 //!    Range₀  Range₁
 //! ```
 //!
-//! ## Tinygrad reference
-//!
-//! `tinygrad/codegen/linearize.py` — `linearize_uop` builds the same
-//! CFG edges and runs the same priority-aware reverse topological sort.
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -49,7 +45,7 @@ use crate::uop::{Arg, Op, UOp};
 
 /// Extract the iteration count from a Range node's bound argument.
 /// Used to compute how many times a node executes, which drives scheduling
-/// priority -- tinygrad schedules cheaper (fewer iterations) nodes first.
+/// priority -- cheaper (fewer iterations) nodes are scheduled first.
 fn range_extent(range: &UOp) -> usize {
     let Some(bound) = range.srcs().first() else {
         return 1;
@@ -99,8 +95,8 @@ fn push_edge(edges: &mut HashMap<UOp, Vec<UOp>>, node: UOp, predecessor: UOp) {
 }
 
 /// How many times a node executes at runtime -- the product of all enclosing
-/// loop extents. Tinygrad uses this as the primary scheduling tiebreaker:
-/// nodes that run fewer times (cheaper) are scheduled first, keeping them
+/// loop extents. This is the primary scheduling tiebreaker: nodes that run
+/// fewer times (cheaper) are scheduled first, keeping them
 /// outside inner loops where possible.
 fn run_count(node: &UOp) -> usize {
     active_ranges(node, &mut HashMap::new())
@@ -110,7 +106,7 @@ fn run_count(node: &UOp) -> usize {
         })
 }
 
-/// Compute tinygrad's multi-level scheduling priority for a node.
+/// Compute the multi-level scheduling priority for a node.
 /// Returns `(run_count, op_priority, extra, topo_order)` -- sorted ascending,
 /// so lower values are scheduled first. Op-level priorities ensure params come
 /// before computation, Ends close loops early, Stores happen late, and Ranges
@@ -268,8 +264,7 @@ fn add_sibling_edges(
 /// sources to `Range` nodes. After this, the graph's natural `srcs()` encode
 /// all ordering constraints and the linearizer needs no side tables.
 ///
-/// This mirrors tinygrad's `pm_add_control_flow` pattern matcher, which
-/// patches Range nodes with CFG predecessors before linearization.
+/// This patches Range nodes with CFG predecessors before linearization.
 fn inject_control_flow(sink: &UOp) -> UOp {
     let order = sink.toposort();
     let (deps, nesting) = build_deps_and_nesting(&order);
@@ -293,8 +288,8 @@ fn inject_control_flow(sink: &UOp) -> UOp {
 
 /// Convert a lowered kernel DAG into an ordered program.
 ///
-/// This is the ferrograd equivalent of tinygrad's late linearizer: it turns
-/// a scoped DAG into a linear list that the renderer can print directly.
+/// Turns a scoped DAG into a linear list that the renderer can print
+/// directly.
 #[must_use]
 pub(crate) fn linearize(root: &UOp) -> Vec<UOp> {
     assert_eq!(root.op(), Op::Sink, "linearize: root must be a Sink node");

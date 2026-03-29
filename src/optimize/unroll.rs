@@ -1,4 +1,4 @@
-//! # Reduction loop unrolling (tinygrad `OptOps.UNROLL`)
+//! # Reduction loop unrolling
 //!
 //! Splits a `Reduce` range into an outer `REDUCE` loop and a small inner
 //! `UNROLL` loop of width [`REDUCE_UNROLL_FACTOR`]. The [`crate::expand`]

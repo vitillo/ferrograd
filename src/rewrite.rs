@@ -12,14 +12,8 @@
 //! - **Optimization**: symbolic simplification and loop unrolling
 //!   (in the `optimize` module)
 //!
-//! Tinygrad uses `PatternMatcher` + `UPat` patterns for the same purpose.
-//! We use Rust's native `match` instead — same fixed-point loop, same
-//! declarative rules, but with compile-time type checking and no framework
-//! to learn.
-//!
-//! ## Tinygrad reference
-//!
-//! `tinygrad/uop/ops.py` — `graph_rewrite` (the fixed-point loop concept).
+//! We use Rust's native `match` — same fixed-point loop, same declarative
+//! rules, but with compile-time type checking and no framework to learn.
 
 use std::collections::HashMap;
 

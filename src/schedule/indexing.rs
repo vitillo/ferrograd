@@ -1,13 +1,13 @@
 //! # Indexing — pushing indices from output to leaves
 //!
-//! In tinygrad's compilation pipeline, `rangeify` creates `Index` nodes at the
-//! kernel output and then rewrite rules push those indices *down* through the
-//! graph — through elementwise ops, movement ops (reshape, permute, expand,
-//! shrink), and reductions — until they reach leaf nodes (kernel parameters and
-//! constants). At each op the index is transformed to account for that op's
-//! semantics: a permute reorders index components, a reshape remaps them via
-//! stride arithmetic, an expand zeroes out broadcast dimensions, and a reduce
-//! replaces collapsed axes with new `Range` iterators.
+//! During rangeify, `Index` nodes are created at the kernel output and then
+//! rewrite rules push those indices *down* through the graph -- through
+//! elementwise ops, movement ops (reshape, permute, expand, shrink), and
+//! reductions -- until they reach leaf nodes (kernel parameters and constants).
+//! At each op the index is transformed to account for that op's semantics: a
+//! permute reorders index components, a reshape remaps them via stride
+//! arithmetic, an expand zeroes out broadcast dimensions, and a reduce replaces
+//! collapsed axes with new `Range` iterators.
 //!
 //! By the time every `Index` has been pushed to a leaf, the abstract tensor
 //! graph has been lowered into concrete loop-and-load kernel IR. This module

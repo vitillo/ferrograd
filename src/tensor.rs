@@ -24,7 +24,7 @@
 //! 8. **Compile** — invoke the platform C compiler (via the `Device` trait).
 //! 9. **Execute** — run the compiled kernel, writing results into device buffers.
 //!
-//! This mirrors tinygrad's `Tensor` class, where `.realize()` triggers the same
+//! Inspired by tinygrad's `Tensor`, calling `.realize()` triggers the full
 //! lazy-graph → schedule → lower → codegen → run pipeline.
 //!
 //! ## Shared handle pattern
@@ -34,8 +34,8 @@
 //! realization must rewrite every handle's `uop` from the old lazy expression
 //! to a realized buffer reference. Without shared identity, an optimizer holding
 //! a parameter clone would go stale after the training loop realizes it. This
-//! matches tinygrad, where `Tensor` objects are mutable Python references that
-//! get rewritten in-place by the scheduler.
+//! Without shared identity, an optimizer holding a parameter clone would see
+//! stale state after the training loop realizes it.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -239,7 +239,7 @@ impl Tensor {
 
         for affected in affected_by_device.into_values() {
             // Rewrite all affected roots in one combined sink so shared subgraphs
-            // are only substituted once, matching tinygrad's approach more closely.
+            // are only substituted once.
             let roots: Vec<UOp> = affected.iter().map(|(_, root)| root.clone()).collect();
             let rewritten_roots = substitute_roots_with_map(&roots, replacements);
 
@@ -724,12 +724,11 @@ impl Tensor {
 
     /// Cross-entropy loss between logits and dense target probabilities.
     ///
-    /// This follows tinygrad's choice to keep losses on `Tensor` instead of in
-    /// a separate `nn::loss` module. The current Rust version keeps the first
-    /// implementation simple and expects `targets` to already have the same
-    /// shape as `self`, for example one-hot labels.
+    /// Losses live directly on `Tensor` rather than in a separate module.
+    /// This implementation expects `targets` to already have the same shape
+    /// as `self`, for example one-hot labels.
     ///
-    /// The class axis matches tinygrad's default: axis `0` for rank-1 logits
+    /// The class axis defaults to axis `0` for rank-1 logits
     /// and axis `1` otherwise. The returned loss is the mean over the
     /// non-class dimensions.
     ///

@@ -10,10 +10,10 @@
 //!
 //! ## Why not expand immediately during optimization?
 //!
-//! Tinygrad keeps `REDUCE` structure alive through expansion so that later
-//! passes can still reason about reduction semantics. If we eagerly
-//! unrolled everything, we'd lose the information that four values belong
-//! to the same reduction and should share an accumulator. By expanding
+//! Keeping `REDUCE` structure alive through expansion lets later passes
+//! still reason about reduction semantics. If we eagerly unrolled
+//! everything, we'd lose the information that four values belong to the
+//! same reduction and should share an accumulator. By expanding
 //! lanes first and lowering reductions separately (in [`crate::devectorize`]),
 //! each pass stays simple.
 //!
@@ -71,11 +71,7 @@
 //!
 //! The `Reduce` is still alive — it now wraps a `Contract` that marks which
 //! lanes should be horizontally summed. Devectorize handles the rest.
-//!
-//! ## Tinygrad reference
-//!
-//! `tinygrad/codegen/late/expander.py` — `do_expand` and the expander rewrite
-//! rules that materialize `UPCAST`/`UNROLL` axes into explicit lane values.
+
 
 use std::collections::{HashMap, HashSet};
 
@@ -88,7 +84,7 @@ use crate::uop::{Arg, AxisKind, Op, UOp};
 /// Converts a scheduled `Range` node (Upcast or Unroll kind) into a lane pack
 /// of constant indices `[0, 1, .., N-1]`. This is how the optimizer's
 /// scheduling decisions become concrete: a `Range(4, Upcast)` turns into
-/// `Unroll(Vectorize(0, 1, 2, 3))`, mirroring tinygrad's expander.
+/// `Unroll(Vectorize(0, 1, 2, 3))`.
 fn lane_pack_for_range(range: &UOp) -> Option<UOp> {
     let Arg::Range(axis, kind) = range.arg() else {
         return None;
@@ -152,9 +148,9 @@ fn rewrite_scheduled_range(node: &UOp) -> Option<UOp> {
 }
 
 /// Rewrites `Reduce` nodes whose range sources have become `Unroll` lane
-/// packs into `Contract` nodes. In tinygrad, `CONTRACT` collapses
-/// lane-parallel values back to scalars via reduction -- this is how
-/// unrolled reduce axes are finalized after expansion.
+/// packs into `Contract` nodes. `Contract` marks which lane-parallel
+/// values should be collapsed back to scalars via reduction -- this is
+/// how unrolled reduce axes are finalized after expansion.
 fn fix_reduce_unroll(node: &UOp) -> Option<UOp> {
     if node.op() != Op::Reduce || node.srcs().len() < 2 {
         return None;
@@ -382,8 +378,8 @@ fn merge_shared_range_ends(root: &UOp) -> UOp {
 
 /// Materialize scheduled `UPCAST`/`UNROLL` decisions into lane-carrying IR.
 ///
-/// This is the ferrograd equivalent of tinygrad's expander pre-pass plus
-/// generic lane propagation. It intentionally keeps `Reduce` alive so the next
+/// Runs upcast expansion, range rewriting, reduce-to-contract conversion,
+/// and lane propagation in sequence. Intentionally keeps `Reduce` alive so the next
 /// stage can still lower reductions with lane structure intact.
 #[must_use]
 pub(crate) fn late_expand(root: &UOp) -> UOp {

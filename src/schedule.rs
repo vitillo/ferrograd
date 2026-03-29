@@ -12,9 +12,10 @@
 //! device buffer), then extracts each resulting subgraph into a self-contained
 //! kernel with numbered parameter slots.
 //!
-//! This mirrors tinygrad's `schedule.py`: walk the lazy graph in topological
-//! order, materialize nodes that are multi-consumer or chained reductions, and
-//! parameterize each kernel subgraph so it's ready for lowering.
+//! The algorithm walks the lazy graph in topological order, materializes nodes
+//! that are multi-consumer or chained reductions, and parameterizes each kernel
+//! subgraph so it's ready for lowering.
+
 
 pub mod indexing;
 pub mod rangeify;
@@ -277,7 +278,7 @@ fn nested_reduce_inputs(order: &[UOp]) -> HashSet<UOp> {
 /// incorrect or wasteful:
 /// - **Multi-consumer**: recomputing would duplicate work across kernels.
 /// - **Reduce consumed by ALU**: the reduce result must be stored before the
-///   elementwise op can read it (tinygrad splits these the same way).
+///   elementwise op can read it (reduce-before-ALU boundary).
 /// - **Chained reductions**: a reduce whose output feeds another reduce needs
 ///   an intermediate buffer (see [`nested_reduce_inputs`]).
 ///

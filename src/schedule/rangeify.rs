@@ -6,9 +6,8 @@
 //! IR with Range loops, Loads, Stores, and explicit kernel `Reduce` nodes.
 //!
 //! All transformations are rewrite rules in a single `graph_rewrite` pass.
-//! This is the same design as tinygrad's `schedule/rangeify.py`: rather than
-//! a procedural lowering function, we define declarative rules and let the
-//! fixed-point engine apply them until the graph stabilizes.
+//! Rather than a procedural lowering function, we define declarative rules
+//! and let the fixed-point engine apply them until the graph stabilizes.
 //!
 //! ## The two rules
 //!
@@ -16,10 +15,10 @@
 //! 2. **Index pushing**: delegates to [`super::indexing`] rules to push
 //!    Index down through ALU/movement/reduce/param nodes
 //!
-//! Tensor reductions are not lowered to accumulators here anymore. Like
-//! tinygrad, rangeify only introduces kernel-level `Reduce` nodes; later late
-//! passes decide how to expand lanes and only then lower reductions to
-//! accumulators.
+//! Tensor reductions are not lowered to accumulators here. Rangeify only
+//! introduces kernel-level `Reduce` nodes; later passes decide how to expand
+//! lanes and only then lower reductions to accumulators.
+
 
 use crate::device::DeviceId;
 use crate::dtype::DType;
@@ -33,7 +32,7 @@ use super::indexing::{
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-/// Create a loop index for one axis, mirroring tinygrad's `new_range()`.
+/// Create a loop index for one axis.
 ///
 /// Size-1 dimensions (from reductions like `sum(axis=0)` on shape `[3,4]` →
 /// `[1,4]`) always index at 0 — there's nothing to iterate. Rather than

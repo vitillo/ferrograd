@@ -1,8 +1,7 @@
 //! # Device Layer
 //!
-//! This module mirrors tinygrad's `device.py`: it defines the abstractions that
-//! all backends implement, plus the `Buffer` and `Storage` types that represent
-//! device memory.
+//! Defines the abstractions that all backends implement, plus the `Buffer` and
+//! `Storage` types that represent device memory.
 //!
 //! - [`Device`] trait -- the interface every backend (CPU, CUDA, ...) implements
 //! - [`Buffer`] -- typed memory that lives on some device
@@ -14,8 +13,8 @@
 //! Backend implementations live in submodules:
 //! - [`cpu`] -- compiles C with clang, runs via dlopen
 //!
-//! This module also owns the per-device backend registry, similar to
-//! tinygrad's global `Device[...]` lookup in `device.py`.
+//! This module also owns the per-device backend registry for resolving
+//! device identifiers to backend objects.
 
 pub mod cpu;
 
@@ -237,8 +236,8 @@ fn next_buffer_id() -> BufferId {
 /// A runtime kernel argument: buffers and scalars in parameter-slot order.
 ///
 /// The scheduler builds the same [`Vec`] stored on [`crate::schedule::ScheduleItem`]
-/// that execution later passes to [`Device::execute`], matching tinygrad’s single
-/// notion of kernel inputs rather than a separate schedule-time type.
+/// that execution later passes to [`Device::execute`], using a single type for
+/// kernel inputs rather than separate schedule-time and execution-time types.
 #[derive(Debug, Clone)]
 pub enum KernelArg {
     /// Tensor storage passed by pointer.

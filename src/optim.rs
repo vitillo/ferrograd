@@ -1,7 +1,7 @@
 //! # Optimizers
 //!
 //! Training updates are expressed as lazy tensor assignments and then realized
-//! together, matching tinygrad's "build more graph, then realize it" model.
+//! together -- build more graph, then realize it all at once.
 //!
 //! `Sgd::step` builds a lazy `assign` graph for every parameter (`param =
 //! param - lr * grad`), then calls `realize_many` once to execute all updates

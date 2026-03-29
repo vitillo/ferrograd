@@ -22,12 +22,7 @@
 //! - unset / `all` / `1`: all passes (default)
 //! - `none` / `off` / `0`: no passes (useful for debugging raw IR)
 //! - comma-separated names: `symbolic,upcast,unroll`
-//!
-//! ## Tinygrad reference
-//!
-//! `tinygrad/codegen/kernel.py` — `Kernel.apply_opt` applies `UPCAST`,
-//! `UNROLL`, `LOCAL`, `GROUP` and other scheduling actions to reshape the loop
-//! structure before the expander materializes them.
+
 
 mod symbolic;
 mod upcast;

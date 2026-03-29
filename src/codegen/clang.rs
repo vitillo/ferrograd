@@ -10,13 +10,7 @@
 //! - `Load`/`Store` → pointer dereference through `Index` expressions
 //! - ALU ops (`Add`, `Mul`, …) → C operators or builtins (`exp2`, `log2`)
 //! - `ParamBuffer`/`ParamScalar` → function parameters (`float* restrict data0`)
-//!
-//! ## Tinygrad reference
-//!
-//! `tinygrad/renderer/cstyle.py` — `ClangRenderer`. Tinygrad's renderer
-//! consumes a late-linearized program. This version now does the same:
-//! ordering and scope placement happen before rendering, so codegen stays a
-//! straightforward printer.
+
 
 use std::collections::HashMap;
 use std::fmt::Write;

@@ -1,4 +1,4 @@
-//! # Output loop upcasting (tinygrad `OptOps.UPCAST`)
+//! # Output loop upcasting
 //!
 //! Splits the trailing output (`LOOP`) axis into an outer `GLOBAL` loop and
 //! an inner `UPCAST` loop of width [`LOOP_UPCAST_FACTOR`]. The
@@ -16,10 +16,9 @@
 //!                                  }
 //! ```
 //!
-//! Heuristics mirror tinygrad’s CPU scheduler: pick the trailing output axis
-//! (e.g. matmul’s `N` for contiguous RHS access), skip kernels that already
-//! have an upcast axis, and stay conservative when post-reduce ALU sits
-//! between the reduction and the store.
+//! Heuristics: pick the trailing output axis (e.g. matmul’s `N` for contiguous
+//! RHS access), skip kernels that already have an upcast axis, and stay
+//! conservative when post-reduce ALU sits between the reduction and the store.
 //!
 //! Runs **first** in the optimization pipeline, before unroll and symbolic.
 
@@ -36,7 +35,7 @@ use super::const_i32;
 const LOOP_UPCAST_FACTOR: i64 = 4;
 
 /// Collect output ranges sorted by axis id so the heuristic can pick the
-/// trailing one, mirroring how tinygrad’s scheduler selects upcast candidates.
+/// trailing one.
 fn ordered_output_ranges(root: &UOp) -> Vec<UOp> {
     let mut ranges: Vec<UOp> = root
         .toposort()

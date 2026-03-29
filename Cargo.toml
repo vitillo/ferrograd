@@ -2,6 +2,9 @@
 name = "ferrograd"
 version = "0.1.0"
 edition = "2021"
+description = "Educational tensor compiler in Rust, inspired by tinygrad"
+license = "MIT"
+repository = "https://github.com/vitillo/ferrograd"
 
 [dependencies]
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }

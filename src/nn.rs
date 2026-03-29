@@ -57,10 +57,10 @@ pub trait Parameters {
     fn parameters(&self) -> Vec<Tensor>;
 }
 
-/// A fully connected layer, mirroring tinygrad's `nn.Linear`.
+/// A fully connected layer.
 ///
-/// The weight is stored as `[out_features, in_features]`, like tinygrad, and
-/// transposed in [`forward`](Self::forward) to feed ferrograd's `[M, K] @ [K, N]`
+/// The weight is stored as `[out_features, in_features]` and transposed in
+/// [`forward`](Self::forward) to feed ferrograd's `[M, K] @ [K, N]`
 /// matrix multiply. The default initialization uses Kaiming normal weights and
 /// zero bias, which is a better default than bounded uniform for `ReLU` MLPs.
 #[derive(Debug)]

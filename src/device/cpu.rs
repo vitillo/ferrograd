@@ -1,8 +1,8 @@
 //! # CPU Backend
 //!
 //! The complete CPU backend: compiles C with clang, loads via dlopen, and
-//! executes kernels. This is tinygrad's `ops_cpu.py` equivalent -- it bundles
-//! the compiler, allocator, and kernel dispatch for the CPU target.
+//! executes kernels. Bundles the compiler, allocator, and kernel dispatch
+//! for the CPU target.
 //!
 //! ## Compilation pipeline
 //!
@@ -236,9 +236,6 @@ impl CompiledKernel {
 // ── CpuDevice ───────────────────────────────────────────────────────────────
 
 /// The CPU device -- compiles C with clang and runs it via dlopen.
-///
-/// Tinygrad's equivalent is `CPUDevice` in `tinygrad/runtime/ops_cpu.py`,
-/// which uses `ClangJITCompiler` + `CPUProgram` in the same way.
 pub struct CpuDevice {
     kernels: RefCell<HashMap<UOp, Rc<Program>>>,
 }

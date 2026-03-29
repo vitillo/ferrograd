@@ -164,7 +164,7 @@ pub enum Op {
 
     /// Pack several scalar lanes into one explicit vector value.
     ///
-    /// This mirrors tinygrad's `Ops.VECTORIZE` and is introduced by the late
+    /// Introduced by the late
     /// expansion phase after scheduling has decided to compute multiple lanes
     /// together. The dtype is vectorized (e.g. `F32.vec(4)` for 4 lanes).
     /// Individual lanes can be extracted via `UOp::gep`.
@@ -175,7 +175,7 @@ pub enum Op {
 
     /// Carry an explicitly expanded multi-lane value through late lowering.
     ///
-    /// This mirrors tinygrad's `Ops.UNROLL`: it is not a control-flow loop,
+    /// This is not a control-flow loop,
     /// but a value wrapper that says "the child has been expanded across these
     /// lanes".
     ///
@@ -185,7 +185,7 @@ pub enum Op {
 
     /// Remap or collapse expanded lane structure.
     ///
-    /// This mirrors tinygrad's `Ops.CONTRACT` and is used when expanded lanes
+    /// Used when expanded lanes
     /// need to be packed back down for stores, reductions, or backend-specific
     /// lowering.
     ///
@@ -299,7 +299,7 @@ pub enum Op {
 
     /// Extract one or more lanes from a vectorized value.
     ///
-    /// This is tinygrad's `Ops.GEP`. When called on a `Vectorize` node via
+    /// When called on a `Vectorize` node via
     /// `UOp::gep`, it short-circuits and returns the indexed source directly
     /// (no IR node created). Otherwise it creates this node to be resolved
     /// later.
@@ -346,10 +346,9 @@ impl fmt::Display for Op {
 
 /// Classifies a loop axis after rangeify.
 ///
-/// This mirrors tinygrad's `AxisType`: rangeify starts with plain `LOOP`
-/// and `REDUCE` axes, and later optimization passes can retag them as
-/// `GLOBAL`, `LOCAL`, `UPCAST`, `UNROLL`, or `THREAD` without changing the
-/// renderer interface.
+/// Rangeify starts with plain `LOOP` and `REDUCE` axes, and later
+/// optimization passes can retag them as `GLOBAL`, `LOCAL`, `UPCAST`,
+/// `UNROLL`, or `THREAD` without changing the renderer interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AxisKind {
     /// Ordinary loop axis with no scheduling decision applied yet.
@@ -420,8 +419,8 @@ pub enum Arg {
     Axes(Box<[usize]>),
     /// Lane metadata for late `Unroll`/`Contract` lowering.
     ///
-    /// Each pair stores `(axis_id, lane_count)`, matching tinygrad's habit of
-    /// carrying expanded axis ids alongside their widths.
+    /// Each pair stores `(axis_id, lane_count)`, carrying expanded axis ids
+    /// alongside their widths.
     Lanes(Box<[(usize, usize)]>),
     /// Reduction op and axes.
     Reduce(Op, Box<[usize]>),
@@ -605,8 +604,8 @@ impl UOp {
     ///
     /// All `UOp` creation funnels through here. The interner either
     /// returns an existing `Rc<UOpInner>` if an identical node already exists,
-    /// or allocates a new one and caches it. This is how tinygrad achieves
-    /// graph deduplication: structurally identical sub-expressions become the
+    /// or allocates a new one and caches it. This achieves graph
+    /// deduplication: structurally identical sub-expressions become the
     /// same object in memory, which makes equality checks O(1) and naturally
     /// deduplicates common sub-expressions in the graph.
     fn build(op: Op, dtype: DType, srcs: Vec<Self>, arg: Arg) -> Self {
@@ -620,7 +619,7 @@ impl UOp {
     /// Derive the device for a non-leaf node from its sources.
     ///
     /// All sources must belong to the same device — cross-device ops are not
-    /// supported (tinygrad enforces the same constraint). Leaf nodes like
+    /// supported. Leaf nodes like
     /// `Const` and `Buffer` carry an explicit `Device` source instead.
     fn device_from_srcs(srcs: &[Self]) -> DeviceId {
         let device = srcs
@@ -734,8 +733,8 @@ impl UOp {
 
     /// Build a constant-filled tensor expression (e.g. all-zeros or all-ones).
     ///
-    /// Creates `Expand(Reshape(Const(value), [1,…,1]), shape)` — the same
-    /// pattern tinygrad uses for `full`. If every dimension is already 1, the
+    /// Creates `Expand(Reshape(Const(value), [1,…,1]), shape)`. If every
+    /// dimension is already 1, the
     /// expand is elided.
     #[must_use]
     pub(crate) fn full(shape: &Shape, dtype: DType, device: DeviceId, value: f64) -> Self {
@@ -1013,7 +1012,7 @@ impl UOp {
     /// Extract lane `i` from a vectorized value.
     ///
     /// If `self` is a `Vectorize` node, returns `self.srcs()[i]` directly
-    /// (no IR node created) — matching tinygrad's inline shortcut. Otherwise
+    /// (no IR node created). Otherwise
     /// creates an `Op::Gep` node with scalar dtype.
     #[must_use]
     pub(crate) fn gep(&self, i: usize) -> Self {

@@ -15,8 +15,6 @@
 //! - Devectorize decides *how* those lanes become concrete accumulators and
 //!   stores (based on reduction semantics).
 //!
-//! Tinygrad uses the same split: the expander keeps `REDUCE` alive, and a
-//! later devectorizer pass does the final lowering.
 //!
 //! ## What the pass does
 //!
@@ -79,11 +77,7 @@
 //!     *(data0 + idx1) = acc0;
 //!   }
 //! ```
-//!
-//! ## Tinygrad reference
-//!
-//! `tinygrad/codegen/late/devectorizer.py` — the rewrite rules that lower
-//! `REDUCE` to `DEFINE_ACC` + `ASSIGN` and scalarize lane-valued stores.
+
 
 use std::collections::{HashMap, HashSet};
 
@@ -96,8 +90,8 @@ type LaneMeta = Box<[(usize, usize)]>;
 /// Scalarize any operation with a vectorized dtype by splitting it into
 /// per-lane scalar ops via `gep(i)`, then wrapping in `Vectorize`.
 ///
-/// This is tinygrad's `no_vectorized_alu`: for each lane `i`, extract
-/// scalar operands with `gep(i)` and create a scalar op. The `gep(i)`
+/// For each lane `i`, extracts scalar operands with `gep(i)` and creates
+/// a scalar op. The `gep(i)`
 /// shortcut on `Vectorize` returns `srcs[i]` directly, so this is
 /// zero-cost for already-vectorized inputs.
 fn no_vectorized_alu(node: &UOp) -> Option<UOp> {
@@ -208,7 +202,7 @@ fn unwrap_unroll(node: &UOp) -> Option<(UOp, LaneMeta)> {
 
 /// Folds multiple lane values into one using a left-associative chain of
 /// `reduce_op`. This is the unrolled "horizontal" reduction within a single
-/// output lane, equivalent to tinygrad's cross-lane contraction.
+/// output lane (cross-lane contraction).
 fn horizontal_reduce(values: &[UOp], reduce_op: Op) -> UOp {
     let mut iter = values.iter().cloned();
     let Some(first) = iter.next() else {

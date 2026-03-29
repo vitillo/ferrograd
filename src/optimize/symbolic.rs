@@ -2,8 +2,7 @@
 //!
 //! Rangeify generates stride arithmetic with many literal zeros and ones
 //! (`idx*1 + 0`, `stride*0`, etc.). This pass cleans those up so codegen
-//! sees smaller, simpler expressions — the same role tinygrad’s symbolic
-//! layer plays on kernel math.
+//! sees smaller, simpler expressions.
 //!
 //! Two kinds of rewrites:
 //! - **Constant folding** — evaluate `Const op Const` at compile time

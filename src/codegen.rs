@@ -5,9 +5,8 @@
 //! graph and emits source code for a specific backend.
 //!
 //! Defines the [`Renderer`] trait and backend implementations (currently
-//! just [`ClangRenderer`]). Each renderer translates the same IR into a
-//! different target language — tinygrad's renderer serves the same role, but
-//! consumes a late-linearized list instead of recovering order from the DAG.
+//! just [`ClangRenderer`]). Each renderer translates the linearized kernel IR
+//! into a target language.
 
 pub mod clang;
 
