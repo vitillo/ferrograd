@@ -44,7 +44,6 @@
 //! - **macOS**: clang produces `.dylib` files. Always available (ships with Xcode CLT).
 //! - **Linux**: clang (or gcc) produces `.so` files. Install via `apt install clang`.
 
-use std::ffi::OsString;
 use std::io::Write;
 use std::process::Command;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
@@ -183,15 +182,11 @@ impl CompiledKernel {
         // -shared: produce a dynamically loadable library (not an executable)
         // -O3: let LLVM be more aggressive now that kernels are cached
         // -march/-mcpu=native: tune for the exact host CPU without changing semantics
-        let mut clang_args = vec![
-            OsString::from("-shared"),
-            OsString::from("-O3"),
-            OsString::from(Self::native_cpu_flag()),
-            OsString::from("-o"),
-            OsString::from(&so_path_str),
-            OsString::from(src_path_str),
-        ];
-        let output = Command::new("clang").args(clang_args.drain(..)).output()?;
+        let output = Command::new("clang")
+            .args(["-shared", "-O3", Self::native_cpu_flag(), "-o"])
+            .arg(&so_path_str)
+            .arg(src_path_str)
+            .output()?;
 
         if !output.status.success() {
             return Err(CpuError::ClangFailed {
