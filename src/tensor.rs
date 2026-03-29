@@ -1043,8 +1043,7 @@ fn substitute_roots_with_map(roots: &[UOp], replacements: &HashMap<UOp, UOp>) ->
 
 /// Wrap a compile-time `usize` as a `Const` i32 `UOp`, used for narrow offsets.
 fn bound_const(value: usize, device: DeviceId) -> UOp {
-    #[allow(clippy::cast_possible_wrap)]
-    UOp::const_int(value as i64, DType::I32, device)
+    UOp::const_int(i64::try_from(value).expect("narrow offset exceeds i64 range"), DType::I32, device)
 }
 
 /// Extract the concrete `usize` from a narrow start `UOp` (either a plain
