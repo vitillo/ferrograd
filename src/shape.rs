@@ -76,16 +76,16 @@ impl Shape {
         let left = self.pad_left(ndim);
         let right = other.pad_left(ndim);
 
-        let mut out = Vec::with_capacity(ndim);
-        for (&lhs, &rhs) in left.iter().zip(right.iter()) {
-            match (lhs, rhs) {
-                (x, y) if x == y => out.push(x),
-                (1, y) => out.push(y),
-                (x, 1) => out.push(x),
-                _ => return None,
-            }
-        }
-        Some(Self::new(out))
+        left.iter()
+            .zip(right.iter())
+            .map(|(&lhs, &rhs)| match (lhs, rhs) {
+                (x, y) if x == y => Some(x),
+                (1, y) => Some(y),
+                (x, 1) => Some(x),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(Self::new)
     }
 
     /// Axes reduced when backpropagating through an expand from `self` to `expanded`.
