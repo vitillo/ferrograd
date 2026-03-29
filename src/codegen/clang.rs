@@ -186,17 +186,15 @@ impl Renderer for ClangRenderer {
 
             match node.op() {
                 Op::Index => {
-                    let ptr = srcs[0].clone();
-                    let offset = srcs[1].clone();
-                    names.insert(node, format!("({ptr}+{offset})"));
+                    names.insert(node, format!("({}+{})", srcs[0], srcs[1]));
                 }
                 Op::Load => {
-                    let index_expr = srcs[0].clone();
                     let var = format!("val{val_count}");
                     val_count += 1;
                     let _ = writeln!(
                         out,
-                        "{ind}{ctype} {var} = *{index_expr};",
+                        "{ind}{ctype} {var} = *{};",
+                        srcs[0],
                         ind = indent(depth),
                         ctype = node.dtype().c_type(),
                     );
