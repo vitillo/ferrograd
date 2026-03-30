@@ -122,9 +122,15 @@ fn parse_images(path: &Path) -> Result<(Tensor, usize)> {
         });
     }
 
-    let count = usize::try_from(read_u32(&mut file)?).expect("IDX dimension exceeds usize");
-    let rows = usize::try_from(read_u32(&mut file)?).expect("IDX dimension exceeds usize");
-    let cols = usize::try_from(read_u32(&mut file)?).expect("IDX dimension exceeds usize");
+    let count = usize::try_from(read_u32(&mut file)?).map_err(|_| DatasetError::BadFormat {
+            detail: "IDX dimension exceeds usize".into(),
+        })?;
+    let rows = usize::try_from(read_u32(&mut file)?).map_err(|_| DatasetError::BadFormat {
+            detail: "IDX dimension exceeds usize".into(),
+        })?;
+    let cols = usize::try_from(read_u32(&mut file)?).map_err(|_| DatasetError::BadFormat {
+            detail: "IDX dimension exceeds usize".into(),
+        })?;
     if (rows, cols) != (28, 28) {
         return Err(DatasetError::BadFormat {
             detail: format!("expected 28x28 images, got {rows}x{cols}"),
@@ -148,7 +154,9 @@ fn parse_labels(path: &Path) -> Result<Vec<u8>> {
         });
     }
 
-    let count = usize::try_from(read_u32(&mut file)?).expect("IDX dimension exceeds usize");
+    let count = usize::try_from(read_u32(&mut file)?).map_err(|_| DatasetError::BadFormat {
+            detail: "IDX dimension exceeds usize".into(),
+        })?;
     let mut labels = vec![0u8; count];
     file.read_exact(&mut labels)?;
     Ok(labels)
