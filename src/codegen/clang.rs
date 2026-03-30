@@ -27,22 +27,18 @@ impl Renderer for ClangRenderer {
     #[allow(clippy::too_many_lines)]
     fn render(&self, uops: &[UOp], name: &str) -> String {
         // Collect kernel parameter nodes for function signature.
-        let mut params: Vec<(usize, DType, bool)> = Vec::new();
-        for node in uops {
-            match node.op() {
-                Op::ParamBuffer => {
-                    if let Arg::ParamBuffer(slot, _) = node.arg() {
-                        params.push((*slot, node.dtype(), true));
-                    }
+        let mut params: Vec<(usize, DType, bool)> = uops
+            .iter()
+            .filter_map(|node| match (node.op(), node.arg()) {
+                (Op::ParamBuffer, Arg::ParamBuffer(slot, _)) => {
+                    Some((*slot, node.dtype(), true))
                 }
-                Op::ParamScalar => {
-                    if let Arg::ParamScalar(slot) = node.arg() {
-                        params.push((*slot, node.dtype(), false));
-                    }
+                (Op::ParamScalar, Arg::ParamScalar(slot)) => {
+                    Some((*slot, node.dtype(), false))
                 }
-                _ => {}
-            }
-        }
+                _ => None,
+            })
+            .collect();
         params.sort_by_key(|(slot, _, _)| *slot);
 
         let args: Vec<String> = params
