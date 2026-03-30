@@ -226,7 +226,7 @@ fn next_buffer_id() -> BufferId {
 }
 
 /// A runtime argument passed to a compiled kernel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum KernelArg {
     /// Tensor storage passed by pointer.
     Buffer(Buffer),
