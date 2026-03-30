@@ -20,7 +20,7 @@ use crate::dtype::DType;
 use crate::uop::{Arg, AxisKind, Op, UOp};
 
 /// Renders `UOp` graphs to C, compiled by clang.
-#[derive(Debug)]
+#[derive(Debug, Clone, Default)]
 pub struct ClangRenderer;
 
 impl Renderer for ClangRenderer {
