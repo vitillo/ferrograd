@@ -694,17 +694,15 @@ impl Tensor {
 
     /// Natural exponential implemented as `2^(x * log2(e))`.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn exp(&self) -> Self {
-        let log2e = Self::scalar(std::f64::consts::LOG2_E as f32, self.device());
+        let log2e = Self::scalar(std::f32::consts::LOG2_E, self.device());
         self.mul(&log2e).exp2()
     }
 
     /// Natural logarithm implemented as `log2(x) * ln(2)`.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn log(&self) -> Self {
-        let ln2 = Self::scalar(std::f64::consts::LN_2 as f32, self.device());
+        let ln2 = Self::scalar(std::f32::consts::LN_2, self.device());
         self.log2().mul(&ln2)
     }
 
