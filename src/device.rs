@@ -238,7 +238,7 @@ fn next_buffer_id() -> BufferId {
 /// The scheduler builds the same [`Vec`] stored on [`crate::schedule::ScheduleItem`]
 /// that execution later passes to [`Device::execute`], using a single type for
 /// kernel inputs rather than separate schedule-time and execution-time types.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum KernelArg {
     /// Tensor storage passed by pointer.
     Buffer(Buffer),
