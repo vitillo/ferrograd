@@ -50,15 +50,16 @@ pub fn compute_gradient(root: &UOp, root_grad: &UOp, targets: &[UOp]) -> HashMap
         }
     }
 
-    let mut result = HashMap::new();
-    for target in targets {
-        let grad = grads
-            .get(target)
-            .cloned()
-            .unwrap_or_else(|| zero_like(target));
-        result.insert(target.clone(), grad);
-    }
-    result
+    targets
+        .iter()
+        .map(|target| {
+            let grad = grads
+                .get(target)
+                .cloned()
+                .unwrap_or_else(|| zero_like(target));
+            (target.clone(), grad)
+        })
+        .collect()
 }
 
 /// Find all nodes on any path between `targets` and `root` via consumers.
